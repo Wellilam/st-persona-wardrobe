@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "minimum": {
+    "sillytavern": "1.14.0",
+    "tavernHelper": null
+  },
+  "requirements": [
+    {
+      "id": "host-context",
+      "owner": "sillytavern",
+      "symbol": "SillyTavern.getContext",
+      "required": true,
+      "fallback": null
+    },
+    {
+      "id": "extension-settings",
+      "owner": "sillytavern",
+      "symbol": "SillyTavern.getContext.extensionSettings",
+      "required": true,
+      "fallback": null
+    },
+    {
+      "id": "event-source",
+      "owner": "sillytavern",
+      "symbol": "SillyTavern.getContext.eventSource",
+      "required": true,
+      "fallback": null
+    },
+    {
+      "id": "slash-command-parser",
+      "owner": "sillytavern",
+      "symbol": "SillyTavern.getContext.SlashCommandParser",
+      "required": false,
+      "fallback": "Skip registering /pwardrobe slash command and use topbar/menu buttons only."
+    },
+    {
+      "id": "worldinfo-api",
+      "owner": "sillytavern",
+      "symbol": "fetch:/api/worldinfo/get",
+      "required": false,
+      "fallback": "Fallback to native World Info drawer jump when direct entry fetch/edit API is unavailable."
+    }
+  ]
+}

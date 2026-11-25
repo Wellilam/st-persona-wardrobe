@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Persona Wardrobe 离线交互预览沙盒 (模拟 SillyTavern 宿主)</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" />
+  <link rel="stylesheet" href="./style.css" />
+  <style>
+    body {
+      margin: 0;
+      font-family: "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+      background: #0e1015;
+      color: #eef0f6;
+      padding: 20px;
+    }
+    .sandbox-banner {
+      max-width: 1260px;
+      margin: 0 auto 16px;
+      padding: 12px 18px;
+      background: rgba(229, 181, 103, 0.12);
+      border: 1px solid rgba(229, 181, 103, 0.4);
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+      font-size: 14px;
+    }
+    .sandbox-grid {
+      max-width: 1260px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: 1fr 1fr 380px;
+      gap: 16px;
+      align-items: start;
+    }
+    .mock-st-panel {
+      background: #171922;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 12px;
+      padding: 16px;
+    }
+    .mock-st-panel h4 {
+      margin: 0 0 12px;
+      color: #e5b567;
+      font-size: 15px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      padding-bottom: 8px;
+    }
+    .menu_button {
+      background: #282c3a;
+      color: #eef0f6;
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      border-radius: 6px;
+      padding: 6px 12px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .menu_button:hover:not(:disabled) {
+      background: #34394c;
+    }
+    .menu_button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .text_pole {
+      background: #11131a;
+      color: #eef0f6;
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 13px;
+    }
+    .checkbox_label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .sysHR {
+      border: none;
+      border-top: 1px solid rgba(255, 255, 255, 0.1);
+      margin: 10px 0;
+    }
+    .inline-drawer-header {
+      font-size: 15px;
+      margin-bottom: 10px;
+      color: #e5b567;
+    }
+    #user_avatar_block {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 12px;
+    }
+    .avatar-container {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 6px 10px;
+      border-radius: 8px;
+      background: #202330;
+      border: 1px solid transparent;
+      cursor: pointer;
+    }
+    .avatar-container.selected {
+      border-color: #e5b567;
+      background: #292d3e;
+    }
+    .avatar-container img {
+      width: 32px;
+      height: 32px;
+      border-radius: 6px;
+    }
+    #toast_log {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      z-index: 20000;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .mock-toast {
+      background: #232736;
+      border-left: 4px solid #e5b567;
+      color: #fff;
+      padding: 10px 14px;
+      border-radius: 6px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+      font-size: 13px;
+    }
+    @media (max-width: 1024px) {
+      .sandbox-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="toast_log"></div>
+
+  <div class="sandbox-banner">
+    <div>
+      <strong>本地交互预览沙盒（非真实 SillyTavern 实例）</strong>：模拟了酒馆原生 User 面板、世界书面板与扩展设置面板，方便直接测试「跳转世界书」「弹窗改条目」「多 User 分类与随身设定卡」。
+    </div>
+  </div>
+
+  <div class="sandbox-grid">
+    <!-- 模拟酒馆原生 Persona Management 面板 -->
+    <div id="PersonaManagement" class="mock-st-panel">
+      <h4><i class="fa-solid fa-face-smile"></i> 模拟酒馆原生 User 人设面板</h4>
+      <div id="user_avatar_block"></div>
+      <div style="margin-bottom: 10px;">
+        <label style="display:block;font-size:12px;color:#b4b9c7;margin-bottom:4px;">原生 Persona Lorebook（你看下面自动多出了一排增强按钮）：</label>
+        <select id="persona_description_lorebook" class="text_pole" style="width:100%;">
+          <option value="">--- None ---</option>
+          <option value="赛博夜之城_V个人设定">赛博夜之城_V个人设定</option>
+          <option value="艾尔登_褪色者档案">艾尔登_褪色者档案</option>
+          <option value="现代都市_调查员背包与人脉">现代都市_调查员背包与人脉</option>
+          <option value="修仙界_太虚剑宗弟子录">修仙界_太虚剑宗弟子录</option>
+          <option value="通用_恋爱日常好感补充">通用_恋爱日常好感补充</option>
+        </select>
+      </div>
+      <div>
+        <label style="display:block;font-size:12px;color:#b4b9c7;margin-bottom:4px;">原生 Persona Description：</label>
+        <textarea id="persona_description" class="text_pole" rows="4" style="width:100%;box-sizing:border-box;"></textarea>
+      </div>
+    </div>
+
+    <!-- 模拟酒馆原生 World Info 世界书面板 -->
+    <div id="WorldInfo" class="mock-st-panel">
+      <h4><i class="fa-solid fa-earth-asia"></i> 模拟酒馆原生「世界书编辑器」(#WorldInfo)</h4>
+      <p style="font-size:12px;color:#b4b9c7;margin-top:0;">当你点击「↗ 跳转世界书面板」时，这里会自动被打开并选中对应的世界书：</p>
+      <select id="world_editor_select" class="text_pole" style="width:100%;margin-bottom:10px;">
+        <option value="">--- 请选择世界书 ---</option>
+        <option value="0">赛博夜之城_V个人设定</option>
+        <option value="1">艾尔登_褪色者档案</option>
+        <option value="2">现代都市_调查员背包与人脉</option>
+        <option value="3">修仙界_太虚剑宗弟子录</option>
+        <option value="4">通用_恋爱日常好感补充</option>
+      </select>
+      <div id="mock_wi_currently_open" style="padding:12px;background:#11131a;border-radius:8px;font-size:13px;color:#57a6ff;">
+        当前编辑器尚未选中世界书
+      </div>
+    </div>
+
+    <!-- 模拟酒馆右侧 Extensions 面板 -->
+    <div id="extensions_settings2" class="mock-st-panel"></div>
+  </div>
+
+  <script>
+    // 1. 构造模拟的酒馆世界书数据与 /api/worldinfo/* 拦截
+    const MOCK_WORLDBOOKS = {
+      '赛博夜之城_V个人设定': {
+        entries: {
+          '0': { uid: 0, comment: 'V 的义体配置', key: ['义体', '斯安威斯坦', '战斗'], content: 'User 搭载了军用科技斯安威斯坦与光学迷彩，右臂内置单分子线。', constant: true, disable: false, order: 100 },
+          '1': { uid: 1, comment: '来生酒吧声望', key: ['来生', '罗格', '中间人'], content: 'User 在来生酒吧拥有极高声望，与罗格及强尼有深厚交集。', constant: false, disable: false, order: 110 },
+          '2': { uid: 2, comment: '旧伤暗疾（默认关闭）', key: ['Relic', '头痛'], content: '芯片偶尔引发视觉闪烁与咳血。', constant: false, disable: true, order: 120 }
+        }
+      },
+      '现代都市_调查员背包与人脉': {
+        entries: {
+          '0': { uid: 0, comment: '古董侦探事务所背景', key: ['事务所', '侦探'], content: 'User 在钟楼街经营一家表面看风水、实则处理异常事件的事务所。', constant: true, disable: false, order: 100 },
+          '1': { uid: 1, comment: '随身银质怀表', key: ['怀表', '污染'], content: '怀表指针倒转时代表周围存在认知污染。', constant: false, disable: false, order: 105 }
+        }
+      },
+      '修仙界_太虚剑宗弟子录': {
+        entries: {
+          '0': { uid: 0, comment: '本命佩剑·霜华', key: ['霜华', '拔剑'], content: 'User 的本命灵剑名曰霜华，剑出时方圆十丈结霜。', constant: true, disable: false, order: 100 }
+        }
+      },
+      '艾尔登_褪色者档案': {
+        entries: {
+          '0': { uid: 0, comment: '赐福指引与灵马哨笛', key: ['托雷特', '赐福'], content: 'User 持有灵马哨笛，能召唤托雷特跨越险境。', constant: true, disable: false, order: 100 }
+        }
+      },
+      '通用_恋爱日常好感补充': {
+        entries: {
+          '0': { uid: 0, comment: '料理与甜点喜好', key: ['做饭', '甜点', '奶茶'], content: 'User 擅长制作热可可与焦糖布丁，偏好三分糖。', constant: false, disable: false, order: 100 }
+        }
+      }
+    };
+
+    window.world_names = Object.keys(MOCK_WORLDBOOKS);
+    window.user_avatar = 'cyber_v.png';
+    window.power_user = {
+      default_persona: 'cyber_v.png',
+      personas: {
+        'cyber_v.png': 'V（夜之城佣兵）',
+        'investigator_lin.png': '林深（民俗调查员）',
+        'sword_shen.png': '沈清寒（太虚剑修）',
+        'tarnished_aria.png': '艾莉娅（无光褪色者）',
+        'student_su.png': '苏晓（美院学妹）'
+      },
+      persona_descriptions: {
+        'cyber_v.png': {
+          description: '23岁，夜之城传奇独立佣兵，性格果决冷幽默，习惯穿高领防弹夹克。',
+          lorebook: '赛博夜之城_V个人设定',
+          position: 0, depth: 2, role: 0, title: '夜之城自由佣兵'
+        },
+        'investigator_lin.png': {
+          description: '27岁，民俗学讲师兼私人调查员，随身带黑伞与速写本，说话温文尔雅。',
+          lorebook: '现代都市_调查员背包与人脉',
+          position: 0, depth: 2, role: 0, title: '钟楼街调查员'
+        },
+        'sword_shen.png': {
+          description: '太虚剑宗小师叔，外冷内热，嗜酒如命。',
+          lorebook: '修仙界_太虚剑宗弟子录',
+          position: 0, depth: 2, role: 0, title: '太虚剑修'
+        },
+        'tarnished_aria.png': {
+          description: '自雾海归来的褪色者，沉默寡言，左眼覆着银色眼罩。',
+          lorebook: '艾尔登_褪色者档案',
+          position: 0, depth: 2, role: 0, title: '褪色者'
+        },
+        'student_su.png': {
+          description: '大二油画系学生，身上常沾着松节油与柠檬香。',
+          lorebook: '通用_恋爱日常好感补充',
+          position: 0, depth: 2, role: 0, title: '油画系学妹'
+        }
+      }
+    };
+
+    // 拦截 fetch 模拟 /api/worldinfo/get 与 /api/worldinfo/edit 及 settings.html
+    const origFetch = window.fetch.bind(window);
+    window.fetch = async (url, options = {}) => {
+      if (String(url).includes('/api/worldinfo/get')) {
+        const body = JSON.parse(options.body || '{}');
+        const data = MOCK_WORLDBOOKS[body.name] || { entries: {} };
+        return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (String(url).includes('/api/worldinfo/edit')) {
+        const body = JSON.parse(options.body || '{}');
+        if (body.name && body.data) {
+          MOCK_WORLDBOOKS[body.name] = body.data;
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return origFetch(url, options);
+    };
+
+    // 模拟 toastr
+    window.toastr = {
+      info: (msg, title) => showToast(msg, title, '#57a6ff'),
+      success: (msg, title) => showToast(msg, title, '#4fd195'),
+      warning: (msg, title) => showToast(msg, title, '#e5b567'),
+      error: (msg, title) => showToast(msg, title, '#f06e6e')
+    };
+    function showToast(msg, title, color) {
+      const box = document.getElementById('toast_log');
+      const item = document.createElement('div');
+      item.className = 'mock-toast';
+      item.style.borderLeftColor = color;
+      item.innerHTML = `<strong>${title || '提示'}</strong><div>${msg}</div>`;
+      box.appendChild(item);
+      setTimeout(() => item.remove(), 3200);
+    }
+
+    // 渲染模拟的酒馆原生头像列表
+    function renderMockNativeAvatars() {
+      const block = document.getElementById('user_avatar_block');
+      block.innerHTML = '';
+      for (const [id, name] of Object.entries(window.power_user.personas)) {
+        const div = document.createElement('div');
+        div.className = 'avatar-container' + (window.user_avatar === id ? ' selected' : '');
+        div.setAttribute('data-avatar-id', id);
+        const hue = Math.abs([...id].reduce((a, c) => a + c.charCodeAt(0), 0)) % 360;
+        const svgAvatar = `data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="hsl(${hue},45%,30%)"/><text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" fill="white" font-size="24" font-family="sans-serif">${encodeURIComponent(name.slice(0,1))}</text></svg>`;
+        div.innerHTML = `<img src="${svgAvatar}" /><div class="ch_name">${name}</div>`;
+        div.addEventListener('click', () => {
+          window.user_avatar = id;
+          window.power_user.default_persona = id;
+          renderMockNativeAvatars();
+          syncMockNativeFields();
+        });
+        block.appendChild(div);
+      }
+    }
+
+    function syncMockNativeFields() {
+      const id = window.user_avatar;
+      const info = window.power_user.persona_descriptions[id] || {};
+      document.getElementById('persona_description').value = info.description || '';
+      document.getElementById('persona_description_lorebook').value = info.lorebook || '';
+    }
+
+    document.getElementById('world_editor_select').addEventListener('change', (e) => {
+      const sel = e.target;
+      const opt = sel.options[sel.selectedIndex];
+      const bookName = opt && sel.value !== '' ? opt.textContent.trim() : '';
+      const box = document.getElementById('mock_wi_currently_open');
+      if (!bookName) {
+        box.textContent = '当前编辑器尚未选中世界书';
+      } else {
+        const entries = Object.values(MOCK_WORLDBOOKS[bookName]?.entries || {});
+        box.innerHTML = `<strong>已在酒馆世界书编辑器打开：${bookName}</strong><div style="margin-top:6px;color:#b4b9c7;">包含条目：${entries.map(x => x.comment).join('、') || '无'}</div>`;
+      }
+    });
+
+    renderMockNativeAvatars();
+    syncMockNativeFields();
+
+    // 模拟 SillyTavern.getContext()
+    const listeners = {};
+    window.SillyTavern = {
+      libs: {},
+      getContext: () => ({
+        powerUserSettings: window.power_user,
+        chat: [{ mes: '我们在来生酒吧见一面，顺便聊聊斯安威斯坦的改装和甜点。' }],
+        characters: [{ name: '强尼·银手' }],
+        characterId: 0,
+        extensionSettings: window.__mockExtSettings || (window.__mockExtSettings = {
+          'st-persona-wardrobe': {
+            enabled: true,
+            enhanceNativePersonaPanel: true,
+            showTopbarButton: true,
+            showWandButton: true,
+            autoSwitchOnCharacterChat: true,
+            scanDepth: 5,
+            groups: ['现代都市', '西幻奇幻', '赛博科幻', '古风仙侠', '无限流/规则'],
+            profiles: {
+              'cyber_v.png': {
+                favorite: true,
+                group: '赛博科幻',
+                tags: ['佣兵', '高敏捷', '夜之城'],
+                boundCharacters: ['强尼·银手', '朱迪'],
+                note: '主线与委托通用人设',
+                extraWorldbooks: [
+                  { name: '通用_恋爱日常好感补充', enabled: true }
+                ],
+                traits: [
+                  { id: 't1', title: '表面伪装身份：公司顾问', content: '出席高端场所时使用荒坂外部安全顾问假身份。', enabled: true, triggerMode: 'always', keywords: '' },
+                  { id: 't2', title: '战斗状态：斯安威斯坦超频', content: '进入战斗或拔枪时反应速度提升三倍，眼神泛起淡金色义眼微光。', enabled: true, triggerMode: 'keyword', keywords: '斯安威斯坦, 战斗, 拔枪' }
+                ]
+              },
+              'investigator_lin.png': {
+                favorite: true,
+                group: '现代都市',
+                tags: ['民俗', '调查员', '温和'],
+                boundCharacters: [],
+                note: '适合克苏鲁与都市怪谈卡',
+                extraWorldbooks: [],
+                traits: []
+              },
+              'sword_shen.png': {
+                favorite: false,
+                group: '古风仙侠',
+                tags: ['剑修', '小师叔'],
+                boundCharacters: [],
+                note: '',
+                extraWorldbooks: [],
+                traits: []
+              }
+            }
+          }
+        }),
+        saveSettingsDebounced: () => {},
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        renderExtensionTemplateAsync: async () => {
+          const resp = await origFetch('./settings.html');
+          return await resp.text();
+        },
+        eventSource: {
+          on: (evt, fn) => { (listeners[evt] = listeners[evt] || []).push(fn); },
+          once: (evt, fn) => { (listeners[evt] = listeners[evt] || []).push(fn); },
+          removeListener: () => {}
+        },
+        event_types: {
+          APP_READY: 'app_ready',
+          CHAT_CHANGED: 'chat_id_changed',
+          SETTINGS_UPDATED: 'settings_updated',
+          WORLDINFO_UPDATED: 'worldinfo_updated',
+          PERSONA_CHANGED: 'persona_changed'
+        }
+      })
+    };
+  </script>
+  <script type="module">
+    import { onActivate } from './index.js';
+    await onActivate();
+    // 默认直接打开衣柜大弹窗方便预览
+    document.getElementById('st_pw_open_wardrobe_btn')?.click();
+  </script>
+</body>
+</html>

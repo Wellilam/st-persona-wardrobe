@@ -1,0 +1,79 @@
+<div id="st_persona_wardrobe_settings" class="st-pw-settings-root" data-extension-id="st-persona-wardrobe">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b>User 人设与世界书总管</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+            <div class="st-pw-drawer-card">
+                <div class="st-pw-drawer-status-row">
+                    <span class="st-pw-drawer-label">当前激活 User</span>
+                    <strong id="st_pw_drawer_active_user" class="st-pw-drawer-val">未读取</strong>
+                </div>
+                <div class="st-pw-drawer-status-row">
+                    <span class="st-pw-drawer-label">原生绑定世界书</span>
+                    <div class="st-pw-drawer-book-actions">
+                        <span id="st_pw_drawer_primary_book" class="st-pw-drawer-book-name">未绑定</span>
+                        <button id="st_pw_drawer_jump_book_btn" class="menu_button st-pw-mini-btn" type="button" title="在酒馆世界书编辑器中跳转打开此世界书">
+                            <i class="fa-solid fa-arrow-up-right-from-square"></i> 跳转
+                        </button>
+                        <button id="st_pw_drawer_popup_book_btn" class="menu_button st-pw-mini-btn" type="button" title="在弹窗内直接查看和开关条目">
+                            <i class="fa-solid fa-book-open"></i> 弹窗条目
+                        </button>
+                    </div>
+                </div>
+                <div class="st-pw-drawer-status-row">
+                    <span class="st-pw-drawer-label">扩展生效状态</span>
+                    <span id="st_pw_drawer_extra_summary" class="st-pw-drawer-subval">0 本附加书 · 0 条随身设定</span>
+                </div>
+            </div>
+
+            <div class="st-pw-drawer-btn-group">
+                <button id="st_pw_open_wardrobe_btn" class="menu_button st-pw-primary-action-btn" type="button">
+                    <i class="fa-solid fa-id-card-clip"></i> 打开 User 人设与世界书衣柜
+                </button>
+            </div>
+
+            <hr class="sysHR" />
+
+            <div class="st-pw-drawer-toggles">
+                <label class="checkbox_label" for="st_pw_enabled">
+                    <input id="st_pw_enabled" type="checkbox" />
+                    <span>启用随身设定卡片与多世界书注入</span>
+                </label>
+                <label class="checkbox_label" for="st_pw_enhance_native">
+                    <input id="st_pw_enhance_native" type="checkbox" />
+                    <span>在原生 User 面板旁增加「跳转/弹窗看世界书」按钮</span>
+                </label>
+                <label class="checkbox_label" for="st_pw_show_topbar">
+                    <input id="st_pw_show_topbar" type="checkbox" />
+                    <span>在顶部导航栏显示「人设衣柜」图标入口</span>
+                </label>
+                <label class="checkbox_label" for="st_pw_show_wand">
+                    <input id="st_pw_show_wand" type="checkbox" />
+                    <span>在输入框左下角魔棒菜单显示入口</span>
+                </label>
+                <label class="checkbox_label" for="st_pw_auto_switch_char">
+                    <input id="st_pw_auto_switch_char" type="checkbox" />
+                    <span>打开角色聊天时若匹配关联 User 则提示/自动切换</span>
+                </label>
+                <div class="st-pw-drawer-inline-field">
+                    <label for="st_pw_scan_depth">关键词触发扫描最近消息数</label>
+                    <input id="st_pw_scan_depth" class="text_pole st-pw-small-input" type="number" min="1" max="50" value="5" />
+                </div>
+            </div>
+
+            <hr class="sysHR" />
+
+            <div class="st-pw-drawer-footer-btns">
+                <button id="st_pw_export_btn" class="menu_button" type="button">
+                    <i class="fa-solid fa-file-export"></i> 导出衣柜配置
+                </button>
+                <button id="st_pw_import_btn" class="menu_button" type="button">
+                    <i class="fa-solid fa-file-import"></i> 导入配置
+                </button>
+                <input id="st_pw_import_file" type="file" accept=".json" style="display:none;" />
+            </div>
+        </div>
+    </div>
+</div>
