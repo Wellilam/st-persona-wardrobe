@@ -470,51 +470,129 @@
   gap: 8px;
 }
 
-.st-pw-mode-switch {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  background: var(--black30a, rgba(0, 0, 0, 0.28));
-  border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.12));
-  border-radius: 4px;
-  padding: 2px;
-  gap: 2px;
+.st-pw-sidebar-create-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
-.st-pw-mode-btn {
-  background: transparent;
-  color: inherit;
-  opacity: 0.65;
-  border: none;
-  border-radius: 3px;
-  padding: 4px 6px;
-  font-size: 0.78rem;
-  cursor: pointer;
+.st-pw-sidebar-create-bar select {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 6px !important;
+  font-size: 0.8rem !important;
 }
 
-.st-pw-mode-btn.active {
-  opacity: 1;
-  font-weight: 600;
-  background: var(--white20a, rgba(255, 255, 255, 0.14));
+/* 自动角色分组 / 自定义分组折叠文件夹样式 */
+.st-pw-folder-section {
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.1));
+  border-radius: 5px;
+  background: var(--black20a, rgba(0, 0, 0, 0.14));
+  overflow: hidden;
+  flex-shrink: 0;
 }
 
-.st-pw-group-ops-bar {
+.st-pw-folder-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 3px 6px;
-  background: var(--black20a, rgba(0, 0, 0, 0.15));
-  border-radius: 3px;
-  font-size: 0.76rem;
+  gap: 6px;
+  padding: 6px 8px;
+  background: var(--black30a, rgba(0, 0, 0, 0.25));
+  user-select: none;
 }
 
-.st-pw-group-ops-name {
-  font-weight: 600;
-  opacity: 0.85;
-}
-
-.st-pw-group-ops-btns {
+.st-pw-folder-title-wrap {
+  flex: 1;
+  min-width: 0;
   display: flex;
-  gap: 8px;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.st-pw-folder-arrow {
+  font-size: 0.72rem;
+  opacity: 0.6;
+  width: 10px;
+}
+
+.st-pw-folder-char-avatar {
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+
+.st-pw-folder-icon {
+  font-size: 0.82rem;
+  opacity: 0.7;
+}
+
+.st-pw-folder-name {
+  font-size: 0.84rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.st-pw-folder-count {
+  font-size: 0.74rem;
+  opacity: 0.65;
+  padding: 0 5px;
+  background: var(--white10a, rgba(255, 255, 255, 0.08));
+  border-radius: 999px;
+}
+
+.st-pw-folder-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.st-pw-folder-body {
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* 组内批量勾选 User 面板 */
+.st-pw-batch-box {
+  padding: 6px 8px;
+  background: var(--black30a, rgba(0, 0, 0, 0.35));
+  border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.1));
+  font-size: 0.8rem;
+}
+
+.st-pw-batch-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 5px;
+}
+
+.st-pw-batch-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+.st-pw-batch-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 3px;
+}
+
+.st-pw-batch-item:hover {
+  background: var(--white10a, rgba(255, 255, 255, 0.06));
 }
 
 .st-pw-link-btn {
