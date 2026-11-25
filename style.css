@@ -6,6 +6,8 @@
 /* 覆盖酒馆全局 .menu_button 的 width: min-content，防止任何中文按钮竖排 */
 .st-pw-settings-root .menu_button,
 .st-pw-native-helper-bar .menu_button,
+.st-pw-inline-left-panel .menu_button,
+.st-pw-inline-right-workbench .menu_button,
 .st-pw-wardrobe-dialog .menu_button,
 .st-pw-wb-dialog .menu_button,
 .st-pw-return-pill.menu_button {
@@ -40,8 +42,12 @@
 
 .st-pw-settings-root select,
 .st-pw-native-helper-bar select,
+.st-pw-inline-left-panel select,
+.st-pw-inline-right-workbench select,
 .st-pw-wardrobe-dialog select,
 .st-pw-wb-dialog select,
+.st-pw-inline-left-panel input.text_pole,
+.st-pw-inline-right-workbench input.text_pole,
 .st-pw-wardrobe-dialog input.text_pole,
 .st-pw-wb-dialog input.text_pole {
   margin: 0 !important;
@@ -121,7 +127,75 @@
   flex-wrap: wrap;
 }
 
-/* 2. 原生 Persona 面板内嵌控制条 */
+/* 2. 原生 Persona 栏目 (#PersonaManagement) 原位接管样式 */
+#PersonaManagement .persona_management_left_column.st-pw-left-taken > .flex-container.marginBot10,
+#PersonaManagement .persona_management_left_column.st-pw-left-taken > #user_avatar_block {
+  display: none !important;
+}
+
+.st-pw-inline-left-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 8px;
+}
+
+.st-pw-inline-left-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.st-pw-inline-left-top .st-pw-sidebar-search {
+  flex: 1;
+  min-width: 80px;
+}
+
+.st-pw-raw-mode-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 8px;
+  background: var(--black30a, rgba(0, 0, 0, 0.25));
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.12));
+  border-radius: 5px;
+  font-size: 0.82rem;
+}
+
+.st-pw-inline-persona-list {
+  max-height: 58vh;
+  max-height: 58dvh;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.st-pw-inline-right-workbench {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 8px 0 10px;
+}
+
+.st-pw-inline-header-btns {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.st-pw-inline-note-row input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 4px 8px !important;
+  font-size: 0.83rem !important;
+}
+
 .st-pw-native-helper-bar {
   display: flex;
   align-items: center;
