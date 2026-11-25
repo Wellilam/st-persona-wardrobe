@@ -145,6 +145,8 @@ function ensureProfileMeta(avatarId) {
       note: '',
       extraWorldbooks: [],
       traits: [],
+      presets: [],
+      activePresetId: '',
     };
   }
   const profile = settings.profiles[avatarId];
@@ -155,6 +157,8 @@ function ensureProfileMeta(avatarId) {
   if (typeof profile.note !== 'string') profile.note = '';
   if (!Array.isArray(profile.extraWorldbooks)) profile.extraWorldbooks = [];
   if (!Array.isArray(profile.traits)) profile.traits = [];
+  if (!Array.isArray(profile.presets)) profile.presets = [];
+  if (typeof profile.activePresetId !== 'string') profile.activePresetId = '';
   return profile;
 }
 
@@ -816,6 +820,244 @@ async function updateHostPersonaData(avatarId, { description, lorebook }) {
     console.error(`[${MODULE_ID}] 更新 Persona 数据失败:`, err);
     return false;
   }
+}
+
+/**
+ * 捕获当前 User 的状态快照（含原生描述、主世界书及其各条目开关/常驻状态、附加世界书、随身设定）
+ */
+async function captureCurrentPersonaSnapshot(persona, presetName, existingId = null) {
+  const cleanName = String(presetName || '').trim();
+  if (!persona || !cleanName) return null;
+
+  let liveDesc = persona.description || '';
+  if (persona.isActive) {
+    const descEl = document.querySelector('#persona_description');
+    if (descEl && typeof descEl.value === 'string') {
+      liveDesc = descEl.value;
+    }
+  }
+
+  const primaryBook = persona.lorebook || '';
+  const primaryEntryStates = {};
+  if (primaryBook) {
+    try {
+      const worldData = await fetchWorldbookData(primaryBook);
+      for (const [key, entry] of Object.entries(worldData?.entries || {})) {
+        if (entry && typeof entry === 'object') {
+          primaryEntryStates[key] = {
+            disable: Boolean(entry.disable),
+            constant: Boolean(entry.constant),
+          };
+        }
+      }
+    } catch (err) {
+      console.warn(`[${MODULE_ID}] 快照读取主世界书条目状态跳过:`, err);
+    }
+  }
+
+  return {
+    id: existingId || `preset_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    name: cleanName,
+    updatedAt: Date.now(),
+    description: liveDesc,
+    lorebook: primaryBook,
+    primaryEntryStates,
+    extraWorldbooks: structuredClone(persona.meta.extraWorldbooks || []),
+    traits: structuredClone(persona.meta.traits || []),
+  };
+}
+
+/**
+ * 一键应用/恢复某套状态快照预设
+ */
+async function applyPersonaSnapshotPreset(persona, presetId) {
+  if (!persona) return false;
+  const meta = ensureProfileMeta(persona.avatarId);
+  const preset = meta.presets.find((p) => p.id === presetId);
+  if (!preset) return false;
+
+  meta.extraWorldbooks = structuredClone(preset.extraWorldbooks || []);
+  meta.traits = structuredClone(preset.traits || []);
+  meta.activePresetId = preset.id;
+
+  const targetBook = preset.lorebook !== undefined ? preset.lorebook : persona.lorebook;
+  const targetDesc = preset.description !== undefined ? preset.description : persona.description;
+
+  updateHostPersonaData(persona.avatarId, {
+    description: targetDesc,
+    lorebook: targetBook,
+  });
+
+  // 如果快照里保存了主世界书各条目的启用/常驻状态，同步还原
+  const entryStates = preset.primaryEntryStates;
+  if (targetBook && entryStates && typeof entryStates === 'object' && Object.keys(entryStates).length > 0) {
+    try {
+      const worldData = await fetchWorldbookData(targetBook);
+      let changed = false;
+      for (const [key, savedState] of Object.entries(entryStates)) {
+        if (worldData?.entries?.[key] && savedState) {
+          if (Boolean(worldData.entries[key].disable) !== Boolean(savedState.disable)) {
+            worldData.entries[key].disable = Boolean(savedState.disable);
+            changed = true;
+          }
+          if (Boolean(worldData.entries[key].constant) !== Boolean(savedState.constant)) {
+            worldData.entries[key].constant = Boolean(savedState.constant);
+            changed = true;
+          }
+        }
+      }
+      if (changed) {
+        await saveWorldbookData(targetBook, worldData);
+      }
+    } catch (err) {
+      console.warn(`[${MODULE_ID}] 还原快照主世界书条目开关失败:`, err);
+    }
+  }
+
+  saveSettings();
+  refreshAllViews();
+  globalThis.toastr?.success?.(`已切换至状态快照「${preset.name}」`);
+  return true;
+}
+
+/**
+ * 完整克隆 User 变体（连带头像文件、人设描述、主世界书、附加世界书、随身设定、所属自定义组、绑定角色组与全部快照预设）
+ */
+async function clonePersonaVariant(sourcePersona, { customName = '', fromPreset = null } = {}) {
+  if (!sourcePersona) return null;
+  await probeHostModules();
+
+  const defaultVariantName = fromPreset
+    ? `${sourcePersona.name} (${fromPreset.name})`
+    : `${sourcePersona.name} (变体)`;
+  const rawName = customName || window.prompt('输入克隆出的新 User 变体名称：', defaultVariantName);
+  if (!rawName || !rawName.trim()) return null;
+  const cleanName = rawName.trim();
+
+  const asciiSlug = cleanName.replace(/[^a-zA-Z0-9]/g, '').slice(0, 20) || 'variant';
+  const newAvatarId = `${Date.now()}-${asciiSlug}.png`;
+
+  const context = getContext();
+  const pu = context.powerUserSettings;
+
+  // 1. 克隆头像文件到服务端 /api/avatars/upload
+  try {
+    let avatarBlob = null;
+    for (const candidateUrl of [
+      sourcePersona.avatarUrl,
+      `/User Avatars/${encodeURIComponent(sourcePersona.avatarId)}`,
+      '/img/ai4.png',
+    ]) {
+      if (!candidateUrl) continue;
+      try {
+        const res = await fetch(candidateUrl);
+        if (res.ok) {
+          avatarBlob = await res.blob();
+          break;
+        }
+      } catch (_e) {}
+    }
+
+    if (avatarBlob) {
+      const file = new File([avatarBlob], 'avatar.png', {
+        type: avatarBlob.type || 'image/png',
+      });
+      const formData = new FormData();
+      formData.append('avatar', file);
+      formData.append('overwrite_name', newAvatarId);
+
+      const headers =
+        typeof context.getRequestHeaders === 'function'
+          ? { ...context.getRequestHeaders({ omitContentType: true }) }
+          : {};
+      delete headers['Content-Type'];
+      delete headers['content-type'];
+
+      await fetch('/api/avatars/upload', {
+        method: 'POST',
+        headers,
+        cache: 'no-cache',
+        body: formData,
+      });
+    }
+  } catch (err) {
+    console.warn(`[${MODULE_ID}] 克隆头像上传警告（将继续写入人设记录）:`, err);
+  }
+
+  // 2. 写入宿主 Persona 数据
+  const targetDesc =
+    fromPreset && fromPreset.description !== undefined
+      ? fromPreset.description
+      : sourcePersona.description || '';
+  const targetLorebook =
+    fromPreset && fromPreset.lorebook !== undefined
+      ? fromPreset.lorebook
+      : sourcePersona.lorebook || '';
+
+  const sourceDescriptor = pu?.persona_descriptions?.[sourcePersona.avatarId] || {};
+  const pos = sourceDescriptor.position ?? 0;
+  const depth = sourceDescriptor.depth ?? 2;
+  const role = sourceDescriptor.role ?? 0;
+
+  if (typeof state.hostPersonasModule?.initPersona === 'function') {
+    try {
+      await state.hostPersonasModule.initPersona(newAvatarId, cleanName, targetDesc, '', {
+        position: pos,
+        depth,
+        role,
+        lorebook: targetLorebook,
+      });
+    } catch (_e) {}
+  }
+
+  if (pu) {
+    if (!pu.personas) pu.personas = {};
+    if (!pu.persona_descriptions) pu.persona_descriptions = {};
+    pu.personas[newAvatarId] = cleanName;
+    pu.persona_descriptions[newAvatarId] = {
+      description: targetDesc,
+      position: pos,
+      depth,
+      role,
+      lorebook: targetLorebook,
+      title: '',
+      connections: structuredClone(sourceDescriptor.connections || []),
+    };
+  }
+
+  // 3. 完整克隆扩展 Profile 元数据（分组、标签、角色绑定、附加世界书、随身设定、状态快照）
+  const settings = getSettings();
+  const srcMeta = sourcePersona.meta;
+  settings.profiles[newAvatarId] = {
+    favorite: Boolean(srcMeta.favorite),
+    group: srcMeta.group || '',
+    tags: [...(srcMeta.tags || [])],
+    boundCharacters: [...(srcMeta.boundCharacters || [])],
+    note: srcMeta.note || '',
+    extraWorldbooks: structuredClone(
+      fromPreset ? fromPreset.extraWorldbooks || [] : srcMeta.extraWorldbooks || []
+    ),
+    traits: structuredClone(fromPreset ? fromPreset.traits || [] : srcMeta.traits || []),
+    presets: structuredClone(srcMeta.presets || []),
+    activePresetId: fromPreset ? fromPreset.id : srcMeta.activePresetId || '',
+  };
+
+  // 4. 如果原 User 绑定了角色组（含 Luker dedicated_personas 或标准 connections），同步把新变体也绑入对应角色组
+  for (const charName of srcMeta.boundCharacters || []) {
+    bindPersonaToCharacter(newAvatarId, charName);
+  }
+
+  saveSettings();
+
+  try {
+    await state.hostPersonasModule?.getUserAvatars?.(true, newAvatarId);
+  } catch (_e) {}
+
+  state.selectedAvatarId = newAvatarId;
+  await switchActivePersona(newAvatarId);
+  refreshAllViews();
+  globalThis.toastr?.success?.(`已完整克隆变体「${cleanName}」`);
+  return newAvatarId;
 }
 
 async function jumpToWorldbookInHost(worldbookName, { fromWardrobeModal = false } = {}) {
@@ -1636,6 +1878,7 @@ function renderPersonaRowHtml(p, selectedAvatarId) {
   const isSelected = selectedAvatarId === p.avatarId;
   const extraCount = p.meta.extraWorldbooks.filter((b) => b.enabled).length;
   const traitCount = p.meta.traits.filter((t) => t.enabled).length;
+  const presetCount = Array.isArray(p.meta.presets) ? p.meta.presets.length : 0;
   return `
     <div class="st-pw-persona-item ${isSelected ? 'is-selected' : ''} ${p.isActive ? 'is-active-user' : ''}" data-avatar-id="${escapeAttr(p.avatarId)}">
       <img class="st-pw-item-avatar" src="${escapeAttr(p.avatarUrl)}" alt="" onerror="this.style.visibility='hidden'" />
@@ -1652,6 +1895,7 @@ function renderPersonaRowHtml(p, selectedAvatarId) {
           }
           ${extraCount ? `<span>+${extraCount}书</span>` : ''}
           ${traitCount ? `<span>· ${traitCount}设定</span>` : ''}
+          ${presetCount ? `<span>· ${presetCount}快照</span>` : ''}
         </div>
       </div>
       <div class="st-pw-item-actions">
@@ -2014,6 +2258,81 @@ function renderBatchChecklistHtml(targetType, targetName, allPersonas) {
   `;
 }
 
+function renderPresetsAndCloneBlockHtml(persona) {
+  const meta = persona.meta;
+  const presets = Array.isArray(meta.presets) ? meta.presets : [];
+  return `
+    <div class="st-pw-block">
+      <div class="st-pw-block-header">
+        <span class="st-pw-block-title">变体克隆 & 状态快照预设 (${presets.length})</span>
+        <div class="st-pw-inline-header-btns">
+          <button type="button" class="menu_button st-pw-mini-btn st-pw-save-preset-btn" title="将当前人设描述、主世界书及条目开关、附加书与随身设定保存为一套状态快照">
+            + 存为状态快照
+          </button>
+          <button type="button" class="menu_button st-pw-mini-btn st-pw-clone-variant-btn" title="完整克隆此 User（连带头像、描述、世界书、随身设定、所属角色组/自定义组及快照）">
+            <i class="fa-solid fa-copy"></i> 完整克隆变体
+          </button>
+        </div>
+      </div>
+      ${
+        presets.length === 0
+          ? `<div class="st-pw-muted-hint">可保存多套「人设描述 + 主世界书条目开关 + 附加书 + 随身设定」状态快照（如日常态/战斗态/IF线），一键切换或直接派生为新 User。</div>`
+          : `
+            <div class="st-pw-compact-rows">
+              ${presets
+                .map((pr) => {
+                  const isCurrentPreset = meta.activePresetId === pr.id;
+                  const ebCount = Array.isArray(pr.extraWorldbooks)
+                    ? pr.extraWorldbooks.filter((b) => b.enabled).length
+                    : 0;
+                  const trCount = Array.isArray(pr.traits)
+                    ? pr.traits.filter((t) => t.enabled).length
+                    : 0;
+                  const entryCount =
+                    pr.primaryEntryStates && typeof pr.primaryEntryStates === 'object'
+                      ? Object.values(pr.primaryEntryStates).filter((s) => s && !s.disable).length
+                      : null;
+                  const summaryParts = [
+                    pr.lorebook
+                      ? `${pr.lorebook}${entryCount !== null ? `(${entryCount}条开)` : ''}`
+                      : '无主书',
+                  ];
+                  if (ebCount) summaryParts.push(`+${ebCount}书`);
+                  if (trCount) summaryParts.push(`${trCount}设定`);
+                  summaryParts.push(`${String(pr.description || '').length}字`);
+
+                  return `
+                    <div class="st-pw-compact-row ${isCurrentPreset ? 'is-active-preset' : ''}" data-preset-id="${escapeAttr(pr.id)}">
+                      <span class="st-pw-mode-tag ${isCurrentPreset ? 'is-constant' : 'is-keyword'} st-pw-apply-preset-btn" data-preset-id="${escapeAttr(pr.id)}" title="点击切换到此状态快照">
+                        <span class="st-pw-dot"></span>${isCurrentPreset ? '当前快照' : '快照'}
+                      </span>
+                      <span class="st-pw-row-main-text st-pw-apply-preset-btn" data-preset-id="${escapeAttr(pr.id)}" title="点击切换到此状态快照">
+                        <strong>${sanitizeHtml(pr.name)}</strong>
+                        <small class="st-pw-muted"> · ${sanitizeHtml(summaryParts.join(' · '))}</small>
+                      </span>
+                      <button type="button" class="menu_button st-pw-mini-btn st-pw-apply-preset-btn" data-preset-id="${escapeAttr(pr.id)}" title="一键恢复此快照的描述、世界书条目开关与随身设定">
+                        切换
+                      </button>
+                      <button type="button" class="menu_button st-pw-mini-btn st-pw-overwrite-preset-btn" data-preset-id="${escapeAttr(pr.id)}" title="用当前最新状态覆盖更新此快照">
+                        更新
+                      </button>
+                      <button type="button" class="menu_button st-pw-mini-btn st-pw-preset-to-variant-btn" data-preset-id="${escapeAttr(pr.id)}" title="将此快照直接派生为一个新的独立 User 人设">
+                        派生User
+                      </button>
+                      <button type="button" class="st-pw-icon-btn st-pw-delete-preset-btn" data-preset-id="${escapeAttr(pr.id)}" title="删除此快照">
+                        <i class="fa-solid fa-xmark"></i>
+                      </button>
+                    </div>
+                  `;
+                })
+                .join('')}
+            </div>
+          `
+      }
+    </div>
+  `;
+}
+
 function renderSelectedPersonaDetail(persona, availableBooks, hostChars, currentCharName, settings) {
   const meta = persona.meta;
   const bookOptionsHtml = [
@@ -2099,6 +2418,9 @@ function renderSelectedPersonaDetail(persona, availableBooks, hostChars, current
         </select>
       </div>
     </div>
+
+    <!-- 变体克隆 & 状态快照预设 -->
+    ${renderPresetsAndCloneBlockHtml(persona)}
 
     <!-- 世界书绑定 -->
     <div class="st-pw-block">
@@ -2669,6 +2991,81 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
     meta.note = e.target.value;
     saveSettings();
   });
+
+  // ==================== 变体克隆 & 状态快照预设事件 ====================
+  modal.querySelector('.st-pw-save-preset-btn')?.addEventListener('click', async () => {
+    const defaultName = `状态 #${(meta.presets?.length || 0) + 1}`;
+    const name = window.prompt('输入状态快照预设名称（如：日常态 / 战斗态 / IF线）：', defaultName);
+    if (!name || !name.trim()) return;
+    const snap = await captureCurrentPersonaSnapshot(selectedPersona, name.trim());
+    if (!snap) return;
+    meta.presets.push(snap);
+    meta.activePresetId = snap.id;
+    saveSettings();
+    rerenderPanels();
+    globalThis.toastr?.success?.(`已保存状态快照「${snap.name}」`);
+  });
+
+  modal.querySelector('.st-pw-clone-variant-btn')?.addEventListener('click', async () => {
+    await clonePersonaVariant(selectedPersona);
+  });
+
+  modal.querySelectorAll('.st-pw-apply-preset-btn').forEach((el) => {
+    el.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const presetId = el.getAttribute('data-preset-id');
+      if (presetId) {
+        await applyPersonaSnapshotPreset(selectedPersona, presetId);
+      }
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-overwrite-preset-btn').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const presetId = btn.getAttribute('data-preset-id');
+      const idx = meta.presets.findIndex((p) => p.id === presetId);
+      if (idx === -1) return;
+      const oldPreset = meta.presets[idx];
+      const updated = await captureCurrentPersonaSnapshot(
+        selectedPersona,
+        oldPreset.name,
+        oldPreset.id
+      );
+      if (!updated) return;
+      meta.presets[idx] = updated;
+      meta.activePresetId = updated.id;
+      saveSettings();
+      rerenderPanels();
+      globalThis.toastr?.success?.(`已用当前状态更新快照「${updated.name}」`);
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-preset-to-variant-btn').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const presetId = btn.getAttribute('data-preset-id');
+      const preset = meta.presets.find((p) => p.id === presetId);
+      if (!preset) return;
+      await clonePersonaVariant(selectedPersona, { fromPreset: preset });
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-delete-preset-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const presetId = btn.getAttribute('data-preset-id');
+      const preset = meta.presets.find((p) => p.id === presetId);
+      if (!preset) return;
+      if (!window.confirm(`确定删除状态快照「${preset.name}」吗？`)) return;
+      meta.presets = meta.presets.filter((p) => p.id !== presetId);
+      if (meta.activePresetId === presetId) {
+        meta.activePresetId = '';
+      }
+      saveSettings();
+      rerenderPanels();
+    });
+  });
 }
 
 async function openActivePromptPreviewModal() {
@@ -3184,6 +3581,9 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
         </select>
       </div>
     </div>
+
+    <!-- 1.5 变体克隆 & 状态快照预设 -->
+    ${renderPresetsAndCloneBlockHtml(targetPersona)}
 
     <!-- 2. 世界书绑定（主世界书 + 附加世界书） -->
     <div class="st-pw-block">
