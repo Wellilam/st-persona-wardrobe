@@ -2211,8 +2211,9 @@ function syncNativePersonaPanelEnhancement() {
     return;
   }
 
+  const personaControlsRow = document.querySelector('#persona_controls');
   const anchorEl =
-    document.querySelector('#persona_lore_button')?.closest('.persona_controls_buttons_block') ||
+    personaControlsRow ||
     document.querySelector('#persona_description_lorebook') ||
     document.querySelector('#persona_description');
 
@@ -2223,11 +2224,14 @@ function syncNativePersonaPanelEnhancement() {
     helperBar = document.createElement('div');
     helperBar.id = 'st_pw_native_persona_helper';
     helperBar.className = 'st-pw-native-helper-bar';
-    if (anchorEl.id === 'persona_description') {
+  }
+  // 确保插入在 #persona_controls 整行外部下方，绝不挤进 #persona_controls 内部 flex 容器导致原按钮变成竖排
+  if (anchorEl.id === 'persona_description') {
+    if (helperBar.nextElementSibling !== anchorEl) {
       anchorEl.insertAdjacentElement('beforebegin', helperBar);
-    } else {
-      anchorEl.insertAdjacentElement('afterend', helperBar);
     }
+  } else if (helperBar.previousElementSibling !== anchorEl) {
+    anchorEl.insertAdjacentElement('afterend', helperBar);
   }
 
   const personas = getHostPersonas();
