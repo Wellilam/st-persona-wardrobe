@@ -139,12 +139,28 @@
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
-  margin-top: 6px;
-  margin-bottom: 6px;
-  padding: 6px 8px;
+  margin-top: 8px;
+  margin-bottom: 8px;
+  padding: 7px 10px;
   background: rgba(229, 181, 103, 0.08);
   border: 1px solid rgba(229, 181, 103, 0.28);
   border-radius: var(--st-pw-radius-sm);
+}
+
+.st-pw-native-bar-label {
+  font-size: 0.85em;
+  color: var(--st-pw-accent);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.st-pw-native-quick-select {
+  flex: 1;
+  min-width: 150px;
+  max-width: 240px;
+  margin: 0 !important;
+  padding: 3px 8px !important;
+  font-size: 0.85em !important;
 }
 
 /* 3. 跳转后右下角「← 返回 User 人设衣柜」悬浮胶囊 */

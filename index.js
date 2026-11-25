@@ -29,6 +29,8 @@ const state = {
   worldbookCache: new Map(),
   lastPromptInjectedSummary: [],
   minimizedReturnPill: null,
+  hostPersonasModule: null,
+  hostWorldInfoModule: null,
 };
 
 function getContext() {
@@ -37,6 +39,22 @@ function getContext() {
     throw new Error(`[${MODULE_ID}] SillyTavern.getContext() 不可用`);
   }
   return context;
+}
+
+/**
+ * 尝试加载宿主原生 personas.js 与 world-info.js 模块（ST 1.19.0 实测路径），失败则优雅降级到 getContext()
+ */
+async function probeHostModules() {
+  if (!state.hostPersonasModule) {
+    try {
+      state.hostPersonasModule = await import('../../../personas.js');
+    } catch (_e) {}
+  }
+  if (!state.hostWorldInfoModule) {
+    try {
+      state.hostWorldInfoModule = await import('../../../world-info.js');
+    } catch (_e) {}
+  }
 }
 
 function sanitizeHtml(raw) {
@@ -115,10 +133,25 @@ function ensureProfileMeta(avatarId) {
 }
 
 /**
- * 读取酒馆当前所有可用世界书列表
+ * 读取酒馆当前所有可用世界书列表（优先使用 ST 1.19 getContext().getWorldInfoNames()）
  */
 function getAvailableWorldbooks() {
   const books = new Set();
+
+  try {
+    const context = getContext();
+    if (typeof context.getWorldInfoNames === 'function') {
+      for (const name of context.getWorldInfoNames()) {
+        if (typeof name === 'string' && name.trim()) books.add(name.trim());
+      }
+    }
+  } catch (_e) {}
+
+  if (Array.isArray(state.hostWorldInfoModule?.world_names)) {
+    for (const name of state.hostWorldInfoModule.world_names) {
+      if (typeof name === 'string' && name.trim()) books.add(name.trim());
+    }
+  }
 
   if (Array.isArray(globalThis.world_names)) {
     for (const name of globalThis.world_names) {
@@ -154,9 +187,15 @@ function getAvailableWorldbooks() {
 }
 
 /**
- * 获取酒馆当前激活的 User Avatar ID
+ * 获取酒馆当前激活的 User Avatar ID（支持 ST 1.19 分页隐藏时的准确读取）
  */
 function getActiveAvatarId() {
+  if (
+    typeof state.hostPersonasModule?.user_avatar === 'string' &&
+    state.hostPersonasModule.user_avatar.trim()
+  ) {
+    return state.hostPersonasModule.user_avatar.trim();
+  }
   if (typeof globalThis.user_avatar === 'string' && globalThis.user_avatar.trim()) {
     return globalThis.user_avatar.trim();
   }
@@ -169,9 +208,35 @@ function getActiveAvatarId() {
   try {
     const context = getContext();
     const pu = context.powerUserSettings || globalThis.power_user;
+    if (pu?.chat_metadata?.persona) return pu.chat_metadata.persona;
+    if (context.chatMetadata?.persona) return context.chatMetadata.persona;
+    // 通过当前 name1 + persona_description 精确反查
+    if (pu?.personas && typeof pu.personas === 'object') {
+      const entries = Object.entries(pu.personas);
+      const byNameAndDesc = entries.find(([id, name]) => {
+        const desc = pu.persona_descriptions?.[id]?.description ?? '';
+        return name === context.name1 && desc === (pu.persona_description ?? '');
+      });
+      if (byNameAndDesc) return byNameAndDesc[0];
+      const byName = entries.find(([_id, name]) => name === context.name1);
+      if (byName) return byName[0];
+    }
     if (pu?.default_persona) return pu.default_persona;
   } catch (_e) {}
   return '';
+}
+
+/**
+ * 生成头像缩略图 URL（优先使用酒馆 getThumbnailUrl('persona', avatarId)）
+ */
+function resolvePersonaAvatarUrl(avatarId) {
+  try {
+    const context = getContext();
+    if (typeof context.getThumbnailUrl === 'function') {
+      return context.getThumbnailUrl('persona', avatarId);
+    }
+  } catch (_e) {}
+  return `/User Avatars/${encodeURIComponent(avatarId)}`;
 }
 
 /**
@@ -195,21 +260,26 @@ function getHostPersonas() {
 
   for (const [avatarId, displayName] of Object.entries(personasMap)) {
     const descObj = descMap[avatarId] || {};
+    const isCurrent = avatarId === activeAvatarId;
+    const effectiveLorebook = String(
+      descObj.lorebook || (isCurrent ? pu.persona_description_lorebook || '' : '')
+    );
     resultMap.set(avatarId, {
       avatarId,
       name: String(displayName || avatarId),
-      description: String(descObj.description ?? ''),
-      lorebook: String(descObj.lorebook ?? ''),
+      description: String(descObj.description ?? (isCurrent ? pu.persona_description ?? '' : '')),
+      lorebook: effectiveLorebook,
       position: descObj.position,
       depth: descObj.depth,
       role: descObj.role,
       title: String(descObj.title ?? ''),
-      avatarUrl: `/User Avatars/${encodeURIComponent(avatarId)}`,
-      isActive: avatarId === activeAvatarId,
+      connections: Array.isArray(descObj.connections) ? descObj.connections : [],
+      avatarUrl: resolvePersonaAvatarUrl(avatarId),
+      isActive: isCurrent,
     });
   }
 
-  // DOM 兜底扫描：防止部分版本 powerUserSettings 未及时暴露或包含未同步项
+  // DOM 兜底扫描
   const avatarNodes = document.querySelectorAll(
     '#user_avatar_block .avatar-container[data-avatar-id]'
   );
@@ -221,7 +291,7 @@ function getHostPersonas() {
       node.getAttribute('title') ||
       avatarId;
     const domDesc = node.querySelector('.ch_description')?.textContent?.trim() || '';
-    const imgSrc = node.querySelector('img')?.getAttribute('src') || `/User Avatars/${encodeURIComponent(avatarId)}`;
+    const imgSrc = node.querySelector('img')?.getAttribute('src') || resolvePersonaAvatarUrl(avatarId);
     const isSelected = node.classList.contains('selected') || avatarId === activeAvatarId;
     const descObj = descMap[avatarId] || {};
 
@@ -232,6 +302,7 @@ function getHostPersonas() {
         description: String(descObj.description ?? domDesc),
         lorebook: String(descObj.lorebook ?? ''),
         title: String(descObj.title ?? ''),
+        connections: [],
         avatarUrl: imgSrc,
         isActive: isSelected,
       });
@@ -242,20 +313,6 @@ function getHostPersonas() {
     }
   });
 
-  // 如果当前正在激活的 User 在 DOM 表单里有最新值，补充同步
-  const activeDomLorebook = document.querySelector('#persona_description_lorebook');
-  if (activeAvatarId && resultMap.has(activeAvatarId) && activeDomLorebook) {
-    const selectedOption = activeDomLorebook.options?.[activeDomLorebook.selectedIndex];
-    const selectedBookName =
-      selectedOption && activeDomLorebook.value
-        ? selectedOption.textContent.trim()
-        : '';
-    const item = resultMap.get(activeAvatarId);
-    if (!item.lorebook && selectedBookName && !selectedBookName.includes('None')) {
-      item.lorebook = selectedBookName;
-    }
-  }
-
   const list = [...resultMap.values()];
   for (const item of list) {
     item.meta = ensureProfileMeta(item.avatarId);
@@ -264,14 +321,26 @@ function getHostPersonas() {
 }
 
 /**
- * 切换当前激活的 User Persona
+ * 切换当前激活的 User Persona（支持跨分页直接调用 setUserAvatar 或 /persona-set）
  */
 async function switchActivePersona(avatarId) {
   if (!avatarId) return false;
+  await probeHostModules();
   const personas = getHostPersonas();
   const target = personas.find((p) => p.avatarId === avatarId);
 
-  // 优先触发酒馆原生头像容器点击，确保聊天绑定、名称与表单全部走原生逻辑
+  // 1. 优先调用宿主 personas.js 的 setUserAvatar（不受分页影响，完整触发 PERSONA_CHANGED 与聊天锁定）
+  if (typeof state.hostPersonasModule?.setUserAvatar === 'function') {
+    await state.hostPersonasModule.setUserAvatar(avatarId);
+    globalThis.toastr?.success?.(
+      `已切换当前 User 为：${target?.name || avatarId}`,
+      'User 人设衣柜'
+    );
+    refreshAllViews();
+    return true;
+  }
+
+  // 2. 次选：如果当前分页 DOM 里正好有该头像容器，直接触发点击
   const escapedId = CSS.escape ? CSS.escape(avatarId) : avatarId.replaceAll('"', '\\"');
   const domAvatar = document.querySelector(
     `#user_avatar_block .avatar-container[data-avatar-id="${escapedId}"]`
@@ -286,36 +355,36 @@ async function switchActivePersona(avatarId) {
     return true;
   }
 
-  // 次选：通过 SlashCommand /persona 切换
+  // 3. 兜底：通过 SlashCommand /persona-set mode=lookup 切换
   try {
     const context = getContext();
     if (typeof context.executeSlashCommandsWithOptions === 'function') {
-      await context.executeSlashCommandsWithOptions(`/persona ${target?.name || avatarId}`);
+      await context.executeSlashCommandsWithOptions(
+        `/persona-set mode=lookup "${avatarId}"`
+      );
       globalThis.toastr?.success?.(
-        `已通过命令切换 User 为：${target?.name || avatarId}`,
+        `已切换当前 User 为：${target?.name || avatarId}`,
         'User 人设衣柜'
       );
       refreshAllViews();
       return true;
     }
   } catch (err) {
-    console.warn(`[${MODULE_ID}] /persona 切换失败:`, err);
+    console.warn(`[${MODULE_ID}] /persona-set 切换失败:`, err);
   }
 
-  globalThis.toastr?.warning?.(
-    '请先点开一次酒馆顶部「User 人设管理」抽屉让列表加载，再执行一键切换。',
-    'User 人设衣柜'
-  );
   return false;
 }
 
 /**
- * 更新某个 User 的原生人设描述与主绑定世界书
+ * 更新某个 User 的原生人设描述与主绑定世界书（完全同步 ST 1.19 power_user 与 #persona_lore_button 状态）
  */
 function updateHostPersonaData(avatarId, { description, lorebook }) {
   try {
     const context = getContext();
     const pu = context.powerUserSettings || globalThis.power_user;
+    const isCurrent = avatarId === getActiveAvatarId();
+
     if (pu) {
       if (!pu.persona_descriptions) pu.persona_descriptions = {};
       if (!pu.persona_descriptions[avatarId]) {
@@ -326,41 +395,45 @@ function updateHostPersonaData(avatarId, { description, lorebook }) {
           role: 0,
           lorebook: '',
           title: '',
+          connections: [],
         };
       }
       if (description !== undefined) {
         pu.persona_descriptions[avatarId].description = description;
+        if (isCurrent) {
+          pu.persona_description = description;
+        }
       }
       if (lorebook !== undefined) {
         pu.persona_descriptions[avatarId].lorebook = lorebook;
+        if (isCurrent) {
+          pu.persona_description_lorebook = lorebook;
+        }
       }
     }
 
-    // 如果修改的就是当前激活的 User，同步更新酒馆原生 DOM 输入框与下拉框
-    if (avatarId === getActiveAvatarId()) {
+    // 如果修改的是当前激活的 User，同步更新酒馆原生 DOM
+    if (isCurrent) {
       if (description !== undefined) {
         const descInput = document.querySelector('#persona_description');
         if (descInput && descInput.value !== description) {
           descInput.value = description;
           descInput.dispatchEvent(new Event('input', { bubbles: true }));
-          descInput.dispatchEvent(new Event('change', { bubbles: true }));
         }
       }
       if (lorebook !== undefined) {
+        // ST 1.19 原生地球按钮高亮状态 class="world_set"
+        const loreBtn = document.querySelector('#persona_lore_button');
+        if (loreBtn) {
+          loreBtn.classList.toggle('world_set', Boolean(lorebook));
+        }
+        // 兼容老版或沙盒下拉框
         const loreSelect = document.querySelector('#persona_description_lorebook');
         if (loreSelect) {
-          let matchedValue = '';
-          for (const opt of loreSelect.options) {
-            if (opt.value === lorebook || opt.textContent.trim() === lorebook) {
-              matchedValue = opt.value;
-              break;
-            }
-          }
-          loreSelect.value = lorebook ? matchedValue : '';
-          globalThis.jQuery?.(loreSelect).trigger('change');
-          loreSelect.dispatchEvent(new Event('change', { bubbles: true }));
+          loreSelect.value = lorebook || '';
         }
       }
+      state.hostPersonasModule?.setPersonaDescription?.();
     }
 
     saveSettings();
@@ -374,61 +447,78 @@ function updateHostPersonaData(avatarId, { description, lorebook }) {
 
 /**
  * 像「角色世界书」一样，一键跳转并打开酒馆原生的世界书编辑器并选中目标世界书
+ * 优先调用 ST 1.19 原生 openWorldInfoEditor(worldbookName)
  */
-function jumpToWorldbookInHost(worldbookName, { fromWardrobeModal = false } = {}) {
+async function jumpToWorldbookInHost(worldbookName, { fromWardrobeModal = false } = {}) {
   const targetName = String(worldbookName || '').trim();
   if (!targetName) {
-    globalThis.toastr?.warning?.('该 User 当前尚未绑定世界书，请先选择或绑定一本世界书。', '世界书跳转');
+    globalThis.toastr?.warning?.('该 User 当前尚未绑定世界书，请先在下拉框选择绑定一本世界书。', '世界书跳转');
     return false;
   }
 
-  // 1. 打开酒馆顶部的 World Info 抽屉
-  const wiDrawerContent =
-    document.querySelector('#WorldInfo') ||
-    document.querySelector('#world_info');
-  const wiToggle =
-    document.querySelector('#WI_button .drawer-toggle') ||
-    document.querySelector('#WI_button') ||
-    document.querySelector('[data-i18n="World Info"]')?.closest('.drawer-toggle');
+  await probeHostModules();
 
-  if (wiDrawerContent && (wiDrawerContent.classList.contains('closedDrawer') || ! isElementVisible(wiDrawerContent))) {
-    if (wiToggle) {
-      wiToggle.click();
-    }
-  } else if (!wiDrawerContent && wiToggle) {
-    wiToggle.click();
-  }
+  let jumped = false;
 
-  // 2. 在 #world_editor_select 中定位并选中该世界书（兼容 value 为索引或书名两种实现）
-  const editorSelect = document.querySelector('#world_editor_select');
-  if (!editorSelect) {
-    globalThis.toastr?.error?.('未找到酒馆世界书选择器 (#world_editor_select)。', '世界书跳转');
-    return false;
-  }
-
-  let matchedValue = null;
-  for (const opt of editorSelect.options) {
-    const optText = (opt.textContent || '').trim();
-    const optVal = (opt.value || '').trim();
-    if (optText === targetName || optVal === targetName) {
-      matchedValue = opt.value;
-      break;
+  // 1. 优先使用 ST 1.19 world-info.js 原生导出的 openWorldInfoEditor
+  if (typeof state.hostWorldInfoModule?.openWorldInfoEditor === 'function') {
+    try {
+      state.hostWorldInfoModule.openWorldInfoEditor(targetName);
+      jumped = true;
+    } catch (err) {
+      console.warn(`[${MODULE_ID}] openWorldInfoEditor 调用异常，回退 DOM 触发:`, err);
     }
   }
 
-  if (matchedValue === null) {
+  // 2. DOM + getContext().reloadWorldInfoEditor 兼容路径
+  if (!jumped) {
+    const wiDrawerContent =
+      document.querySelector('#WorldInfo') ||
+      document.querySelector('#world_info');
+    if (wiDrawerContent && !isElementVisible(wiDrawerContent)) {
+      const wiToggle =
+        document.querySelector('#WIDrawerIcon') ||
+        document.querySelector('#WI_button .drawer-toggle') ||
+        document.querySelector('#WI_button');
+      wiToggle?.click();
+    }
+
+    try {
+      const context = getContext();
+      if (typeof context.reloadWorldInfoEditor === 'function') {
+        context.reloadWorldInfoEditor(targetName, true);
+      }
+    } catch (_e) {}
+
+    const editorSelect = document.querySelector('#world_editor_select');
+    if (editorSelect) {
+      let matchedValue = null;
+      for (const opt of editorSelect.options) {
+        const optText = (opt.textContent || '').trim();
+        const optVal = (opt.value || '').trim();
+        if (optText === targetName || optVal === targetName) {
+          matchedValue = opt.value;
+          break;
+        }
+      }
+      if (matchedValue !== null) {
+        editorSelect.value = matchedValue;
+        if (globalThis.jQuery) {
+          globalThis.jQuery(editorSelect).trigger('change');
+        } else {
+          editorSelect.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        jumped = true;
+      }
+    }
+  }
+
+  if (!jumped) {
     globalThis.toastr?.warning?.(
-      `在酒馆世界书列表中未找到「${targetName}」，可能已被重命名或删除。`,
+      `在酒馆世界书列表中未找到「${targetName}」，请确认该世界书是否存在。`,
       '世界书跳转'
     );
     return false;
-  }
-
-  editorSelect.value = matchedValue;
-  if (globalThis.jQuery) {
-    globalThis.jQuery(editorSelect).trigger('change');
-  } else {
-    editorSelect.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
   // 3. 如果是从我们的衣柜全屏弹窗点过来的，自动收起弹窗并在右下角放一个「← 返回 User 人设衣柜」胶囊按钮
@@ -440,7 +530,7 @@ function jumpToWorldbookInHost(worldbookName, { fromWardrobeModal = false } = {}
     }
   }
 
-  globalThis.toastr?.info?.(`已在世界书编辑器中打开：${targetName}`, '世界书跳转');
+  globalThis.toastr?.info?.(`已在酒馆世界书编辑器中打开：${targetName}`, '世界书跳转');
   return true;
 }
 
@@ -456,7 +546,7 @@ function showReturnToWardrobePill(bookName) {
   pill.id = 'st_pw_return_pill';
   pill.type = 'button';
   pill.className = 'st-pw-return-pill';
-  pill.innerHTML = `<i class="fa-solid fa-rotate-left"></i> <span>已打开「${sanitizeHtml(bookName)}」· 点击返回 User 人设衣柜</span>`;
+  pill.innerHTML = `<i class="fa-solid fa-rotate-left"></i> <span>正在编辑「${sanitizeHtml(bookName)}」· 点击返回 User 人设衣柜</span>`;
   pill.addEventListener('click', () => {
     removeReturnToWardrobePill();
     openWardrobeModal();
@@ -474,13 +564,27 @@ function removeReturnToWardrobePill() {
 }
 
 /**
- * 调用酒馆原生 /api/worldinfo/get 读取世界书完整数据
+ * 读取世界书完整数据（优先使用 ST 1.19 context.loadWorldInfo 保持与酒馆内部 worldInfoCache 同步）
  */
 async function fetchWorldbookData(worldbookName) {
   const name = String(worldbookName || '').trim();
   if (!name) throw new Error('世界书名称为空');
 
   const context = getContext();
+  if (typeof context.loadWorldInfo === 'function') {
+    const data = await context.loadWorldInfo(name);
+    if (data && typeof data === 'object') {
+      if (!data.entries || typeof data.entries !== 'object') {
+        data.entries = {};
+      }
+      state.worldbookCache.set(name, {
+        fetchedAt: Date.now(),
+        data,
+      });
+      return data;
+    }
+  }
+
   const headers =
     typeof context.getRequestHeaders === 'function'
       ? context.getRequestHeaders()
@@ -505,19 +609,29 @@ async function fetchWorldbookData(worldbookName) {
   }
   state.worldbookCache.set(name, {
     fetchedAt: Date.now(),
-    data: structuredClone(data),
+    data,
   });
   return data;
 }
 
 /**
- * 调用酒馆原生 /api/worldinfo/edit 保存修改后的世界书条目
+ * 保存修改后的世界书条目（优先使用 ST 1.19 context.saveWorldInfo + reloadWorldInfoEditor）
  */
 async function saveWorldbookData(worldbookName, worldData) {
   const name = String(worldbookName || '').trim();
   if (!name || !worldData) throw new Error('世界书名称或数据为空');
 
   const context = getContext();
+  if (typeof context.saveWorldInfo === 'function') {
+    await context.saveWorldInfo(name, worldData, true);
+    state.worldbookCache.set(name, {
+      fetchedAt: Date.now(),
+      data: worldData,
+    });
+    context.reloadWorldInfoEditor?.(name, false);
+    return true;
+  }
+
   const headers =
     typeof context.getRequestHeaders === 'function'
       ? context.getRequestHeaders()
@@ -535,10 +649,9 @@ async function saveWorldbookData(worldbookName, worldData) {
 
   state.worldbookCache.set(name, {
     fetchedAt: Date.now(),
-    data: structuredClone(worldData),
+    data: worldData,
   });
 
-  // 若酒馆当前在世界书面板里正好打开了这本书，触发一次刷新
   const editorSelect = document.querySelector('#world_editor_select');
   if (editorSelect) {
     const selectedOpt = editorSelect.options?.[editorSelect.selectedIndex];
@@ -764,7 +877,6 @@ function renderWorldbookInspectorContent(modal, worldbookName, worldData) {
       </div>
     `;
 
-    // 绑定事件
     modal.querySelector('.st-pw-close-wb-modal')?.addEventListener('click', () => {
       modal.classList.add('st-pw-hidden');
     });
@@ -1075,7 +1187,6 @@ function renderWardrobeModalContent() {
     state.selectedAvatarId = selectedPersona.avatarId;
   }
 
-  // 过滤左侧人设列表
   const q = state.searchQuery.trim().toLowerCase();
   const filteredPersonas = personas
     .filter((p) => {
@@ -1136,7 +1247,7 @@ function renderWardrobeModalContent() {
           <div>
             <h3 class="st-pw-modal-title">User 人设与世界书总管</h3>
             <p class="st-pw-modal-subtitle">
-              共收纳 <strong>${personas.length}</strong> 个 User 档案 · 支持分类检索、一键切人设、世界书跳转与弹窗直接改条目
+              共收纳 <strong>${personas.length}</strong> 个 User 档案 · 支持分类检索、跨分页一键切人设、世界书跳转与弹窗直接改条目
             </p>
           </div>
         </div>
@@ -1286,7 +1397,7 @@ function renderWardrobeModalContent() {
         <main class="st-pw-detail-pane">
           ${
             !selectedPersona
-              ? `<div class="st-pw-empty-state">尚未在酒馆中检测到任何 User 人设。请先打开一次酒馆顶部的「User 人设管理」抽屉。</div>`
+              ? `<div class="st-pw-empty-state">尚未在酒馆中检测到任何 User 人设。</div>`
               : renderSelectedPersonaDetail(selectedPersona, availableBooks, settings)
           }
         </main>
@@ -1338,19 +1449,19 @@ function renderSelectedPersonaDetail(persona, availableBooks, settings) {
             <label>标签（逗号分隔）：</label>
             <input type="text" id="st_pw_detail_tags" class="text_pole st-pw-inline-input" placeholder="如：高冷, 调查员, 现代" value="${escapeAttr(meta.tags.join(', '))}" />
             <label>常用关联角色卡：</label>
-            <input type="text" id="st_pw_detail_chars" class="text_pole st-pw-inline-input" placeholder="填角色名，切聊天可自动匹配" value="${escapeAttr(meta.boundCharacters.join(', '))}" />
+            <input type="text" id="st_pw_detail_chars" class="text_pole st-pw-inline-input" placeholder="填角色名，切聊天可提醒" value="${escapeAttr(meta.boundCharacters.join(', '))}" />
           </div>
         </div>
       </div>
     </div>
 
-    <!-- 模块 1：世界书绑定、一键跳转与弹窗速编中心 (核心解决原生世界书不好使) -->
+    <!-- 模块 1：世界书绑定、一键跳转与弹窗速编中心 -->
     <section class="st-pw-section-card">
       <div class="st-pw-section-head">
         <div>
           <h3><i class="fa-solid fa-earth-asia st-pw-accent-icon"></i> 关联世界书总控（支持一键跳转面板 & 弹窗直接改条目）</h3>
           <p class="st-pw-section-desc">
-            原生主世界书会直接同步给酒馆自带的 Persona Lorebook；你还可以额外绑定多本附加世界书，切换此 User 时自动联动生效。
+            原生主世界书会直接同步给酒馆自带的 Persona Lorebook（无需再按 Shift 点那个小地球）；你还可以额外绑定多本附加世界书，切换此 User 时自动联动生效。
           </p>
         </div>
       </div>
@@ -1428,7 +1539,7 @@ function renderSelectedPersonaDetail(persona, availableBooks, settings) {
       </div>
     </section>
 
-    <!-- 模块 2：A. User 随身设定卡片（不用专门建世界书也能随时勾选开关的模块化人设） -->
+    <!-- 模块 2：A. User 随身设定卡片 -->
     <section class="st-pw-section-card">
       <div class="st-pw-section-head">
         <div>
@@ -1525,7 +1636,6 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
     await openActivePromptPreviewModal();
   });
 
-  // 搜索框
   const searchInput = modal.querySelector('#st_pw_search_input');
   searchInput?.addEventListener('input', (e) => {
     state.searchQuery = e.target.value;
@@ -1538,7 +1648,6 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
     }
   });
 
-  // 分类标签切换
   modal.querySelectorAll('.st-pw-tab-btn[data-tab]').forEach((btn) => {
     btn.addEventListener('click', () => {
       state.activeModalTab = btn.getAttribute('data-tab') || 'all';
@@ -1546,7 +1655,6 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
     });
   });
 
-  // 新增自定义分组
   modal.querySelector('.st-pw-add-group-btn')?.addEventListener('click', () => {
     const newGroup = window.prompt('请输入新的人设分类名称（例如：克苏鲁跑团、校园恋爱）：');
     if (newGroup && newGroup.trim()) {
@@ -1560,7 +1668,6 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
     }
   });
 
-  // 点击左侧卡片选中详情
   modal.querySelectorAll('.st-pw-persona-card').forEach((card) => {
     card.addEventListener('click', (e) => {
       if (
@@ -1574,7 +1681,6 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
     });
   });
 
-  // 收藏按钮
   modal.querySelectorAll('.st-pw-fav-btn').forEach((btn) => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -1587,7 +1693,6 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
     });
   });
 
-  // 一键切换 User
   modal.querySelectorAll('.st-pw-use-persona-btn, .st-pw-detail-switch-btn').forEach((btn) => {
     btn.addEventListener('click', async (e) => {
       e.stopPropagation();
@@ -1599,7 +1704,6 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
     });
   });
 
-  // 所有「跳转世界书面板」按钮
   modal.querySelectorAll('.st-pw-act-jump-book').forEach((btn) => {
     btn.addEventListener('click', () => {
       const book = btn.getAttribute('data-book');
@@ -1607,7 +1711,6 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
     });
   });
 
-  // 所有「弹窗管理条目」按钮
   modal.querySelectorAll('.st-pw-act-popup-book').forEach((btn) => {
     btn.addEventListener('click', () => {
       const book = btn.getAttribute('data-book');
@@ -1618,7 +1721,6 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
   if (!selectedPersona) return;
   const meta = selectedPersona.meta;
 
-  // 分类、标签、关联角色卡修改
   modal.querySelector('#st_pw_detail_group')?.addEventListener('change', (e) => {
     meta.group = e.target.value;
     saveSettings();
@@ -1642,7 +1744,6 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
     saveSettings();
   });
 
-  // 更换原生主绑定世界书
   modal.querySelector('#st_pw_primary_book_select')?.addEventListener('change', (e) => {
     const newBook = e.target.value;
     updateHostPersonaData(selectedPersona.avatarId, { lorebook: newBook });
@@ -1652,7 +1753,6 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
     );
   });
 
-  // 添加附加绑定世界书
   modal.querySelector('#st_pw_add_extra_book_btn')?.addEventListener('click', () => {
     const sel = modal.querySelector('#st_pw_add_extra_book_select');
     const bookName = sel?.value?.trim();
@@ -1687,7 +1787,6 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
     });
   });
 
-  // 随身设定卡片 (A)
   modal.querySelector('#st_pw_add_trait_btn')?.addEventListener('click', () => {
     meta.traits.push({
       id: `trait_${Date.now()}`,
@@ -1762,7 +1861,6 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
     });
   });
 
-  // 保存基础人设描述与私密备注
   modal.querySelector('#st_pw_save_base_desc_btn')?.addEventListener('click', () => {
     const newDesc = modal.querySelector('#st_pw_base_description')?.value ?? '';
     const newNote = modal.querySelector('#st_pw_private_note')?.value ?? '';
@@ -1852,7 +1950,8 @@ async function openActivePromptPreviewModal() {
 }
 
 /**
- * 在酒馆原生 Persona Management 面板的「Persona Lorebook」旁注入【↗ 跳转世界书】【📖 弹窗条目】【🗂️ 人设衣柜】快捷按钮
+ * 在酒馆原生 Persona Management 面板（ST 1.19 `#persona_lore_button` 所在控制栏或 `#persona_description` 上方）
+ * 注入直观的【当前绑定世界书下拉切换 + ↗ 跳转世界书 + 📖 弹窗条目 + 🗂️ 人设衣柜】工具条
  */
 function syncNativePersonaPanelEnhancement() {
   const settings = getSettings();
@@ -1863,49 +1962,71 @@ function syncNativePersonaPanelEnhancement() {
     return;
   }
 
-  const loreSelect = document.querySelector('#persona_description_lorebook');
-  const personaPanel =
-    loreSelect?.closest('#PersonaManagement') ||
-    document.querySelector('#user-settings-block') ||
-    loreSelect?.parentElement;
+  // ST 1.19 真实 DOM 锚点：#persona_lore_button 所在的 .persona_controls_buttons_block 或 #persona_description_lorebook
+  const anchorEl =
+    document.querySelector('#persona_lore_button')?.closest('.persona_controls_buttons_block') ||
+    document.querySelector('#persona_description_lorebook') ||
+    document.querySelector('#persona_description');
 
-  if (!loreSelect || !personaPanel) return;
+  if (!anchorEl) return;
 
   let helperBar = existingBar;
   if (!helperBar) {
     helperBar = document.createElement('div');
     helperBar.id = 'st_pw_native_persona_helper';
     helperBar.className = 'st-pw-native-helper-bar';
-    loreSelect.insertAdjacentElement('afterend', helperBar);
+    if (anchorEl.id === 'persona_description') {
+      anchorEl.insertAdjacentElement('beforebegin', helperBar);
+    } else {
+      anchorEl.insertAdjacentElement('afterend', helperBar);
+    }
   }
 
-  const getSelectedNativeBook = () => {
-    const personas = getHostPersonas();
-    const active = personas.find((p) => p.isActive);
-    if (active?.lorebook) return active.lorebook;
-    const opt = loreSelect.options?.[loreSelect.selectedIndex];
-    const txt = opt ? opt.textContent.trim() : '';
-    return loreSelect.value && txt && !txt.includes('None') && !txt.startsWith('---') ? txt : '';
-  };
+  const personas = getHostPersonas();
+  const active = personas.find((p) => p.isActive);
+  const currentBook = active?.lorebook || '';
+  const availableBooks = getAvailableWorldbooks();
 
   helperBar.innerHTML = `
-    <button type="button" class="menu_button st-pw-mini-btn st-pw-native-jump-btn" title="像角色世界书一样直接跳转打开这本世界书">
-      <i class="fa-solid fa-arrow-up-right-from-square"></i> 跳转打开此世界书
+    <span class="st-pw-native-bar-label"><i class="fa-solid fa-book-atlas"></i> 绑定世界书：</span>
+    <select id="st_pw_native_quick_book_select" class="text_pole st-pw-native-quick-select" title="无需按 Shift 点地球，直接在这里切换当前 User 绑定的世界书">
+      <option value="">— 未绑定 —</option>
+      ${availableBooks
+        .map(
+          (b) =>
+            `<option value="${escapeAttr(b)}" ${currentBook === b ? 'selected' : ''}>${sanitizeHtml(b)}</option>`
+        )
+        .join('')}
+    </select>
+    <button type="button" class="menu_button st-pw-mini-btn st-pw-native-jump-btn" ${!currentBook ? 'disabled' : ''} title="像角色世界书一样直接跳转打开这本世界书">
+      <i class="fa-solid fa-arrow-up-right-from-square"></i> 跳转面板
     </button>
-    <button type="button" class="menu_button st-pw-mini-btn st-pw-native-popup-btn" title="直接在弹窗里查看、搜索、开关这本世界书的条目">
-      <i class="fa-solid fa-book-open"></i> 弹窗管理条目
+    <button type="button" class="menu_button st-pw-mini-btn st-pw-native-popup-btn" ${!currentBook ? 'disabled' : ''} title="直接在弹窗里查看、搜索、开关这本世界书的条目">
+      <i class="fa-solid fa-book-open"></i> 弹窗条目
     </button>
-    <button type="button" class="menu_button st-pw-mini-btn st-pw-native-wardrobe-btn" title="打开多 User 分类衣柜与随身设定总管">
+    <button type="button" class="menu_button st-pw-mini-btn st-pw-primary-action-btn st-pw-native-wardrobe-btn" title="打开多 User 分类衣柜与随身设定总管">
       <i class="fa-solid fa-id-card-clip"></i> User 衣柜总管
     </button>
   `;
 
+  helperBar.querySelector('#st_pw_native_quick_book_select')?.addEventListener('change', (e) => {
+    const newBook = e.target.value;
+    const activeId = getActiveAvatarId();
+    if (activeId) {
+      updateHostPersonaData(activeId, { lorebook: newBook });
+      globalThis.toastr?.success?.(
+        newBook ? `当前 User 已绑定世界书：${newBook}` : '已解除当前 User 世界书绑定',
+        'User 人设衣柜'
+      );
+    }
+  });
+
   helperBar.querySelector('.st-pw-native-jump-btn')?.addEventListener('click', () => {
-    jumpToWorldbookInHost(getSelectedNativeBook(), { fromWardrobeModal: false });
+    jumpToWorldbookInHost(currentBook, { fromWardrobeModal: false });
   });
 
   helperBar.querySelector('.st-pw-native-popup-btn')?.addEventListener('click', () => {
-    openWorldbookInspectorModal(getSelectedNativeBook());
+    openWorldbookInspectorModal(currentBook);
   });
 
   helperBar.querySelector('.st-pw-native-wardrobe-btn')?.addEventListener('click', () => {
@@ -1919,7 +2040,6 @@ function syncNativePersonaPanelEnhancement() {
 function syncQuickEntryButtons() {
   const settings = getSettings();
 
-  // 1. 顶部导航栏按钮
   const existingTopBtn = document.querySelector('#st_pw_topbar_btn');
   if (!settings.showTopbarButton) {
     existingTopBtn?.remove();
@@ -1945,7 +2065,6 @@ function syncQuickEntryButtons() {
     }
   }
 
-  // 2. 魔棒菜单按钮 (#extensionsMenu)
   const existingWandBtn = document.querySelector('#st_pw_wand_btn');
   if (!settings.showWandButton) {
     existingWandBtn?.remove();
@@ -1998,9 +2117,6 @@ function refreshAllViews() {
   renderWardrobeModalContent();
 }
 
-/**
- * 切换角色聊天时检查是否有绑定该角色的专属 User 人设
- */
 function onChatChanged() {
   refreshAllViews();
   const settings = getSettings();
@@ -2026,9 +2142,6 @@ function onChatChanged() {
   } catch (_e) {}
 }
 
-/**
- * 注册 /pwardrobe 斜杠命令
- */
 function registerSlashCommands() {
   try {
     const context = getContext();
@@ -2076,9 +2189,6 @@ function registerSlashCommands() {
   }
 }
 
-/**
- * 注入扩展设置面板并绑定控件
- */
 async function mountSettingsPanel() {
   if (document.querySelector('#st_persona_wardrobe_settings')) return;
   const context = getContext();
@@ -2143,7 +2253,6 @@ async function mountSettingsPanel() {
     openWorldbookInspectorModal(active?.lorebook);
   });
 
-  // 导出配置
   document.querySelector('#st_pw_export_btn')?.addEventListener('click', () => {
     const payload = JSON.stringify(getSettings(), null, 2);
     const blob = new Blob([payload], { type: 'application/json' });
@@ -2155,7 +2264,6 @@ async function mountSettingsPanel() {
     URL.revokeObjectURL(url);
   });
 
-  // 导入配置
   const importFile = document.querySelector('#st_pw_import_file');
   document.querySelector('#st_pw_import_btn')?.addEventListener('click', () => {
     importFile?.click();
@@ -2189,6 +2297,7 @@ async function initExtension() {
   if (state.initialized) return;
   state.initialized = true;
 
+  await probeHostModules();
   getSettings();
   await mountSettingsPanel();
   registerSlashCommands();
@@ -2210,7 +2319,6 @@ async function initExtension() {
         state.worldbookCache.clear();
         refreshAllViews();
       });
-      // 兼容 ST v1.17+ 新增的 PERSONA_* 事件
       subscribe(event_types.PERSONA_CHANGED, refreshAllViews);
       subscribe(event_types.PERSONA_CREATED, refreshAllViews);
       subscribe(event_types.PERSONA_UPDATED, refreshAllViews);
@@ -2249,7 +2357,6 @@ export async function onClean() {
   state.worldbookCache.clear();
 }
 
-// 兼容 ST v1.14 - v1.16 无 manifest.hooks 的加载路径（幂等防重复初始化）
 if (typeof globalThis.jQuery === 'function') {
   globalThis.jQuery(() => {
     initExtension();
