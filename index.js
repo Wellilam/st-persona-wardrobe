@@ -286,7 +286,32 @@ function resolvePersonaAvatarUrl(avatarId) {
 }
 
 /**
- * 读取所有 User Personas，并解析它们在酒馆原生 connections 和插件里绑定的角色卡
+ * 从角色对象读取 Luker 专属的 character.data.extensions.luker.dedicated_personas
+ */
+function extractLukerDedicatedPersonas(rawChar) {
+  if (!rawChar || typeof rawChar !== 'object') return [];
+  if (typeof state.hostPersonasModule?.getDedicatedPersonaEntriesFromCharacter === 'function') {
+    try {
+      const list = state.hostPersonasModule.getDedicatedPersonaEntriesFromCharacter(rawChar);
+      if (Array.isArray(list)) return list;
+    } catch (_e) {}
+  }
+  const direct = rawChar?.data?.extensions?.luker?.dedicated_personas;
+  if (Array.isArray(direct)) return direct;
+  if (typeof rawChar?.json_data === 'string' && rawChar.json_data.trim()) {
+    try {
+      const parsed = JSON.parse(rawChar.json_data);
+      const fromJson = parsed?.data?.extensions?.luker?.dedicated_personas;
+      if (Array.isArray(fromJson)) return fromJson;
+    } catch (_e) {}
+  }
+  return [];
+}
+
+/**
+ * 读取所有 User Personas，同时兼容：
+ * 1. 标准 SillyTavern 的 power_user.personas / persona_descriptions.connections
+ * 2. Luker (funnycups/Luker) 的 character.data.extensions.luker.dedicated_personas（含 Character-Only 专属人设）
  */
 function getHostPersonas() {
   let context = null;
@@ -301,6 +326,7 @@ function getHostPersonas() {
       ? pu.persona_descriptions
       : {};
 
+  const rawChars = Array.isArray(context?.characters) ? context.characters : [];
   const hostChars = getHostCharacters();
   const charByAvatar = new Map(hostChars.map((c) => [c.avatar, c]));
   const charByNameLower = new Map(hostChars.map((c) => [c.name.toLowerCase(), c]));
@@ -328,9 +354,54 @@ function getHostPersonas() {
       role: descObj.role,
       title: String(descObj.title ?? ''),
       connections,
+      lukerDedicatedChars: [],
+      isLukerCharacterOnly: false,
       avatarUrl: resolvePersonaAvatarUrl(avatarId),
       isActive: isCurrent,
     });
+  }
+
+  // 扫描 Luker 的 character.data.extensions.luker.dedicated_personas
+  // 在 Luker 中选择 "Character Only" 绑定后，人设会从 power_user.personas 移除并仅存于角色卡内
+  for (const rawChar of rawChars) {
+    const charName = String(rawChar?.name || '').trim();
+    const charAvatar = String(rawChar?.avatar || '').trim();
+    if (!charName) continue;
+    const dedicatedList = extractLukerDedicatedPersonas(rawChar);
+    for (const entry of dedicatedList) {
+      const avatarId = String(entry?.avatar || '').trim();
+      if (!avatarId) continue;
+      const isCurrent = avatarId === activeAvatarId;
+      if (!resultMap.has(avatarId)) {
+        resultMap.set(avatarId, {
+          avatarId,
+          name: String(entry.name || avatarId),
+          description: String(entry.description ?? (isCurrent ? pu.persona_description ?? '' : '')),
+          lorebook: String(entry.lorebook || (isCurrent ? pu.persona_description_lorebook || '' : '')),
+          position: entry.position,
+          depth: entry.depth,
+          role: entry.role,
+          title: String(entry.title ?? ''),
+          connections: [],
+          lukerDedicatedChars: [charName],
+          lukerCharacterAvatars: charAvatar ? [charAvatar] : [],
+          isLukerCharacterOnly: true,
+          avatarUrl: resolvePersonaAvatarUrl(avatarId),
+          isActive: isCurrent,
+        });
+      } else {
+        const existing = resultMap.get(avatarId);
+        if (!existing.lukerDedicatedChars.includes(charName)) {
+          existing.lukerDedicatedChars.push(charName);
+        }
+        if (!existing.description && entry.description) {
+          existing.description = String(entry.description);
+        }
+        if (!existing.lorebook && entry.lorebook) {
+          existing.lorebook = String(entry.lorebook);
+        }
+      }
+    }
   }
 
   const avatarNodes = document.querySelectorAll(
@@ -356,6 +427,8 @@ function getHostPersonas() {
         lorebook: String(descObj.lorebook ?? ''),
         title: String(descObj.title ?? ''),
         connections: Array.isArray(descObj.connections) ? descObj.connections : [],
+        lukerDedicatedChars: [],
+        isLukerCharacterOnly: false,
         avatarUrl: imgSrc,
         isActive: isSelected,
       });
@@ -371,7 +444,10 @@ function getHostPersonas() {
     const meta = ensureProfileMeta(item.avatarId);
     const mergedCharNames = new Set(meta.boundCharacters.filter(Boolean));
 
-    // 解析酒馆原生 connections（含角色锁定与群聊锁定）
+    for (const cName of item.lukerDedicatedChars || []) {
+      if (cName) mergedCharNames.add(cName);
+    }
+
     for (const conn of item.connections) {
       if (!conn?.id) continue;
       if (conn.type === 'character') {
@@ -472,7 +548,7 @@ function buildUnifiedPersonaGroups(personas) {
 /**
  * 将某个 User 绑定到指定角色名（同时开启酒馆原生 persona_allow_multi_connections 并写入 connections）
  */
-function bindPersonaToCharacter(avatarId, characterName) {
+async function bindPersonaToCharacter(avatarId, characterName) {
   const cleanName = String(characterName || '').trim();
   if (!avatarId || !cleanName) return;
 
@@ -482,39 +558,68 @@ function bindPersonaToCharacter(avatarId, characterName) {
   }
 
   try {
-    const hostChar = getHostCharacters().find(
-      (c) => c.name.toLowerCase() === cleanName.toLowerCase()
-    );
     const context = getContext();
+    const rawChars = Array.isArray(context.characters) ? context.characters : [];
+    const rawChar = rawChars.find(
+      (c) => String(c?.name || '').trim().toLowerCase() === cleanName.toLowerCase()
+    );
     const pu = context.powerUserSettings || globalThis.power_user;
+
     if (pu) {
-      // 自动开启酒馆「允许多个 Persona 连接到同一角色」，防止酒馆原生逻辑把同角色下的其他 User 顶掉
       pu.persona_allow_multi_connections = true;
       const multiChk = document.querySelector('#persona_allow_multi_connections');
       if (multiChk) multiChk.checked = true;
+    }
 
-      if (hostChar?.avatar) {
-        if (!pu.persona_descriptions) pu.persona_descriptions = {};
-        if (!pu.persona_descriptions[avatarId]) {
-          pu.persona_descriptions[avatarId] = {
-            description: '',
-            position: 0,
-            depth: 2,
-            role: 0,
-            lorebook: '',
-            title: '',
-            connections: [],
-          };
-        }
-        if (!Array.isArray(pu.persona_descriptions[avatarId].connections)) {
-          pu.persona_descriptions[avatarId].connections = [];
-        }
-        const conns = pu.persona_descriptions[avatarId].connections;
-        if (!conns.some((c) => c.type === 'character' && c.id === hostChar.avatar)) {
-          conns.push({ type: 'character', id: hostChar.avatar });
-        }
+    // 1. 若在 Luker 环境（存在 setCharacterDedicatedPersonaEntries），同步写入角色卡的 dedicated_personas
+    if (
+      rawChar?.avatar &&
+      typeof state.hostPersonasModule?.setCharacterDedicatedPersonaEntries === 'function'
+    ) {
+      const existingPersona = getHostPersonas().find((p) => p.avatarId === avatarId);
+      const currentDedicated = extractLukerDedicatedPersonas(rawChar);
+      if (!currentDedicated.some((e) => String(e?.avatar || '').trim() === avatarId)) {
+        const nextEntries = [
+          ...currentDedicated,
+          {
+            avatar: avatarId,
+            name: existingPersona?.name || pu?.personas?.[avatarId] || avatarId,
+            description: existingPersona?.description ?? pu?.persona_descriptions?.[avatarId]?.description ?? '',
+            position: existingPersona?.position ?? 0,
+            depth: existingPersona?.depth ?? 2,
+            role: existingPersona?.role ?? 0,
+            lorebook: existingPersona?.lorebook ?? pu?.persona_descriptions?.[avatarId]?.lorebook ?? '',
+            title: existingPersona?.title ?? '',
+          },
+        ];
+        await state.hostPersonasModule.setCharacterDedicatedPersonaEntries(
+          rawChar.avatar,
+          nextEntries
+        );
+      }
+    } else if (rawChar?.avatar && pu) {
+      // 2. 标准 SillyTavern 环境：写入 power_user.persona_descriptions[avatarId].connections
+      if (!pu.persona_descriptions) pu.persona_descriptions = {};
+      if (!pu.persona_descriptions[avatarId]) {
+        pu.persona_descriptions[avatarId] = {
+          description: '',
+          position: 0,
+          depth: 2,
+          role: 0,
+          lorebook: '',
+          title: '',
+          connections: [],
+        };
+      }
+      if (!Array.isArray(pu.persona_descriptions[avatarId].connections)) {
+        pu.persona_descriptions[avatarId].connections = [];
+      }
+      const conns = pu.persona_descriptions[avatarId].connections;
+      if (!conns.some((c) => c.type === 'character' && c.id === rawChar.avatar)) {
+        conns.push({ type: 'character', id: rawChar.avatar });
       }
     }
+
     state.hostPersonasModule?.updatePersonaConnectionsAvatarList?.();
     state.hostPersonasModule?.updatePersonaUIStates?.();
   } catch (_e) {}
@@ -523,7 +628,7 @@ function bindPersonaToCharacter(avatarId, characterName) {
   refreshAllViews();
 }
 
-function unbindPersonaFromCharacter(avatarId, characterName) {
+async function unbindPersonaFromCharacter(avatarId, characterName) {
   const cleanName = String(characterName || '').trim();
   if (!avatarId || !cleanName) return;
 
@@ -533,15 +638,36 @@ function unbindPersonaFromCharacter(avatarId, characterName) {
   );
 
   try {
-    const hostChar = getHostCharacters().find(
-      (c) => c.name.toLowerCase() === cleanName.toLowerCase()
-    );
     const context = getContext();
+    const rawChars = Array.isArray(context.characters) ? context.characters : [];
+    const rawChar = rawChars.find(
+      (c) => String(c?.name || '').trim().toLowerCase() === cleanName.toLowerCase()
+    );
     const pu = context.powerUserSettings || globalThis.power_user;
-    if (hostChar?.avatar && Array.isArray(pu?.persona_descriptions?.[avatarId]?.connections)) {
+
+    // 1. Luker 环境：同步从 character.data.extensions.luker.dedicated_personas 移除（并默认恢复回全局）
+    if (
+      rawChar?.avatar &&
+      typeof state.hostPersonasModule?.setCharacterDedicatedPersonaEntries === 'function'
+    ) {
+      const currentDedicated = extractLukerDedicatedPersonas(rawChar);
+      const nextEntries = currentDedicated.filter(
+        (e) => String(e?.avatar || '').trim() !== avatarId
+      );
+      if (nextEntries.length !== currentDedicated.length) {
+        await state.hostPersonasModule.setCharacterDedicatedPersonaEntries(
+          rawChar.avatar,
+          nextEntries,
+          { restoreRemovedToGlobal: true }
+        );
+      }
+    }
+
+    // 2. 标准 SillyTavern 环境：从 connections 移除
+    if (rawChar?.avatar && Array.isArray(pu?.persona_descriptions?.[avatarId]?.connections)) {
       pu.persona_descriptions[avatarId].connections =
         pu.persona_descriptions[avatarId].connections.filter(
-          (c) => !(c.type === 'character' && c.id === hostChar.avatar)
+          (c) => !(c.type === 'character' && c.id === rawChar.avatar)
         );
     }
     state.hostPersonasModule?.updatePersonaConnectionsAvatarList?.();
@@ -591,35 +717,66 @@ async function switchActivePersona(avatarId) {
   return false;
 }
 
-function updateHostPersonaData(avatarId, { description, lorebook }) {
+async function updateHostPersonaData(avatarId, { description, lorebook }) {
   try {
     const context = getContext();
     const pu = context.powerUserSettings || globalThis.power_user;
     const isCurrent = avatarId === getActiveAvatarId();
+    const isGlobal = Boolean(pu?.personas && Object.hasOwn(pu.personas, avatarId));
 
     if (pu) {
-      if (!pu.persona_descriptions) pu.persona_descriptions = {};
-      if (!pu.persona_descriptions[avatarId]) {
-        pu.persona_descriptions[avatarId] = {
-          description: '',
-          position: 0,
-          depth: 2,
-          role: 0,
-          lorebook: '',
-          title: '',
-          connections: [],
-        };
+      if (isGlobal || !pu.persona_descriptions?.[avatarId]) {
+        if (!pu.persona_descriptions) pu.persona_descriptions = {};
+        if (isGlobal && !pu.persona_descriptions[avatarId]) {
+          pu.persona_descriptions[avatarId] = {
+            description: '',
+            position: 0,
+            depth: 2,
+            role: 0,
+            lorebook: '',
+            title: '',
+            connections: [],
+          };
+        }
       }
       if (description !== undefined) {
-        pu.persona_descriptions[avatarId].description = description;
+        if (pu.persona_descriptions?.[avatarId]) {
+          pu.persona_descriptions[avatarId].description = description;
+        }
         if (isCurrent) {
           pu.persona_description = description;
         }
       }
       if (lorebook !== undefined) {
-        pu.persona_descriptions[avatarId].lorebook = lorebook;
+        if (pu.persona_descriptions?.[avatarId]) {
+          pu.persona_descriptions[avatarId].lorebook = lorebook;
+        }
         if (isCurrent) {
           pu.persona_description_lorebook = lorebook;
+        }
+      }
+    }
+
+    // Luker 兼容：如果该 User 也存在于某些角色卡的 dedicated_personas 中，同步更新角色卡内的 dedicated_personas
+    if (typeof state.hostPersonasModule?.setCharacterDedicatedPersonaEntries === 'function') {
+      const rawChars = Array.isArray(context.characters) ? context.characters : [];
+      for (const rawChar of rawChars) {
+        if (!rawChar?.avatar) continue;
+        const dedicated = extractLukerDedicatedPersonas(rawChar);
+        const idx = dedicated.findIndex((e) => String(e?.avatar || '').trim() === avatarId);
+        if (idx !== -1) {
+          const nextEntries = dedicated.map((e, i) => {
+            if (i !== idx) return e;
+            return {
+              ...e,
+              ...(description !== undefined ? { description } : {}),
+              ...(lorebook !== undefined ? { lorebook } : {}),
+            };
+          });
+          await state.hostPersonasModule.setCharacterDedicatedPersonaEntries(
+            rawChar.avatar,
+            nextEntries
+          );
         }
       }
     }
