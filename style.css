@@ -1094,7 +1094,51 @@
   opacity: 0.58;
 }
 
+/* 使用足迹统计 & 去重提示 */
+.st-pw-stats-metrics-row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.st-pw-stat-cell {
+  background: var(--black30a, rgba(0, 0, 0, 0.22));
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.08));
+  border-radius: 4px;
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.st-pw-stat-label {
+  font-size: 0.74rem;
+  opacity: 0.65;
+}
+
+.st-pw-stat-val {
+  font-size: 0.88rem;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.st-pw-usage-badge {
+  opacity: 0.85;
+}
+
+.st-pw-dedup-notice {
+  font-size: 0.74rem;
+  opacity: 0.68;
+  padding: 2px 6px;
+  border-left: 2px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.28));
+}
+
 @media (max-width: 860px) {
+  .st-pw-stats-metrics-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
   .st-pw-modal-backdrop {
     padding: 8px;
   }

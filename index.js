@@ -28,19 +28,57 @@ const DEFAULT_SETTINGS = Object.freeze({
 const state = {
   initialized: false,
   disposers: [],
-  activeFilter: 'all', // 'all' | 'fav' | 'char:<charKey>' | 'group:<groupName>' | 'ungrouped'
+  activeFilter: 'all', // 'all' | 'global' | 'dedicated' | 'chatted' | 'fav' | 'char:<charKey>' | 'group:<groupName>' | 'ungrouped'
   collapsedSections: new Set(),
   batchAssignTarget: null, // null | { type: 'character', key: string, name: string } | { type: 'group', name: string }
   searchQuery: '',
   selectedAvatarId: null,
   expandedTraitIdx: null,
+  showStatsDetail: false,
+  isScanningHistory: false,
+  scanProgressText: '',
+  lastUserInteractionAt: Date.now(),
   useRawNativeLeftList: false,
+  diskAvatarSet: null,
+  diskAvatarFetched: false,
+  lastExcludedOrphanCount: 0,
+  lastMergedDuplicateCount: 0,
   worldbookCache: new Map(),
   lastPromptInjectedSummary: [],
   minimizedReturnPill: null,
   hostPersonasModule: null,
   hostWorldInfoModule: null,
 };
+
+async function refreshDiskAvatarSet() {
+  try {
+    const context = getContext();
+    const rawHeaders =
+      typeof context.getRequestHeaders === 'function'
+        ? { ...context.getRequestHeaders({ omitContentType: true }) }
+        : {};
+    delete rawHeaders['Content-Type'];
+    delete rawHeaders['content-type'];
+
+    const response = await fetch('/api/avatars/get', {
+      method: 'POST',
+      headers: rawHeaders,
+    });
+    if (response.ok) {
+      const list = await response.json();
+      if (Array.isArray(list)) {
+        state.diskAvatarSet = new Set(
+          list.map((x) => String(x || '').trim()).filter(Boolean)
+        );
+        state.diskAvatarFetched = true;
+        return state.diskAvatarSet;
+      }
+    }
+  } catch (err) {
+    console.warn(`[${MODULE_ID}] 读取 /api/avatars/get 跳过:`, err);
+  }
+  return state.diskAvatarSet;
+}
 
 function getContext() {
   const context = globalThis.SillyTavern?.getContext?.();
@@ -147,6 +185,10 @@ function ensureProfileMeta(avatarId) {
       traits: [],
       presets: [],
       activePresetId: '',
+      usageStats: {
+        chats: {},
+        extraLiveMs: 0,
+      },
     };
   }
   const profile = settings.profiles[avatarId];
@@ -159,7 +201,442 @@ function ensureProfileMeta(avatarId) {
   if (!Array.isArray(profile.traits)) profile.traits = [];
   if (!Array.isArray(profile.presets)) profile.presets = [];
   if (typeof profile.activePresetId !== 'string') profile.activePresetId = '';
+  if (!profile.usageStats || typeof profile.usageStats !== 'object') {
+    profile.usageStats = { chats: {}, extraLiveMs: 0 };
+  }
+  if (!profile.usageStats.chats || typeof profile.usageStats.chats !== 'object') {
+    profile.usageStats.chats = {};
+  }
+  if (typeof profile.usageStats.extraLiveMs !== 'number') {
+    profile.usageStats.extraLiveMs = 0;
+  }
   return profile;
+}
+
+function formatDurationShort(ms) {
+  const val = Math.max(0, Number(ms) || 0);
+  if (val <= 0) return '0分';
+  if (val < 60_000) return '<1分';
+  if (val < 3600_000) return `${Math.round(val / 60_000)}分`;
+  const hours = (val / 3600_000).toFixed(1).replace(/\.0$/, '');
+  return `${hours}h`;
+}
+
+function formatDurationHuman(ms) {
+  const val = Math.max(0, Number(ms) || 0);
+  if (val <= 0) return '0 分';
+  if (val < 60_000) return `${Math.max(1, Math.round(val / 1000))} 秒`;
+  const totalMins = Math.floor(val / 60_000);
+  if (totalMins < 60) {
+    const secs = Math.round((val % 60_000) / 1000);
+    return secs > 0 ? `${totalMins} 分 ${secs} 秒` : `${totalMins} 分钟`;
+  }
+  const hours = Math.floor(totalMins / 60);
+  const mins = totalMins % 60;
+  return mins > 0 ? `${hours} 小时 ${mins} 分` : `${hours} 小时`;
+}
+
+function getPersonaUsageSummary(avatarId) {
+  const meta = ensureProfileMeta(avatarId);
+  const chatRecords = Object.values(meta.usageStats?.chats || {}).filter(
+    (c) => c && typeof c === 'object' && c.charName
+  );
+  const charMap = new Map();
+  let totalChatCount = 0;
+  let totalUserMsgs = 0;
+  let totalAiMsgs = 0;
+  let totalDurationMs = Math.max(0, Number(meta.usageStats?.extraLiveMs) || 0);
+  let lastChatAt = 0;
+
+  for (const rec of chatRecords) {
+    totalChatCount++;
+    const uMsgs = Math.max(0, Number(rec.userMsgs) || 0);
+    const aMsgs = Math.max(0, Number(rec.aiMsgs) || 0);
+    const dur = Math.max(0, Number(rec.durationMs) || 0);
+    const ts = Math.max(0, Number(rec.lastChatAt) || 0);
+    totalUserMsgs += uMsgs;
+    totalAiMsgs += aMsgs;
+    totalDurationMs += dur;
+    if (ts > lastChatAt) lastChatAt = ts;
+
+    const cKey = String(rec.charName).trim().toLowerCase();
+    if (!charMap.has(cKey)) {
+      charMap.set(cKey, {
+        charName: rec.charName,
+        charAvatar: rec.charAvatar || '',
+        chatCount: 0,
+        userMsgs: 0,
+        aiMsgs: 0,
+        durationMs: 0,
+        lastChatAt: 0,
+      });
+    }
+    const bucket = charMap.get(cKey);
+    bucket.chatCount++;
+    bucket.userMsgs += uMsgs;
+    bucket.aiMsgs += aMsgs;
+    bucket.durationMs += dur;
+    if (ts > bucket.lastChatAt) bucket.lastChatAt = ts;
+  }
+
+  const byCharacter = [...charMap.values()].sort(
+    (a, b) => b.durationMs - a.durationMs || b.chatCount - a.chatCount
+  );
+
+  return {
+    charCount: byCharacter.length,
+    chatCount: totalChatCount,
+    userMsgs: totalUserMsgs,
+    aiMsgs: totalAiMsgs,
+    totalMsgs: totalUserMsgs + totalAiMsgs,
+    durationMs: totalDurationMs,
+    lastChatAt,
+    byCharacter,
+  };
+}
+
+function parseStTimestamp(raw) {
+  if (!raw) return 0;
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+  const str = String(raw).trim();
+  if (!str) return 0;
+  const direct = Date.parse(str);
+  if (Number.isFinite(direct) && direct > 0) return direct;
+
+  // 兼容酒馆格式 "2026-11-25 @15h 30m 12s 123ms"
+  const m = str.match(
+    /(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s*@\s*(\d{1,2})h\s*(\d{1,2})m\s*(\d{1,2})s/i
+  );
+  if (m) {
+    const dt = new Date(
+      Number(m[1]),
+      Number(m[2]) - 1,
+      Number(m[3]),
+      Number(m[4]),
+      Number(m[5]),
+      Number(m[6])
+    );
+    return dt.getTime();
+  }
+  return 0;
+}
+
+function extractAvatarIdFromForceAvatar(forceAvatarRaw) {
+  if (!forceAvatarRaw) return '';
+  let str = String(forceAvatarRaw).trim();
+  if (!str) return '';
+  try {
+    str = decodeURIComponent(str);
+  } catch (_e) {}
+  const idx = str.lastIndexOf('/');
+  const base = idx !== -1 ? str.slice(idx + 1) : str;
+  const qIdx = base.indexOf('?');
+  return (qIdx !== -1 ? base.slice(0, qIdx) : base).trim();
+}
+
+/**
+ * 分析单个聊天档的消息数组，计算该聊天档关联到了哪些 User 以及各自的互动时长、消息数
+ */
+function attributeChatMessagesToPersonas({
+  charName,
+  charAvatar,
+  chatId,
+  headerObj,
+  messages,
+  allPersonas,
+  fallbackAvatarId = '',
+}) {
+  if (!charName || !chatId || !Array.isArray(messages) || messages.length === 0) {
+    return false;
+  }
+
+  const personaByAvatar = new Map(allPersonas.map((p) => [p.avatarId, p]));
+  const resolveByNameAndChar = (uName) => {
+    const clean = String(uName || '').trim().toLowerCase();
+    if (!clean) return null;
+    const candidates = allPersonas.filter((p) => p.name.trim().toLowerCase() === clean);
+    if (candidates.length === 0) return null;
+    if (candidates.length === 1) return candidates[0].avatarId;
+    // 如果同名有多个 User，优先归属给绑定了该角色卡的那个 User
+    const boundHit = candidates.find((p) =>
+      p.meta.boundCharacters.some((c) => c.toLowerCase() === charName.toLowerCase())
+    );
+    return (boundHit || candidates[0]).avatarId;
+  };
+
+  // 先看 chat_metadata 或 header 里的显式绑定
+  const chatMeta = headerObj?.chat_metadata || {};
+  let chatLevelAvatarId = '';
+  const trackedLukerAvatar = String(chatMeta?.luker_last_user_persona?.avatar || '').trim();
+  const lockedChatAvatar = String(chatMeta?.persona || '').trim();
+  if (trackedLukerAvatar && personaByAvatar.has(trackedLukerAvatar)) {
+    chatLevelAvatarId = trackedLukerAvatar;
+  } else if (lockedChatAvatar && personaByAvatar.has(lockedChatAvatar)) {
+    chatLevelAvatarId = lockedChatAvatar;
+  } else if (chatMeta?.luker_last_user_persona?.name) {
+    chatLevelAvatarId = resolveByNameAndChar(chatMeta.luker_last_user_persona.name) || '';
+  } else if (headerObj?.user_name) {
+    chatLevelAvatarId = resolveByNameAndChar(headerObj.user_name) || '';
+  }
+
+  // 统计消息时间戳与生成耗时，并按消息识别参与的 User
+  const timestamps = [];
+  let totalGenMs = 0;
+  let totalUserMsgs = 0;
+  let totalAiMsgs = 0;
+  let lastChatAt = 0;
+  const userHitsCount = new Map(); // avatarId -> userMsgCount
+
+  for (const msg of messages) {
+    if (!msg || typeof msg !== 'object') continue;
+    if (msg.is_system) continue;
+
+    const ts = parseStTimestamp(msg.send_date);
+    if (ts > 0) {
+      timestamps.push(ts);
+      if (ts > lastChatAt) lastChatAt = ts;
+    }
+
+    const genStart = parseStTimestamp(msg.gen_started ?? msg.extra?.gen_started);
+    const genEnd = parseStTimestamp(msg.gen_finished ?? msg.extra?.gen_finished);
+    if (genStart > 0 && genEnd > genStart && genEnd - genStart < 600_000) {
+      totalGenMs += genEnd - genStart;
+    }
+
+    if (msg.is_user) {
+      totalUserMsgs++;
+      let msgAvatarId = '';
+      const fromForce = extractAvatarIdFromForceAvatar(msg.force_avatar);
+      if (fromForce && personaByAvatar.has(fromForce)) {
+        msgAvatarId = fromForce;
+      } else if (msg.name) {
+        msgAvatarId = resolveByNameAndChar(msg.name) || '';
+      }
+      if (!msgAvatarId) {
+        msgAvatarId = chatLevelAvatarId || fallbackAvatarId;
+      }
+      if (msgAvatarId && personaByAvatar.has(msgAvatarId)) {
+        userHitsCount.set(msgAvatarId, (userHitsCount.get(msgAvatarId) || 0) + 1);
+      }
+    } else {
+      totalAiMsgs++;
+    }
+  }
+
+  // 如果该档还没有用户发言（例如只有开场白），则归给 chatLevelAvatarId 或 fallbackAvatarId
+  if (userHitsCount.size === 0) {
+    const targetId = chatLevelAvatarId || fallbackAvatarId;
+    if (targetId && personaByAvatar.has(targetId) && (totalUserMsgs > 0 || totalAiMsgs > 0)) {
+      userHitsCount.set(targetId, totalUserMsgs);
+    }
+  }
+
+  if (userHitsCount.size === 0) return false;
+
+  // 计算该聊天档的活跃互动时长（相邻消息间隔 <= 10分钟全额计入，> 10分钟按单轮 90秒封顶，避免挂机虚高）
+  timestamps.sort((a, b) => a - b);
+  let intervalDurationMs = 0;
+  if (timestamps.length >= 2) {
+    for (let i = 1; i < timestamps.length; i++) {
+      const gap = timestamps[i] - timestamps[i - 1];
+      if (gap > 0) {
+        intervalDurationMs += gap <= 10 * 60_000 ? gap : 90_000;
+      }
+    }
+    intervalDurationMs += 45_000;
+  } else if (totalUserMsgs > 0 || totalAiMsgs > 0) {
+    intervalDurationMs = totalUserMsgs * 60_000 + totalAiMsgs * 20_000;
+  }
+
+  const estimatedTotalMs = Math.max(intervalDurationMs, totalGenMs);
+  const totalAttributedUserMsgs = Math.max(
+    1,
+    [...userHitsCount.values()].reduce((acc, v) => acc + v, 0)
+  );
+  const chatRecordKey = `${charAvatar || charName}::${chatId}`;
+
+  for (const [avatarId, uCount] of userHitsCount.entries()) {
+    const share = userHitsCount.size === 1 ? 1 : Math.max(0.1, uCount / totalAttributedUserMsgs);
+    const meta = ensureProfileMeta(avatarId);
+    const prev = meta.usageStats.chats[chatRecordKey];
+    const computedDur = Math.round(estimatedTotalMs * share);
+
+    meta.usageStats.chats[chatRecordKey] = {
+      charName,
+      charAvatar: charAvatar || '',
+      chatId,
+      userMsgs: uCount,
+      aiMsgs: Math.round(totalAiMsgs * share),
+      durationMs: Math.max(prev?.durationMs || 0, computedDur),
+      lastChatAt: lastChatAt || prev?.lastChatAt || Date.now(),
+    };
+  }
+
+  return true;
+}
+
+/**
+ * 实时记录当前打开聊天窗口的使用统计
+ */
+function recordCurrentOpenChatStats() {
+  try {
+    const context = getContext();
+    const currentChar = getCurrentCharacter();
+    if (!currentChar?.name) return;
+
+    const rawChars = Array.isArray(context.characters) ? context.characters : [];
+    const rawChar = rawChars[currentChar.index];
+    const chatId = String(
+      context.chatId || rawChar?.chat || ''
+    )
+      .replace(/\.jsonl$/i, '')
+      .trim();
+    if (!chatId) return;
+
+    const chatMessages = Array.isArray(context.chat) ? context.chat : [];
+    if (chatMessages.length === 0) return;
+
+    const allPersonas = getHostPersonas();
+    const activeId = getActiveAvatarId();
+    const updated = attributeChatMessagesToPersonas({
+      charName: currentChar.name,
+      charAvatar: currentChar.avatar,
+      chatId,
+      headerObj: {
+        user_name: context.name1,
+        chat_metadata: context.chatMetadata || globalThis.chat_metadata || {},
+      },
+      messages: chatMessages,
+      allPersonas,
+      fallbackAvatarId: activeId,
+    });
+
+    if (updated) {
+      saveSettings();
+    }
+  } catch (err) {
+    console.warn(`[${MODULE_ID}] 记录当前聊天统计跳过:`, err);
+  }
+}
+
+/**
+ * 一键扫描酒馆内所有角色卡的历史聊天档，回溯每个 User 聊过几个角色卡、几个聊天档、聊了多久
+ */
+async function scanAllHistoricalChatsForStats() {
+  if (state.isScanningHistory) return;
+  state.isScanningHistory = true;
+  state.scanProgressText = '准备扫描…';
+  refreshAllViews();
+
+  try {
+    const context = getContext();
+    const rawChars = Array.isArray(context.characters) ? context.characters : [];
+    const allPersonas = getHostPersonas();
+    const headers =
+      typeof context.getRequestHeaders === 'function'
+        ? context.getRequestHeaders()
+        : { 'Content-Type': 'application/json' };
+
+    let scannedChars = 0;
+    let scannedChatFiles = 0;
+
+    for (let i = 0; i < rawChars.length; i++) {
+      const rawChar = rawChars[i];
+      const charName = String(rawChar?.name || '').trim();
+      const charAvatar = String(rawChar?.avatar || '').trim();
+      if (!charName || !charAvatar) continue;
+
+      state.scanProgressText = `扫描中 (${i + 1}/${rawChars.length})：${charName}`;
+      syncNativePersonaPanelEnhancement({ forceRight: true });
+
+      let chatList = [];
+      try {
+        const listRes = await fetch('/api/characters/chats', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ avatar_url: charAvatar, metadata: true }),
+        });
+        if (listRes.ok) {
+          const data = await listRes.json();
+          chatList = Array.isArray(data) ? data : Object.values(data || {});
+        }
+      } catch (_e) {}
+
+      if (!Array.isArray(chatList) || chatList.length === 0) continue;
+      let charHadValidChat = false;
+
+      // 如果该角色卡在 Luker 或本插件下只绑定了唯一一个专属 User，可作为该角色卡历史聊天档的默认归属兜底
+      const charDedicatedPersonas = allPersonas.filter((p) =>
+        p.meta.boundCharacters.some((c) => c.toLowerCase() === charName.toLowerCase())
+      );
+      const charDefaultAvatarId =
+        charDedicatedPersonas.length === 1 ? charDedicatedPersonas[0].avatarId : '';
+
+      for (const chatInfo of chatList) {
+        const rawFileName = String(chatInfo?.file_name || chatInfo?.file_id || '').trim();
+        if (!rawFileName) continue;
+        const fileId = rawFileName.replace(/\.jsonl$/i, '');
+
+        try {
+          const chatRes = await fetch('/api/chats/get', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              ch_name: charName,
+              file_name: fileId,
+              avatar_url: charAvatar,
+            }),
+          });
+          if (!chatRes.ok) continue;
+          const lines = await chatRes.json();
+          if (!Array.isArray(lines) || lines.length === 0) continue;
+
+          const firstLine = lines[0];
+          const hasHeader =
+            firstLine &&
+            typeof firstLine === 'object' &&
+            !Object.hasOwn(firstLine, 'mes') &&
+            (Object.hasOwn(firstLine, 'user_name') || Object.hasOwn(firstLine, 'chat_metadata'));
+          const headerObj = hasHeader
+            ? firstLine
+            : { chat_metadata: chatInfo?.chat_metadata || {} };
+          const msgLines = hasHeader ? lines.slice(1) : lines;
+
+          if (msgLines.length === 0) continue;
+
+          const hit = attributeChatMessagesToPersonas({
+            charName,
+            charAvatar,
+            chatId: fileId,
+            headerObj,
+            messages: msgLines,
+            allPersonas,
+            fallbackAvatarId: charDefaultAvatarId,
+          });
+          if (hit) {
+            scannedChatFiles++;
+            charHadValidChat = true;
+          }
+        } catch (_e) {}
+      }
+
+      if (charHadValidChat) {
+        scannedChars++;
+      }
+    }
+
+    saveSettings();
+    globalThis.toastr?.success?.(
+      `历史统计回溯完成：共扫描识别 ${scannedChars} 个角色卡、${scannedChatFiles} 个聊天档`
+    );
+  } catch (err) {
+    console.error(`[${MODULE_ID}] 历史聊天扫描异常:`, err);
+    globalThis.toastr?.error?.(`扫描出错：${err.message}`);
+  } finally {
+    state.isScanningHistory = false;
+    state.scanProgressText = '';
+    refreshAllViews();
+  }
 }
 
 /**
@@ -346,18 +823,33 @@ function getHostPersonas() {
 
   const activeAvatarId = getActiveAvatarId();
   const resultMap = new Map();
+  const hasDiskFilter =
+    state.diskAvatarFetched &&
+    state.diskAvatarSet instanceof Set &&
+    state.diskAvatarSet.size > 0;
 
+  let excludedOrphanCount = 0;
+  let mergedDuplicateCount = 0;
+
+  // 1. 读取全局 power_user.personas（与酒馆原生 getUserAvatars 一致：必须校核 /api/avatars/get 磁盘文件是否存在，过滤已删头像的历史残留键）
   for (const [avatarId, displayName] of Object.entries(personasMap)) {
-    const descObj = descMap[avatarId] || {};
-    const isCurrent = avatarId === activeAvatarId;
+    const cleanId = String(avatarId || '').trim();
+    if (!cleanId) continue;
+    const isCurrent = cleanId === activeAvatarId;
+    if (hasDiskFilter && !state.diskAvatarSet.has(cleanId) && !isCurrent) {
+      excludedOrphanCount++;
+      continue;
+    }
+
+    const descObj = descMap[cleanId] || {};
     const effectiveLorebook = String(
       descObj.lorebook || (isCurrent ? pu.persona_description_lorebook || '' : '')
     );
     const connections = Array.isArray(descObj.connections) ? descObj.connections : [];
 
-    resultMap.set(avatarId, {
-      avatarId,
-      name: String(displayName || avatarId),
+    resultMap.set(cleanId, {
+      avatarId: cleanId,
+      name: String(displayName || cleanId),
       description: String(descObj.description ?? (isCurrent ? pu.persona_description ?? '' : '')),
       lorebook: effectiveLorebook,
       position: descObj.position,
@@ -367,13 +859,42 @@ function getHostPersonas() {
       connections,
       lukerDedicatedChars: [],
       isLukerCharacterOnly: false,
-      avatarUrl: resolvePersonaAvatarUrl(avatarId),
+      avatarUrl: resolvePersonaAvatarUrl(cleanId),
       isActive: isCurrent,
     });
   }
 
-  // 扫描 Luker 的 character.data.extensions.luker.dedicated_personas
-  // 在 Luker 中选择 "Character Only" 绑定后，人设会从 power_user.personas 移除并仅存于角色卡内
+  // 辅助：查找是否已有同一个人设（兼容 Luker 为不同角色卡生成 Char__Persona.png 或 _1.png 等不同 avatarId 的情况）
+  const findExistingPersonaForDedicated = (avatarId, entryName, entryDesc) => {
+    if (resultMap.has(avatarId)) {
+      return resultMap.get(avatarId);
+    }
+    const normName = String(entryName || '').trim().toLowerCase();
+    const normDesc = String(entryDesc || '').trim();
+    if (!normName) return null;
+
+    // 优先匹配：同名且同描述（跨卡绑定同一个人设或同时存在于全局与角色卡）
+    for (const item of resultMap.values()) {
+      if (
+        item.name.trim().toLowerCase() === normName &&
+        item.description.trim() === normDesc
+      ) {
+        return item;
+      }
+    }
+    // 次级匹配：如果两边有一边描述为空且名字完全一致
+    for (const item of resultMap.values()) {
+      if (
+        item.name.trim().toLowerCase() === normName &&
+        (!normDesc || !item.description.trim())
+      ) {
+        return item;
+      }
+    }
+    return null;
+  };
+
+  // 2. 扫描 Luker 的 character.data.extensions.luker.dedicated_personas（自动去重合并同人设跨多张角色卡的绑定）
   for (const rawChar of rawChars) {
     const charName = String(rawChar?.name || '').trim();
     const charAvatar = String(rawChar?.avatar || '').trim();
@@ -381,13 +902,38 @@ function getHostPersonas() {
     const dedicatedList = extractLukerDedicatedPersonas(rawChar);
     for (const entry of dedicatedList) {
       const avatarId = String(entry?.avatar || '').trim();
-      if (!avatarId) continue;
-      const isCurrent = avatarId === activeAvatarId;
-      if (!resultMap.has(avatarId)) {
-        resultMap.set(avatarId, {
-          avatarId,
-          name: String(entry.name || avatarId),
-          description: String(entry.description ?? (isCurrent ? pu.persona_description ?? '' : '')),
+      const entryName = String(entry?.name || avatarId).trim();
+      if (!avatarId && !entryName) continue;
+      const entryDesc = String(entry?.description ?? '');
+      const isCurrent = Boolean(avatarId && avatarId === activeAvatarId);
+
+      const existing = findExistingPersonaForDedicated(avatarId, entryName, entryDesc);
+      if (existing) {
+        if (existing.avatarId !== avatarId) {
+          mergedDuplicateCount++;
+        }
+        if (!existing.lukerDedicatedChars.includes(charName)) {
+          existing.lukerDedicatedChars.push(charName);
+        }
+        if (!existing.description && entryDesc) {
+          existing.description = entryDesc;
+        }
+        if (!existing.lorebook && entry.lorebook) {
+          existing.lorebook = String(entry.lorebook);
+        }
+        if (isCurrent) {
+          existing.isActive = true;
+        }
+      } else {
+        const finalId = avatarId || `luker_dedicated__${charName}__${entryName}.png`;
+        if (hasDiskFilter && avatarId && !state.diskAvatarSet.has(avatarId) && !entryDesc.trim() && !isCurrent) {
+          excludedOrphanCount++;
+          continue;
+        }
+        resultMap.set(finalId, {
+          avatarId: finalId,
+          name: entryName || finalId,
+          description: String(entryDesc || (isCurrent ? pu.persona_description ?? '' : '')),
           lorebook: String(entry.lorebook || (isCurrent ? pu.persona_description_lorebook || '' : '')),
           position: entry.position,
           depth: entry.depth,
@@ -397,23 +943,15 @@ function getHostPersonas() {
           lukerDedicatedChars: [charName],
           lukerCharacterAvatars: charAvatar ? [charAvatar] : [],
           isLukerCharacterOnly: true,
-          avatarUrl: resolvePersonaAvatarUrl(avatarId),
+          avatarUrl: resolvePersonaAvatarUrl(finalId),
           isActive: isCurrent,
         });
-      } else {
-        const existing = resultMap.get(avatarId);
-        if (!existing.lukerDedicatedChars.includes(charName)) {
-          existing.lukerDedicatedChars.push(charName);
-        }
-        if (!existing.description && entry.description) {
-          existing.description = String(entry.description);
-        }
-        if (!existing.lorebook && entry.lorebook) {
-          existing.lorebook = String(entry.lorebook);
-        }
       }
     }
   }
+
+  state.lastExcludedOrphanCount = excludedOrphanCount;
+  state.lastMergedDuplicateCount = mergedDuplicateCount;
 
   const avatarNodes = document.querySelectorAll(
     '#user_avatar_block .avatar-container[data-avatar-id]'
@@ -1048,6 +1586,11 @@ async function clonePersonaVariant(sourcePersona, { customName = '', fromPreset 
   }
 
   saveSettings();
+
+  if (state.diskAvatarSet instanceof Set) {
+    state.diskAvatarSet.add(newAvatarId);
+  }
+  await refreshDiskAvatarSet();
 
   try {
     await state.hostPersonasModule?.getUserAvatars?.(true, newAvatarId);
@@ -1871,7 +2414,7 @@ function openWardrobeModal(initialAvatarId = null) {
   bindModalBackdropEvents(modal);
 
   modal.classList.remove('st-pw-hidden');
-  renderWardrobeModalContent();
+  renderWardrobeModalContent({ force: true });
 }
 
 function renderPersonaRowHtml(p, selectedAvatarId) {
@@ -1879,6 +2422,8 @@ function renderPersonaRowHtml(p, selectedAvatarId) {
   const extraCount = p.meta.extraWorldbooks.filter((b) => b.enabled).length;
   const traitCount = p.meta.traits.filter((t) => t.enabled).length;
   const presetCount = Array.isArray(p.meta.presets) ? p.meta.presets.length : 0;
+  const usage = getPersonaUsageSummary(p.avatarId);
+  const hasUsage = usage.charCount > 0 || usage.chatCount > 0 || usage.durationMs > 0;
   return `
     <div class="st-pw-persona-item ${isSelected ? 'is-selected' : ''} ${p.isActive ? 'is-active-user' : ''}" data-avatar-id="${escapeAttr(p.avatarId)}">
       <img class="st-pw-item-avatar" src="${escapeAttr(p.avatarUrl)}" alt="" onerror="this.style.visibility='hidden'" />
@@ -1886,6 +2431,7 @@ function renderPersonaRowHtml(p, selectedAvatarId) {
         <div class="st-pw-item-title-line">
           <span class="st-pw-item-name">${sanitizeHtml(p.name)}</span>
           ${p.meta.group ? `<span class="st-pw-tiny-tag">${sanitizeHtml(p.meta.group)}</span>` : ''}
+          ${p.isLukerCharacterOnly ? `<span class="st-pw-tiny-tag" title="Luker 角色卡专属人设 (Character Only)">卡内专属</span>` : ''}
         </div>
         <div class="st-pw-item-sub-line">
           ${
@@ -1896,6 +2442,11 @@ function renderPersonaRowHtml(p, selectedAvatarId) {
           ${extraCount ? `<span>+${extraCount}书</span>` : ''}
           ${traitCount ? `<span>· ${traitCount}设定</span>` : ''}
           ${presetCount ? `<span>· ${presetCount}快照</span>` : ''}
+          ${
+            hasUsage
+              ? `<span class="st-pw-usage-badge" title="已聊 ${usage.charCount} 个角色卡 · ${usage.chatCount} 个聊天档 · 累计 ${formatDurationHuman(usage.durationMs)}">· ${usage.charCount}角/${usage.chatCount}档/${formatDurationShort(usage.durationMs)}</span>`
+              : ''
+          }
         </div>
       </div>
       <div class="st-pw-item-actions">
@@ -1931,9 +2482,99 @@ function matchesSearch(p, q) {
   return hay.includes(q);
 }
 
-function renderWardrobeModalContent() {
+function renderFilterPillsBarHtml(personas, characterGroups, customGroups, ungroupedMembers) {
+  const dedicatedCount = personas.filter((p) => p.isLukerCharacterOnly).length;
+  const globalCount = personas.length - dedicatedCount;
+  const favCount = personas.filter((p) => p.meta.favorite).length;
+  const chattedCount = personas.filter((p) => {
+    const u = getPersonaUsageSummary(p.avatarId);
+    return u.chatCount > 0 || u.durationMs > 0;
+  }).length;
+
+  const dedupParts = [];
+  if (state.lastExcludedOrphanCount > 0) {
+    dedupParts.push(`已过滤 ${state.lastExcludedOrphanCount} 条无头像残留`);
+  }
+  if (state.lastMergedDuplicateCount > 0) {
+    dedupParts.push(`已合并 ${state.lastMergedDuplicateCount} 条跨卡同名重复`);
+  }
+
+  return `
+    <div class="st-pw-group-tabs">
+      <button type="button" class="st-pw-filter-pill ${state.activeFilter === 'all' ? 'active' : ''}" data-filter="all" title="所有去重后的真实人设总数">
+        全部 (${personas.length})
+      </button>
+      ${
+        dedicatedCount > 0
+          ? `
+            <button type="button" class="st-pw-filter-pill ${state.activeFilter === 'global' ? 'active' : ''}" data-filter="global" title="全局人设列表中的人设数量（与 Luker 原生全局列表一致）">
+              全局 (${globalCount})
+            </button>
+            <button type="button" class="st-pw-filter-pill ${state.activeFilter === 'dedicated' ? 'active' : ''}" data-filter="dedicated" title="Luker 中设为 Character Only 仅保存在角色卡内部的人设">
+              卡内专属 (${dedicatedCount})
+            </button>
+          `
+          : ''
+      }
+      ${
+        chattedCount > 0
+          ? `
+            <button type="button" class="st-pw-filter-pill ${state.activeFilter === 'chatted' ? 'active' : ''}" data-filter="chatted" title="有过聊天档记录的 User">
+              已聊过 (${chattedCount})
+            </button>
+          `
+          : ''
+      }
+      <button type="button" class="st-pw-filter-pill ${state.activeFilter === 'fav' ? 'active' : ''}" data-filter="fav">
+        收藏 (${favCount})
+      </button>
+      ${characterGroups
+        .map(
+          (cg) => `
+            <button type="button" class="st-pw-filter-pill ${state.activeFilter === cg.id ? 'active' : ''}" data-filter="${escapeAttr(cg.id)}" title="角色绑定的 User 自动分组">
+              <i class="fa-solid fa-user-tag"></i> ${sanitizeHtml(cg.name)} (${cg.members.length})
+            </button>
+          `
+        )
+        .join('')}
+      ${customGroups
+        .map(
+          (g) => `
+            <button type="button" class="st-pw-filter-pill ${state.activeFilter === g.id ? 'active' : ''}" data-filter="${escapeAttr(g.id)}">
+              ${sanitizeHtml(g.name)} (${g.members.length})
+            </button>
+          `
+        )
+        .join('')}
+      ${
+        (characterGroups.length > 0 || customGroups.length > 0) && ungroupedMembers.length > 0
+          ? `<button type="button" class="st-pw-filter-pill ${state.activeFilter === 'ungrouped' ? 'active' : ''}" data-filter="ungrouped">未分组 (${ungroupedMembers.length})</button>`
+          : ''
+      }
+    </div>
+    ${
+      dedupParts.length > 0
+        ? `<div class="st-pw-dedup-notice">${sanitizeHtml(dedupParts.join(' · '))}</div>`
+        : ''
+    }
+  `;
+}
+
+function renderWardrobeModalContent({ force = false } = {}) {
   const modal = document.querySelector('#st_pw_wardrobe_modal');
   if (!modal || modal.classList.contains('st-pw-hidden')) return;
+
+  if (
+    !force &&
+    document.activeElement &&
+    modal.contains(document.activeElement) &&
+    (document.activeElement.tagName === 'INPUT' ||
+      document.activeElement.tagName === 'TEXTAREA' ||
+      document.activeElement.tagName === 'SELECT') &&
+    document.activeElement.type !== 'checkbox'
+  ) {
+    return;
+  }
 
   const settings = getSettings();
   const personas = getHostPersonas();
@@ -1971,150 +2612,6 @@ function renderWardrobeModalContent() {
   }
 
   const q = state.searchQuery.trim().toLowerCase();
-
-  // 构建左侧折叠分组树 HTML
-  const renderGroupedTreeHtml = () => {
-    const sections = [];
-
-    // 1) 自动角色分组（一个角色下绑了多个 User 的自动归为一组）
-    for (const cg of characterGroups) {
-      if (state.activeFilter !== 'all' && state.activeFilter !== cg.id) continue;
-      const visibleMembers = cg.members.filter((p) => matchesSearch(p, q));
-      if (q && visibleMembers.length === 0) continue;
-      const isCollapsed = state.collapsedSections.has(cg.id);
-      const isBatchOpen =
-        state.batchAssignTarget?.type === 'character' &&
-        state.batchAssignTarget?.name.toLowerCase() === cg.name.toLowerCase();
-
-      sections.push(`
-        <div class="st-pw-folder-section" data-section-id="${escapeAttr(cg.id)}">
-          <div class="st-pw-folder-header">
-            <div class="st-pw-folder-title-wrap st-pw-folder-toggle" data-section-id="${escapeAttr(cg.id)}">
-              <i class="fa-solid fa-chevron-${isCollapsed ? 'right' : 'down'} st-pw-folder-arrow"></i>
-              ${
-                cg.avatarUrl
-                  ? `<img class="st-pw-folder-char-avatar" src="${escapeAttr(cg.avatarUrl)}" alt="" onerror="this.style.display='none'" />`
-                  : `<i class="fa-solid fa-user-tag st-pw-folder-icon"></i>`
-              }
-              <span class="st-pw-folder-name">${sanitizeHtml(cg.name)}</span>
-              <span class="st-pw-folder-count">${cg.members.length}</span>
-              ${cg.isCurrentChar ? `<span class="st-pw-tiny-tag">当前角色</span>` : ''}
-            </div>
-            <div class="st-pw-folder-actions">
-              <button type="button" class="st-pw-icon-btn st-pw-open-batch-char" data-char-name="${escapeAttr(cg.name)}" title="勾选/管理绑定到此角色下的多个 User">
-                <i class="fa-solid fa-user-plus"></i>
-              </button>
-            </div>
-          </div>
-          ${
-            isBatchOpen
-              ? renderBatchChecklistHtml('character', cg.name, personas)
-              : ''
-          }
-          ${
-            !isCollapsed
-              ? `<div class="st-pw-folder-body">${
-                  visibleMembers.length
-                    ? visibleMembers.map((p) => renderPersonaRowHtml(p, selectedPersona?.avatarId)).join('')
-                    : `<div class="st-pw-muted-hint">无匹配项</div>`
-                }</div>`
-              : ''
-          }
-        </div>
-      `);
-    }
-
-    // 2) 用户自定义分组
-    for (const grp of customGroups) {
-      if (state.activeFilter !== 'all' && state.activeFilter !== grp.id) continue;
-      const visibleMembers = grp.members.filter((p) => matchesSearch(p, q));
-      if (q && visibleMembers.length === 0) continue;
-      const isCollapsed = state.collapsedSections.has(grp.id);
-      const isBatchOpen =
-        state.batchAssignTarget?.type === 'group' &&
-        state.batchAssignTarget?.name === grp.name;
-
-      sections.push(`
-        <div class="st-pw-folder-section" data-section-id="${escapeAttr(grp.id)}">
-          <div class="st-pw-folder-header">
-            <div class="st-pw-folder-title-wrap st-pw-folder-toggle" data-section-id="${escapeAttr(grp.id)}">
-              <i class="fa-solid fa-chevron-${isCollapsed ? 'right' : 'down'} st-pw-folder-arrow"></i>
-              <i class="fa-regular fa-folder st-pw-folder-icon"></i>
-              <span class="st-pw-folder-name">${sanitizeHtml(grp.name)}</span>
-              <span class="st-pw-folder-count">${grp.members.length}</span>
-            </div>
-            <div class="st-pw-folder-actions">
-              <button type="button" class="st-pw-icon-btn st-pw-open-batch-group" data-group-name="${escapeAttr(grp.name)}" title="批量勾选移入此分组的 User">
-                <i class="fa-solid fa-user-plus"></i>
-              </button>
-              <button type="button" class="st-pw-icon-btn st-pw-rename-group-btn" data-group-name="${escapeAttr(grp.name)}" title="重命名分组">
-                <i class="fa-solid fa-pen"></i>
-              </button>
-              <button type="button" class="st-pw-icon-btn st-pw-delete-group-btn" data-group-name="${escapeAttr(grp.name)}" title="删除分组">
-                <i class="fa-solid fa-trash-can"></i>
-              </button>
-            </div>
-          </div>
-          ${
-            isBatchOpen
-              ? renderBatchChecklistHtml('group', grp.name, personas)
-              : ''
-          }
-          ${
-            !isCollapsed
-              ? `<div class="st-pw-folder-body">${
-                  visibleMembers.length
-                    ? visibleMembers.map((p) => renderPersonaRowHtml(p, selectedPersona?.avatarId)).join('')
-                    : `<div class="st-pw-muted-hint">组内暂无 User，点右上角小人图标可批量勾选加入</div>`
-                }</div>`
-              : ''
-          }
-        </div>
-      `);
-    }
-
-    // 3) 仅查看收藏
-    if (state.activeFilter === 'fav') {
-      const favList = personas.filter((p) => p.meta.favorite && matchesSearch(p, q));
-      return favList.length
-        ? favList.map((p) => renderPersonaRowHtml(p, selectedPersona?.avatarId)).join('')
-        : `<div class="st-pw-empty-state">暂无收藏的 User</div>`;
-    }
-
-    // 4) 未分组 User（如果还没有任何角色分组或自定义分组，直接平铺显示，不套多余文件夹壳子）
-    if (state.activeFilter === 'all' || state.activeFilter === 'ungrouped') {
-      const visibleUngrouped = ungroupedMembers.filter((p) => matchesSearch(p, q));
-      if (characterGroups.length === 0 && customGroups.length === 0) {
-        return visibleUngrouped.length
-          ? visibleUngrouped.map((p) => renderPersonaRowHtml(p, selectedPersona?.avatarId)).join('')
-          : `<div class="st-pw-empty-state">无匹配人设</div>`;
-      }
-      if (visibleUngrouped.length > 0 || state.activeFilter === 'ungrouped') {
-        const isCollapsed = state.collapsedSections.has('ungrouped');
-        sections.push(`
-          <div class="st-pw-folder-section" data-section-id="ungrouped">
-            <div class="st-pw-folder-header">
-              <div class="st-pw-folder-title-wrap st-pw-folder-toggle" data-section-id="ungrouped">
-                <i class="fa-solid fa-chevron-${isCollapsed ? 'right' : 'down'} st-pw-folder-arrow"></i>
-                <span class="st-pw-folder-name st-pw-muted">未分组</span>
-                <span class="st-pw-folder-count">${visibleUngrouped.length}</span>
-              </div>
-            </div>
-            ${
-              !isCollapsed
-                ? `<div class="st-pw-folder-body">${visibleUngrouped
-                    .map((p) => renderPersonaRowHtml(p, selectedPersona?.avatarId))
-                    .join('')}</div>`
-                : ''
-            }
-          </div>
-        `);
-      }
-    }
-
-    return sections.length ? sections.join('') : `<div class="st-pw-empty-state">无匹配人设</div>`;
-  };
-
   const activeMeta = activePersona ? activePersona.meta : null;
   const activeExtraBooks = activeMeta
     ? activeMeta.extraWorldbooks.filter((b) => b.enabled && b.name)
@@ -2146,6 +2643,10 @@ function renderWardrobeModalContent() {
           }
         </div>
         <div class="st-pw-modal-header-actions">
+          <button type="button" class="menu_button st-pw-mini-btn st-pw-scan-history-btn" ${state.isScanningHistory ? 'disabled' : ''}>
+            <i class="fa-solid fa-${state.isScanningHistory ? 'spinner fa-spin' : 'chart-simple'}"></i>
+            ${state.isScanningHistory ? sanitizeHtml(state.scanProgressText || '扫描中…') : '扫描统计'}
+          </button>
           <button type="button" class="menu_button st-pw-mini-btn st-pw-preview-active-prompt-btn">生效预览</button>
           <button type="button" class="menu_button st-pw-mini-btn st-pw-refresh-host-btn" title="同步列表"><i class="fa-solid fa-rotate"></i></button>
           <button type="button" class="menu_button st-pw-mini-btn st-pw-close-wardrobe-btn" title="关闭"><i class="fa-solid fa-xmark"></i> 关闭</button>
@@ -2175,42 +2676,18 @@ function renderWardrobeModalContent() {
             </button>
           </div>
 
-          <!-- 顶部快速筛选标签（只展示实际有内容的自动角色组与用户自建组，绝不显示无用的空预设） -->
-          <div class="st-pw-group-tabs">
-            <button type="button" class="st-pw-filter-pill ${state.activeFilter === 'all' ? 'active' : ''}" data-filter="all">
-              全部 (${personas.length})
-            </button>
-            <button type="button" class="st-pw-filter-pill ${state.activeFilter === 'fav' ? 'active' : ''}" data-filter="fav">
-              收藏 (${personas.filter((p) => p.meta.favorite).length})
-            </button>
-            ${characterGroups
-              .map(
-                (cg) => `
-                  <button type="button" class="st-pw-filter-pill ${state.activeFilter === cg.id ? 'active' : ''}" data-filter="${escapeAttr(cg.id)}" title="角色绑定的 User 自动分组">
-                    <i class="fa-solid fa-user-tag"></i> ${sanitizeHtml(cg.name)} (${cg.members.length})
-                  </button>
-                `
-              )
-              .join('')}
-            ${customGroups
-              .map(
-                (g) => `
-                  <button type="button" class="st-pw-filter-pill ${state.activeFilter === g.id ? 'active' : ''}" data-filter="${escapeAttr(g.id)}">
-                    ${sanitizeHtml(g.name)} (${g.members.length})
-                  </button>
-                `
-              )
-              .join('')}
-            ${
-              (characterGroups.length > 0 || customGroups.length > 0) && ungroupedMembers.length > 0
-                ? `<button type="button" class="st-pw-filter-pill ${state.activeFilter === 'ungrouped' ? 'active' : ''}" data-filter="ungrouped">未分组 (${ungroupedMembers.length})</button>`
-                : ''
-            }
-          </div>
+          ${renderFilterPillsBarHtml(personas, characterGroups, customGroups, ungroupedMembers)}
 
           <!-- 分组树列表：同一角色下绑的多个 User 自动归在一组，自定义组也自动归在一组 -->
           <div class="st-pw-persona-list">
-            ${renderGroupedTreeHtml()}
+            ${buildGroupedTreeSectionsHtml(
+              personas,
+              selectedPersona?.avatarId,
+              characterGroups,
+              customGroups,
+              ungroupedMembers,
+              q
+            )}
           </div>
         </aside>
 
@@ -2254,6 +2731,79 @@ function renderBatchChecklistHtml(targetType, targetName, allPersonas) {
           })
           .join('')}
       </div>
+    </div>
+  `;
+}
+
+function renderUsageStatsBlockHtml(persona) {
+  const stats = getPersonaUsageSummary(persona.avatarId);
+  return `
+    <div class="st-pw-block">
+      <div class="st-pw-block-header">
+        <span class="st-pw-block-title">使用足迹统计（聊过角色 · 聊天档 · 累计时长）</span>
+        <div class="st-pw-inline-header-btns">
+          <button type="button" class="menu_button st-pw-mini-btn st-pw-scan-history-btn" ${state.isScanningHistory ? 'disabled' : ''} title="扫描酒馆内所有角色卡的历史聊天档，自动回溯统计每个 User 聊过的角色卡、档数与时长">
+            <i class="fa-solid fa-${state.isScanningHistory ? 'spinner fa-spin' : 'chart-simple'}"></i>
+            ${state.isScanningHistory ? sanitizeHtml(state.scanProgressText || '扫描中…') : '扫描历史档'}
+          </button>
+          ${
+            stats.byCharacter.length > 0
+              ? `
+                <button type="button" class="menu_button st-pw-mini-btn st-pw-toggle-stats-detail-btn">
+                  ${state.showStatsDetail ? '收起明细' : '角色明细'}
+                </button>
+              `
+              : ''
+          }
+          ${
+            stats.chatCount > 0 || stats.durationMs > 0
+              ? `
+                <button type="button" class="menu_button st-pw-mini-btn st-pw-reset-user-stats-btn" title="清空此 User 的使用统计记录">
+                  重置
+                </button>
+              `
+              : ''
+          }
+        </div>
+      </div>
+
+      <div class="st-pw-stats-metrics-row">
+        <div class="st-pw-stat-cell">
+          <span class="st-pw-stat-label">聊过角色卡</span>
+          <strong class="st-pw-stat-val">${stats.charCount} <small>个</small></strong>
+        </div>
+        <div class="st-pw-stat-cell">
+          <span class="st-pw-stat-label">聊天档数</span>
+          <strong class="st-pw-stat-val">${stats.chatCount} <small>个档</small></strong>
+        </div>
+        <div class="st-pw-stat-cell">
+          <span class="st-pw-stat-label">互动消息</span>
+          <strong class="st-pw-stat-val">${stats.totalMsgs} <small>条</small></strong>
+        </div>
+        <div class="st-pw-stat-cell">
+          <span class="st-pw-stat-label">累计聊天时长</span>
+          <strong class="st-pw-stat-val">${sanitizeHtml(formatDurationHuman(stats.durationMs))}</strong>
+        </div>
+      </div>
+
+      ${
+        state.showStatsDetail && stats.byCharacter.length > 0
+          ? `
+            <div class="st-pw-compact-rows">
+              ${stats.byCharacter
+                .map(
+                  (c) => `
+                    <div class="st-pw-compact-row">
+                      <span class="st-pw-row-main-text"><strong>${sanitizeHtml(c.charName)}</strong></span>
+                      <span class="st-pw-muted" style="font-size:0.8rem;">${c.chatCount} 个档 · ${c.userMsgs + c.aiMsgs} 条消息 · ${sanitizeHtml(formatDurationHuman(c.durationMs))}</span>
+                    </div>
+                  `
+                )
+                .join('')}
+            </div>
+          `
+          : ''
+      }
     </div>
   `;
 }
@@ -2383,6 +2933,9 @@ function renderSelectedPersonaDetail(persona, availableBooks, hostChars, current
         </div>
       </div>
     </div>
+
+    <!-- 使用足迹统计 -->
+    ${renderUsageStatsBlockHtml(persona)}
 
     <!-- 绑定角色卡（绑在同一个角色卡下的多个 User 会自动在左侧归为一组） -->
     <div class="st-pw-block">
@@ -2552,7 +3105,7 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
   const settings = getSettings();
   const rerenderPanels = () => {
     syncNativePersonaPanelEnhancement({ forceRight: true });
-    renderWardrobeModalContent();
+    renderWardrobeModalContent({ force: true });
   };
 
   modal.querySelector('.st-pw-close-wardrobe-btn')?.addEventListener('click', () => {
@@ -2572,7 +3125,7 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
   searchInput?.addEventListener('input', (e) => {
     state.searchQuery = e.target.value;
     const pos = e.target.selectionStart;
-    renderWardrobeModalContent();
+    renderWardrobeModalContent({ force: true });
     const nextInput = modal.querySelector('#st_pw_search_input');
     if (nextInput) {
       nextInput.focus();
@@ -3066,6 +3619,32 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
       rerenderPanels();
     });
   });
+
+  // ==================== 使用足迹统计（聊过角色卡 · 聊天档 · 时长）事件 ====================
+  modal.querySelectorAll('.st-pw-scan-history-btn').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await scanAllHistoricalChatsForStats();
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-toggle-stats-detail-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      state.showStatsDetail = !state.showStatsDetail;
+      rerenderPanels();
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-reset-user-stats-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (!window.confirm(`确定清空「${selectedPersona.name}」的使用统计记录吗？`)) return;
+      meta.usageStats = { chats: {}, extraLiveMs: 0 };
+      saveSettings();
+      rerenderPanels();
+    });
+  });
 }
 
 async function openActivePromptPreviewModal() {
@@ -3140,6 +3719,35 @@ async function openActivePromptPreviewModal() {
  * - 右栏 (.persona_management_right_column)：在保留原生改名/换头像/复制/删除/描述/位置/连接的前提下，原位嵌入「分组与角色绑定、主/附加世界书（下拉+查看条目+跳转编辑器）、随身设定、生效预览与私密备注」
  */
 function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroups, customGroups, ungroupedMembers, q) {
+  // 单项模式筛选：收藏 / 全局人设 / 卡内专属 / 已聊过
+  if (state.activeFilter === 'fav') {
+    const favList = personas.filter((p) => p.meta.favorite && matchesSearch(p, q));
+    return favList.length
+      ? favList.map((p) => renderPersonaRowHtml(p, selectedAvatarId)).join('')
+      : `<div class="st-pw-empty-state">暂无收藏的 User</div>`;
+  }
+  if (state.activeFilter === 'global') {
+    const globalList = personas.filter((p) => !p.isLukerCharacterOnly && matchesSearch(p, q));
+    return globalList.length
+      ? globalList.map((p) => renderPersonaRowHtml(p, selectedAvatarId)).join('')
+      : `<div class="st-pw-empty-state">无匹配的全局人设</div>`;
+  }
+  if (state.activeFilter === 'dedicated') {
+    const dedList = personas.filter((p) => p.isLukerCharacterOnly && matchesSearch(p, q));
+    return dedList.length
+      ? dedList.map((p) => renderPersonaRowHtml(p, selectedAvatarId)).join('')
+      : `<div class="st-pw-empty-state">无匹配的卡内专属人设</div>`;
+  }
+  if (state.activeFilter === 'chatted') {
+    const chattedList = personas.filter((p) => {
+      const u = getPersonaUsageSummary(p.avatarId);
+      return (u.chatCount > 0 || u.durationMs > 0) && matchesSearch(p, q);
+    });
+    return chattedList.length
+      ? chattedList.map((p) => renderPersonaRowHtml(p, selectedAvatarId)).join('')
+      : `<div class="st-pw-empty-state">暂无有聊天记录的 User，可点右侧「扫描历史档」回溯</div>`;
+  }
+
   const sections = [];
 
   // 1) 自动角色分组（绑在同一角色下的多个 User 自动归为一组）
@@ -3231,15 +3839,7 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
     `);
   }
 
-  // 3) 仅查看收藏
-  if (state.activeFilter === 'fav') {
-    const favList = personas.filter((p) => p.meta.favorite && matchesSearch(p, q));
-    return favList.length
-      ? favList.map((p) => renderPersonaRowHtml(p, selectedAvatarId)).join('')
-      : `<div class="st-pw-empty-state">暂无收藏的 User</div>`;
-  }
-
-  // 4) 未分组 User
+  // 3) 未分组 User
   if (state.activeFilter === 'all' || state.activeFilter === 'ungrouped') {
     const visibleUngrouped = ungroupedMembers.filter((p) => matchesSearch(p, q));
     if (characterGroups.length === 0 && customGroups.length === 0) {
@@ -3329,156 +3929,135 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
       leftCol.insertBefore(leftPanel, leftCol.firstChild);
     }
 
-    if (state.useRawNativeLeftList) {
-      leftCol.classList.remove('st-pw-left-taken');
-      leftPanel.innerHTML = `
-        <div class="st-pw-raw-mode-bar">
-          <span class="st-pw-muted">当前为原生平铺列表</span>
-          <button type="button" class="menu_button st-pw-mini-btn st-pw-toggle-raw-list-btn">
-            <i class="fa-solid fa-folder-tree"></i> 切回分组接管视图
-          </button>
-        </div>
-      `;
-      leftPanel.querySelector('.st-pw-toggle-raw-list-btn')?.addEventListener('click', () => {
-        state.useRawNativeLeftList = false;
-        syncNativePersonaPanelEnhancement();
-      });
-    } else {
-      leftCol.classList.add('st-pw-left-taken');
-      const q = state.searchQuery.trim().toLowerCase();
-      const wasSearchFocused =
-        document.activeElement &&
-        document.activeElement.id === 'st_pw_inline_search_input';
-      const searchCursorPos = wasSearchFocused ? document.activeElement.selectionStart : null;
+    // 如果用户正在展开左栏的下拉菜单 (<select>)，不要在后台重绘冲掉已打开的下拉框
+    const isLeftSelectFocused =
+      !forceRight &&
+      document.activeElement &&
+      leftPanel.contains(document.activeElement) &&
+      document.activeElement.tagName === 'SELECT';
 
-      leftPanel.innerHTML = `
-        <div class="st-pw-inline-left-top">
-          <input type="search" id="st_pw_inline_search_input" class="text_pole st-pw-sidebar-search" placeholder="搜索 User、角色组、自定义组、世界书…" value="${escapeAttr(state.searchQuery)}" />
-          <button type="button" class="menu_button st-pw-mini-btn st-pw-inline-create-btn" title="调用原生新建人设">
-            <i class="fa-solid fa-plus"></i> 新建
-          </button>
-          <button type="button" class="menu_button st-pw-mini-btn st-pw-inline-upload-btn" title="上传头像新建人设">
-            <i class="fa-solid fa-image"></i> 头像
-          </button>
-          <button type="button" class="menu_button st-pw-mini-btn st-pw-toggle-raw-list-btn" title="切换到酒馆原生平铺列表">
-            原生列表
-          </button>
-        </div>
-
-        <div class="st-pw-sidebar-create-bar">
-          <select id="st_pw_inline_char_group_select" class="text_pole st-pw-flex-select" title="选一个角色卡，把多个 User 绑到它下面自动归为一组">
-            <option value="">+ 按角色绑一组 User…</option>
-            ${
-              currentCharName
-                ? `<option value="${escapeAttr(currentCharName)}">当前角色：${sanitizeHtml(currentCharName)}</option>`
-                : ''
-            }
-            ${hostChars
-              .filter((c) => c.name !== currentCharName)
-              .map((c) => `<option value="${escapeAttr(c.name)}">${sanitizeHtml(c.name)}</option>`)
-              .join('')}
-          </select>
-          <button type="button" class="menu_button st-pw-mini-btn st-pw-inline-add-group-btn" title="新建自定义分组">
-            + 自定义组
-          </button>
-        </div>
-
-        <div class="st-pw-group-tabs">
-          <button type="button" class="st-pw-filter-pill ${state.activeFilter === 'all' ? 'active' : ''}" data-filter="all">
-            全部 (${personas.length})
-          </button>
-          <button type="button" class="st-pw-filter-pill ${state.activeFilter === 'fav' ? 'active' : ''}" data-filter="fav">
-            收藏 (${personas.filter((p) => p.meta.favorite).length})
-          </button>
-          ${characterGroups
-            .map(
-              (cg) => `
-                <button type="button" class="st-pw-filter-pill ${state.activeFilter === cg.id ? 'active' : ''}" data-filter="${escapeAttr(cg.id)}" title="角色绑定的 User 自动分组">
-                  <i class="fa-solid fa-user-tag"></i> ${sanitizeHtml(cg.name)} (${cg.members.length})
-                </button>
-              `
-            )
-            .join('')}
-          ${customGroups
-            .map(
-              (g) => `
-                <button type="button" class="st-pw-filter-pill ${state.activeFilter === g.id ? 'active' : ''}" data-filter="${escapeAttr(g.id)}">
-                  ${sanitizeHtml(g.name)} (${g.members.length})
-                </button>
-              `
-            )
-            .join('')}
-          ${
-            (characterGroups.length > 0 || customGroups.length > 0) && ungroupedMembers.length > 0
-              ? `<button type="button" class="st-pw-filter-pill ${state.activeFilter === 'ungrouped' ? 'active' : ''}" data-filter="ungrouped">未分组 (${ungroupedMembers.length})</button>`
-              : ''
-          }
-        </div>
-
-        <div class="st-pw-persona-list st-pw-inline-persona-list">
-          ${buildGroupedTreeSectionsHtml(
-            personas,
-            targetPersona?.avatarId,
-            characterGroups,
-            customGroups,
-            ungroupedMembers,
-            q
-          )}
-        </div>
-      `;
-
-      if (wasSearchFocused) {
-        const nextInput = leftPanel.querySelector('#st_pw_inline_search_input');
-        if (nextInput) {
-          nextInput.focus();
-          if (typeof searchCursorPos === 'number') {
-            nextInput.setSelectionRange(searchCursorPos, searchCursorPos);
-          }
-        }
-      }
-
-      leftPanel.querySelector('#st_pw_inline_search_input')?.addEventListener('input', (e) => {
-        state.searchQuery = e.target.value;
-        syncNativePersonaPanelEnhancement();
-      });
-
-      leftPanel.querySelector('.st-pw-inline-create-btn')?.addEventListener('click', () => {
-        document.querySelector('#create_dummy_persona')?.click();
-      });
-
-      leftPanel.querySelector('.st-pw-inline-upload-btn')?.addEventListener('click', () => {
-        const uploadTrigger = document.querySelector('#user_avatar_block .avatar_upload');
-        if (uploadTrigger) {
-          uploadTrigger.click();
-        } else {
-          const overwriteInput = document.querySelector('#avatar_upload_overwrite');
-          if (overwriteInput) overwriteInput.value = '';
-          document.querySelector('#avatar_upload_file')?.click();
-        }
-      });
-
-      leftPanel.querySelector('.st-pw-toggle-raw-list-btn')?.addEventListener('click', () => {
-        state.useRawNativeLeftList = true;
-        syncNativePersonaPanelEnhancement();
-      });
-
-      // 使用与主窗口一致的分组树交互绑定
-      bindWardrobeModalEvents(leftPanel, targetPersona, personas);
-
-      // 在原生人设栏目左栏点击某个人设行时，直接切换为该人设（联动右栏原生表单）
-      leftPanel.querySelectorAll('.st-pw-persona-item').forEach((card) => {
-        card.addEventListener('click', async (e) => {
-          if (e.target.closest('.st-pw-fav-btn') || e.target.closest('.st-pw-use-persona-btn')) {
-            return;
-          }
-          const id = card.getAttribute('data-avatar-id');
-          if (!id) return;
-          state.selectedAvatarId = id;
-          state.expandedTraitIdx = null;
-          await switchActivePersona(id);
-          refreshAllViews();
+    if (!isLeftSelectFocused) {
+      if (state.useRawNativeLeftList) {
+        leftCol.classList.remove('st-pw-left-taken');
+        leftPanel.innerHTML = `
+          <div class="st-pw-raw-mode-bar">
+            <span class="st-pw-muted">当前为原生平铺列表</span>
+            <button type="button" class="menu_button st-pw-mini-btn st-pw-toggle-raw-list-btn">
+              <i class="fa-solid fa-folder-tree"></i> 切回分组接管视图
+            </button>
+          </div>
+        `;
+        leftPanel.querySelector('.st-pw-toggle-raw-list-btn')?.addEventListener('click', () => {
+          state.useRawNativeLeftList = false;
+          syncNativePersonaPanelEnhancement({ forceRight: true });
         });
-      });
+      } else {
+        leftCol.classList.add('st-pw-left-taken');
+        const q = state.searchQuery.trim().toLowerCase();
+        const wasSearchFocused =
+          document.activeElement &&
+          document.activeElement.id === 'st_pw_inline_search_input';
+        const searchCursorPos = wasSearchFocused ? document.activeElement.selectionStart : null;
+
+        leftPanel.innerHTML = `
+          <div class="st-pw-inline-left-top">
+            <input type="search" id="st_pw_inline_search_input" class="text_pole st-pw-sidebar-search" placeholder="搜索 User、角色组、自定义组、世界书…" value="${escapeAttr(state.searchQuery)}" />
+            <button type="button" class="menu_button st-pw-mini-btn st-pw-inline-create-btn" title="调用原生新建人设">
+              <i class="fa-solid fa-plus"></i> 新建
+            </button>
+            <button type="button" class="menu_button st-pw-mini-btn st-pw-inline-upload-btn" title="上传头像新建人设">
+              <i class="fa-solid fa-image"></i> 头像
+            </button>
+            <button type="button" class="menu_button st-pw-mini-btn st-pw-toggle-raw-list-btn" title="切换到酒馆原生平铺列表">
+              原生列表
+            </button>
+          </div>
+
+          <div class="st-pw-sidebar-create-bar">
+            <select id="st_pw_inline_char_group_select" class="text_pole st-pw-flex-select" title="选一个角色卡，把多个 User 绑到它下面自动归为一组">
+              <option value="">+ 按角色绑一组 User…</option>
+              ${
+                currentCharName
+                  ? `<option value="${escapeAttr(currentCharName)}">当前角色：${sanitizeHtml(currentCharName)}</option>`
+                  : ''
+              }
+              ${hostChars
+                .filter((c) => c.name !== currentCharName)
+                .map((c) => `<option value="${escapeAttr(c.name)}">${sanitizeHtml(c.name)}</option>`)
+                .join('')}
+            </select>
+            <button type="button" class="menu_button st-pw-mini-btn st-pw-inline-add-group-btn" title="新建自定义分组">
+              + 自定义组
+            </button>
+          </div>
+
+          ${renderFilterPillsBarHtml(personas, characterGroups, customGroups, ungroupedMembers)}
+
+          <div class="st-pw-persona-list st-pw-inline-persona-list">
+            ${buildGroupedTreeSectionsHtml(
+              personas,
+              targetPersona?.avatarId,
+              characterGroups,
+              customGroups,
+              ungroupedMembers,
+              q
+            )}
+          </div>
+        `;
+
+        if (wasSearchFocused) {
+          const nextInput = leftPanel.querySelector('#st_pw_inline_search_input');
+          if (nextInput) {
+            nextInput.focus();
+            if (typeof searchCursorPos === 'number') {
+              nextInput.setSelectionRange(searchCursorPos, searchCursorPos);
+            }
+          }
+        }
+
+        leftPanel.querySelector('#st_pw_inline_search_input')?.addEventListener('input', (e) => {
+          state.searchQuery = e.target.value;
+          syncNativePersonaPanelEnhancement();
+        });
+
+        leftPanel.querySelector('.st-pw-inline-create-btn')?.addEventListener('click', () => {
+          document.querySelector('#create_dummy_persona')?.click();
+        });
+
+        leftPanel.querySelector('.st-pw-inline-upload-btn')?.addEventListener('click', () => {
+          const uploadTrigger = document.querySelector('#user_avatar_block .avatar_upload');
+          if (uploadTrigger) {
+            uploadTrigger.click();
+          } else {
+            const overwriteInput = document.querySelector('#avatar_upload_overwrite');
+            if (overwriteInput) overwriteInput.value = '';
+            document.querySelector('#avatar_upload_file')?.click();
+          }
+        });
+
+        leftPanel.querySelector('.st-pw-toggle-raw-list-btn')?.addEventListener('click', () => {
+          state.useRawNativeLeftList = true;
+          syncNativePersonaPanelEnhancement({ forceRight: true });
+        });
+
+        // 使用与主窗口一致的分组树交互绑定
+        bindWardrobeModalEvents(leftPanel, targetPersona, personas);
+
+        // 在原生人设栏目左栏点击某个人设行时，直接切换为该人设（联动右栏原生表单）
+        leftPanel.querySelectorAll('.st-pw-persona-item').forEach((card) => {
+          card.addEventListener('click', async (e) => {
+            if (e.target.closest('.st-pw-fav-btn') || e.target.closest('.st-pw-use-persona-btn')) {
+              return;
+            }
+            const id = card.getAttribute('data-avatar-id');
+            if (!id) return;
+            state.selectedAvatarId = id;
+            state.expandedTraitIdx = null;
+            await switchActivePersona(id);
+            refreshAllViews();
+          });
+        });
+      }
     }
   }
 
@@ -3507,12 +4086,14 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
     anchorEl.insertAdjacentElement('afterend', rightPanel);
   }
 
-  // 如果用户当前正在右栏接管面板的输入框里打字，避免后台 SETTINGS_UPDATED 冲掉输入焦点
+  // 如果用户当前正在右栏接管面板的输入框或下拉菜单 (<select>) 中操作，避免后台重绘直接销毁展开中的下拉框
   if (
     !forceRight &&
     document.activeElement &&
     rightPanel.contains(document.activeElement) &&
-    (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') &&
+    (document.activeElement.tagName === 'INPUT' ||
+      document.activeElement.tagName === 'TEXTAREA' ||
+      document.activeElement.tagName === 'SELECT') &&
     document.activeElement.type !== 'checkbox'
   ) {
     return;
@@ -3528,6 +4109,9 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
   );
 
   rightPanel.innerHTML = `
+    <!-- 0. 使用足迹统计（聊过几个角色卡 · 几个聊天档 · 聊了多久） -->
+    ${renderUsageStatsBlockHtml(targetPersona)}
+
     <!-- 1. 分组、标签与角色分组绑定 -->
     <div class="st-pw-block">
       <div class="st-pw-block-header">
@@ -3786,6 +4370,7 @@ function refreshAllViews() {
 }
 
 function onChatChanged() {
+  recordCurrentOpenChatStats();
   refreshAllViews();
   const settings = getSettings();
   if (!settings.autoSwitchOnCharacterChat) return;
@@ -3963,12 +4548,15 @@ async function initExtension() {
   state.initialized = true;
 
   await probeHostModules();
+  await refreshDiskAvatarSet();
   getSettings();
   await mountSettingsPanel();
   registerSlashCommands();
+  recordCurrentOpenChatStats();
   refreshAllViews();
 
   const onGlobalKeydown = (e) => {
+    state.lastUserInteractionAt = Date.now();
     if (e.key === 'Escape') {
       if (closeTopmostWardrobeModal()) {
         e.stopPropagation();
@@ -3978,14 +4566,65 @@ async function initExtension() {
   document.addEventListener('keydown', onGlobalKeydown);
   state.disposers.push(() => document.removeEventListener('keydown', onGlobalKeydown));
 
-  const personaDrawerBtn = document.querySelector('#persona-management-button');
-  if (personaDrawerBtn) {
-    const onPersonaDrawerClick = () => {
+  const onUserActivity = () => {
+    state.lastUserInteractionAt = Date.now();
+  };
+  document.addEventListener('mousedown', onUserActivity, { passive: true });
+  document.addEventListener('touchstart', onUserActivity, { passive: true });
+  state.disposers.push(() => {
+    document.removeEventListener('mousedown', onUserActivity);
+    document.removeEventListener('touchstart', onUserActivity);
+  });
+
+  // 实时聊天活跃计时器：当打开某个角色聊天且最近 2 分钟内有交互时，每 15 秒为当前激活 User 累加活跃时长
+  const liveTimerId = setInterval(() => {
+    try {
+      if (document.hidden) return;
+      if (Date.now() - state.lastUserInteractionAt > 120_000) return;
+      const context = getContext();
+      const charId = context.characterId;
+      if (charId === undefined || charId === null || Number(charId) < 0) return;
+      const charObj = context.characters?.[charId];
+      if (!charObj?.avatar) return;
+      const activeId = getActiveAvatarId();
+      if (!activeId) return;
+
+      const meta = ensureProfileMeta(activeId);
+      const chatFile = String(charObj.chat || context.chatId || 'active_chat').trim();
+      const chatKey = `${charObj.avatar}::${chatFile}`;
+      if (meta.usageStats.chats[chatKey]) {
+        meta.usageStats.chats[chatKey].durationMs =
+          (Number(meta.usageStats.chats[chatKey].durationMs) || 0) + 15_000;
+        meta.usageStats.chats[chatKey].lastActive = Date.now();
+      } else {
+        meta.usageStats.extraLiveMs = (Number(meta.usageStats.extraLiveMs) || 0) + 15_000;
+      }
+      const isPersonaDrawerOpen = document
+        .querySelector('#PersonaManagement')
+        ?.classList.contains('openDrawer');
+      const isWardrobeModalOpen =
+        document.querySelector('#st_pw_wardrobe_modal') &&
+        !document.querySelector('#st_pw_wardrobe_modal').classList.contains('st-pw-hidden');
+      if (!isPersonaDrawerOpen && !isWardrobeModalOpen) {
+        saveSettings();
+      }
+    } catch (_e) {}
+  }, 15_000);
+  state.disposers.push(() => clearInterval(liveTimerId));
+
+  // 注意：只监听顶栏笑脸抽屉开关按钮 (.drawer-toggle)，绝不能绑定在父容器 #persona-management-button 上，
+  // 否则在 #PersonaManagement 内部点击 <select> 世界书下拉框会冒泡触发 30ms 重绘并直接销毁展开中的下拉菜单！
+  const personaDrawerToggle = document.querySelector('#persona-management-button > .drawer-toggle');
+  if (personaDrawerToggle) {
+    const onPersonaDrawerClick = (e) => {
+      if (e?.target && document.querySelector('#PersonaManagement')?.contains(e.target)) {
+        return;
+      }
       setTimeout(() => syncNativePersonaPanelEnhancement(), 30);
     };
-    personaDrawerBtn.addEventListener('click', onPersonaDrawerClick);
+    personaDrawerToggle.addEventListener('click', onPersonaDrawerClick);
     state.disposers.push(() =>
-      personaDrawerBtn.removeEventListener('click', onPersonaDrawerClick)
+      personaDrawerToggle.removeEventListener('click', onPersonaDrawerClick)
     );
   }
 
@@ -3999,17 +4638,35 @@ async function initExtension() {
         state.disposers.push(() => eventSource.removeListener?.(evtName, handler));
       };
 
+      const onChatMessageActivity = () => {
+        state.lastUserInteractionAt = Date.now();
+        recordCurrentOpenChatStats();
+        refreshAllViews();
+      };
+
       subscribe(event_types.CHAT_CHANGED, onChatChanged);
+      subscribe(event_types.MESSAGE_SENT, onChatMessageActivity);
+      subscribe(event_types.MESSAGE_RECEIVED, onChatMessageActivity);
+      subscribe(event_types.GENERATION_ENDED, onChatMessageActivity);
       subscribe(event_types.SETTINGS_UPDATED, refreshAllViews);
       subscribe(event_types.WORLDINFO_UPDATED, () => {
         state.worldbookCache.clear();
         refreshAllViews();
       });
-      subscribe(event_types.PERSONA_CHANGED, refreshAllViews);
-      subscribe(event_types.PERSONA_CREATED, refreshAllViews);
+      subscribe(event_types.PERSONA_CHANGED, () => {
+        recordCurrentOpenChatStats();
+        refreshAllViews();
+      });
+      subscribe(event_types.PERSONA_CREATED, async () => {
+        await refreshDiskAvatarSet();
+        refreshAllViews();
+      });
       subscribe(event_types.PERSONA_UPDATED, refreshAllViews);
       subscribe(event_types.PERSONA_RENAMED, refreshAllViews);
-      subscribe(event_types.PERSONA_DELETED, refreshAllViews);
+      subscribe(event_types.PERSONA_DELETED, async () => {
+        await refreshDiskAvatarSet();
+        refreshAllViews();
+      });
     }
   } catch (err) {
     console.warn(`[${MODULE_ID}] 事件订阅警告:`, err);
