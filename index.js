@@ -2,11 +2,11 @@ const MODULE_ID = 'st-persona-wardrobe';
 const EXTENSION_FOLDER = 'third-party/st-persona-wardrobe';
 
 const DEFAULT_GROUPS = Object.freeze([
-  '现代都市',
-  '西幻奇幻',
-  '赛博科幻',
-  '古风仙侠',
-  '无限流/规则',
+  '古风',
+  '现代',
+  '西幻',
+  '科幻',
+  '无限流',
 ]);
 
 const DEFAULT_SETTINGS = Object.freeze({
@@ -23,9 +23,12 @@ const DEFAULT_SETTINGS = Object.freeze({
 const state = {
   initialized: false,
   disposers: [],
+  sidebarMode: 'group', // 'group' (按自定义分组) | 'character' (按绑定角色)
   activeModalTab: 'all',
+  activeCharFilter: '__current__',
   searchQuery: '',
   selectedAvatarId: null,
+  expandedTraitIdx: null,
   worldbookCache: new Map(),
   lastPromptInjectedSummary: [],
   minimizedReturnPill: null,
@@ -41,9 +44,6 @@ function getContext() {
   return context;
 }
 
-/**
- * 尝试加载宿主原生 personas.js 与 world-info.js 模块（ST 1.19.0 实测路径），失败则优雅降级到 getContext()
- */
 async function probeHostModules() {
   if (!state.hostPersonasModule) {
     try {
@@ -133,8 +133,33 @@ function ensureProfileMeta(avatarId) {
 }
 
 /**
- * 读取酒馆当前所有可用世界书列表（优先使用 ST 1.19 getContext().getWorldInfoNames()）
+ * 读取酒馆当前所有角色卡与当前正在聊天的角色
  */
+function getHostCharacters() {
+  try {
+    const context = getContext();
+    const chars = Array.isArray(context.characters) ? context.characters : [];
+    const currentChid =
+      context.characterId !== undefined && context.characterId !== null
+        ? Number(context.characterId)
+        : -1;
+    return chars
+      .map((c, idx) => ({
+        index: idx,
+        name: String(c?.name || '').trim(),
+        avatar: String(c?.avatar || '').trim(),
+        isCurrent: idx === currentChid,
+      }))
+      .filter((c) => c.name);
+  } catch (_e) {
+    return [];
+  }
+}
+
+function getCurrentCharacter() {
+  return getHostCharacters().find((c) => c.isCurrent) || null;
+}
+
 function getAvailableWorldbooks() {
   const books = new Set();
 
@@ -186,9 +211,6 @@ function getAvailableWorldbooks() {
   return [...books].sort((a, b) => a.localeCompare(b, 'zh-CN'));
 }
 
-/**
- * 获取酒馆当前激活的 User Avatar ID（支持 ST 1.19 分页隐藏时的准确读取）
- */
 function getActiveAvatarId() {
   if (
     typeof state.hostPersonasModule?.user_avatar === 'string' &&
@@ -210,7 +232,6 @@ function getActiveAvatarId() {
     const pu = context.powerUserSettings || globalThis.power_user;
     if (pu?.chat_metadata?.persona) return pu.chat_metadata.persona;
     if (context.chatMetadata?.persona) return context.chatMetadata.persona;
-    // 通过当前 name1 + persona_description 精确反查
     if (pu?.personas && typeof pu.personas === 'object') {
       const entries = Object.entries(pu.personas);
       const byNameAndDesc = entries.find(([id, name]) => {
@@ -226,9 +247,6 @@ function getActiveAvatarId() {
   return '';
 }
 
-/**
- * 生成头像缩略图 URL（优先使用酒馆 getThumbnailUrl('persona', avatarId)）
- */
 function resolvePersonaAvatarUrl(avatarId) {
   try {
     const context = getContext();
@@ -240,7 +258,7 @@ function resolvePersonaAvatarUrl(avatarId) {
 }
 
 /**
- * 从酒馆 Context 与 DOM 读取所有 User Personas
+ * 读取所有 User Personas，并把酒馆原生 connections（绑定到角色的锁定关系）与插件 boundCharacters 自动合并
  */
 function getHostPersonas() {
   let context = null;
@@ -255,6 +273,9 @@ function getHostPersonas() {
       ? pu.persona_descriptions
       : {};
 
+  const hostChars = getHostCharacters();
+  const charByAvatar = new Map(hostChars.map((c) => [c.avatar, c.name]));
+
   const activeAvatarId = getActiveAvatarId();
   const resultMap = new Map();
 
@@ -264,6 +285,8 @@ function getHostPersonas() {
     const effectiveLorebook = String(
       descObj.lorebook || (isCurrent ? pu.persona_description_lorebook || '' : '')
     );
+    const connections = Array.isArray(descObj.connections) ? descObj.connections : [];
+
     resultMap.set(avatarId, {
       avatarId,
       name: String(displayName || avatarId),
@@ -273,13 +296,12 @@ function getHostPersonas() {
       depth: descObj.depth,
       role: descObj.role,
       title: String(descObj.title ?? ''),
-      connections: Array.isArray(descObj.connections) ? descObj.connections : [],
+      connections,
       avatarUrl: resolvePersonaAvatarUrl(avatarId),
       isActive: isCurrent,
     });
   }
 
-  // DOM 兜底扫描
   const avatarNodes = document.querySelectorAll(
     '#user_avatar_block .avatar-container[data-avatar-id]'
   );
@@ -302,7 +324,7 @@ function getHostPersonas() {
         description: String(descObj.description ?? domDesc),
         lorebook: String(descObj.lorebook ?? ''),
         title: String(descObj.title ?? ''),
-        connections: [],
+        connections: Array.isArray(descObj.connections) ? descObj.connections : [],
         avatarUrl: imgSrc,
         isActive: isSelected,
       });
@@ -315,57 +337,114 @@ function getHostPersonas() {
 
   const list = [...resultMap.values()];
   for (const item of list) {
-    item.meta = ensureProfileMeta(item.avatarId);
+    const meta = ensureProfileMeta(item.avatarId);
+    // 将酒馆原生 connections 中的角色自动合并进 meta.boundCharacters（保持双向一致）
+    const mergedChars = new Set(meta.boundCharacters.filter(Boolean));
+    for (const conn of item.connections) {
+      if (conn?.type === 'character' && conn.id) {
+        const resolvedName = charByAvatar.get(conn.id);
+        if (resolvedName) mergedChars.add(resolvedName);
+      }
+    }
+    meta.boundCharacters = [...mergedChars];
+    item.meta = meta;
   }
   return list;
 }
 
 /**
- * 切换当前激活的 User Persona（支持跨分页直接调用 setUserAvatar 或 /persona-set）
+ * 将某个 User 绑定到指定角色名（同时写入插件 boundCharacters 与酒馆原生 connections）
  */
+function bindPersonaToCharacter(avatarId, characterName) {
+  const cleanName = String(characterName || '').trim();
+  if (!avatarId || !cleanName) return;
+
+  const meta = ensureProfileMeta(avatarId);
+  if (!meta.boundCharacters.includes(cleanName)) {
+    meta.boundCharacters.push(cleanName);
+  }
+
+  // 如果该角色存在于酒馆角色列表，同步写入酒馆原生 persona_descriptions[avatarId].connections
+  try {
+    const hostChar = getHostCharacters().find(
+      (c) => c.name.toLowerCase() === cleanName.toLowerCase()
+    );
+    const context = getContext();
+    const pu = context.powerUserSettings || globalThis.power_user;
+    if (hostChar?.avatar && pu?.persona_descriptions?.[avatarId]) {
+      if (!Array.isArray(pu.persona_descriptions[avatarId].connections)) {
+        pu.persona_descriptions[avatarId].connections = [];
+      }
+      const conns = pu.persona_descriptions[avatarId].connections;
+      if (!conns.some((c) => c.type === 'character' && c.id === hostChar.avatar)) {
+        conns.push({ type: 'character', id: hostChar.avatar });
+      }
+    }
+  } catch (_e) {}
+
+  saveSettings();
+  refreshAllViews();
+}
+
+/**
+ * 解除某个 User 与指定角色的绑定（同时从插件与酒馆原生 connections 移除）
+ */
+function unbindPersonaFromCharacter(avatarId, characterName) {
+  const cleanName = String(characterName || '').trim();
+  if (!avatarId || !cleanName) return;
+
+  const meta = ensureProfileMeta(avatarId);
+  meta.boundCharacters = meta.boundCharacters.filter(
+    (c) => c.toLowerCase() !== cleanName.toLowerCase()
+  );
+
+  try {
+    const hostChar = getHostCharacters().find(
+      (c) => c.name.toLowerCase() === cleanName.toLowerCase()
+    );
+    const context = getContext();
+    const pu = context.powerUserSettings || globalThis.power_user;
+    if (hostChar?.avatar && Array.isArray(pu?.persona_descriptions?.[avatarId]?.connections)) {
+      pu.persona_descriptions[avatarId].connections =
+        pu.persona_descriptions[avatarId].connections.filter(
+          (c) => !(c.type === 'character' && c.id === hostChar.avatar)
+        );
+    }
+  } catch (_e) {}
+
+  saveSettings();
+  refreshAllViews();
+}
+
 async function switchActivePersona(avatarId) {
   if (!avatarId) return false;
   await probeHostModules();
   const personas = getHostPersonas();
   const target = personas.find((p) => p.avatarId === avatarId);
 
-  // 1. 优先调用宿主 personas.js 的 setUserAvatar（不受分页影响，完整触发 PERSONA_CHANGED 与聊天锁定）
   if (typeof state.hostPersonasModule?.setUserAvatar === 'function') {
     await state.hostPersonasModule.setUserAvatar(avatarId);
-    globalThis.toastr?.success?.(
-      `已切换当前 User 为：${target?.name || avatarId}`,
-      'User 人设衣柜'
-    );
+    globalThis.toastr?.success?.(`已切换：${target?.name || avatarId}`);
     refreshAllViews();
     return true;
   }
 
-  // 2. 次选：如果当前分页 DOM 里正好有该头像容器，直接触发点击
   const escapedId = CSS.escape ? CSS.escape(avatarId) : avatarId.replaceAll('"', '\\"');
   const domAvatar = document.querySelector(
     `#user_avatar_block .avatar-container[data-avatar-id="${escapedId}"]`
   );
   if (domAvatar) {
     domAvatar.click();
-    globalThis.toastr?.success?.(
-      `已切换当前 User 为：${target?.name || avatarId}`,
-      'User 人设衣柜'
-    );
+    globalThis.toastr?.success?.(`已切换：${target?.name || avatarId}`);
     refreshAllViews();
     return true;
   }
 
-  // 3. 兜底：通过 SlashCommand /persona-set mode=lookup 切换
   try {
     const context = getContext();
     if (typeof context.executeSlashCommandsWithOptions === 'function') {
-      await context.executeSlashCommandsWithOptions(
-        `/persona-set mode=lookup "${avatarId}"`
-      );
-      globalThis.toastr?.success?.(
-        `已切换当前 User 为：${target?.name || avatarId}`,
-        'User 人设衣柜'
-      );
+      await context.executeSlashCommandsWithOptions(`/persona-set mode=lookup "${avatarId}"`);
+      globalThis.toastr?.success?.(`已切换：${target?.name || avatarId}`);
       refreshAllViews();
       return true;
     }
@@ -376,9 +455,6 @@ async function switchActivePersona(avatarId) {
   return false;
 }
 
-/**
- * 更新某个 User 的原生人设描述与主绑定世界书（完全同步 ST 1.19 power_user 与 #persona_lore_button 状态）
- */
 function updateHostPersonaData(avatarId, { description, lorebook }) {
   try {
     const context = getContext();
@@ -412,7 +488,6 @@ function updateHostPersonaData(avatarId, { description, lorebook }) {
       }
     }
 
-    // 如果修改的是当前激活的 User，同步更新酒馆原生 DOM
     if (isCurrent) {
       if (description !== undefined) {
         const descInput = document.querySelector('#persona_description');
@@ -422,12 +497,10 @@ function updateHostPersonaData(avatarId, { description, lorebook }) {
         }
       }
       if (lorebook !== undefined) {
-        // ST 1.19 原生地球按钮高亮状态 class="world_set"
         const loreBtn = document.querySelector('#persona_lore_button');
         if (loreBtn) {
           loreBtn.classList.toggle('world_set', Boolean(lorebook));
         }
-        // 兼容老版或沙盒下拉框
         const loreSelect = document.querySelector('#persona_description_lorebook');
         if (loreSelect) {
           loreSelect.value = lorebook || '';
@@ -440,19 +513,15 @@ function updateHostPersonaData(avatarId, { description, lorebook }) {
     refreshAllViews();
     return true;
   } catch (err) {
-    console.error(`[${MODULE_ID}] 更新原生 Persona 数据失败:`, err);
+    console.error(`[${MODULE_ID}] 更新 Persona 数据失败:`, err);
     return false;
   }
 }
 
-/**
- * 像「角色世界书」一样，一键跳转并打开酒馆原生的世界书编辑器并选中目标世界书
- * 优先调用 ST 1.19 原生 openWorldInfoEditor(worldbookName)
- */
 async function jumpToWorldbookInHost(worldbookName, { fromWardrobeModal = false } = {}) {
   const targetName = String(worldbookName || '').trim();
   if (!targetName) {
-    globalThis.toastr?.warning?.('该 User 当前尚未绑定世界书，请先在下拉框选择绑定一本世界书。', '世界书跳转');
+    globalThis.toastr?.warning?.('当前未绑定世界书');
     return false;
   }
 
@@ -460,17 +529,13 @@ async function jumpToWorldbookInHost(worldbookName, { fromWardrobeModal = false 
 
   let jumped = false;
 
-  // 1. 优先使用 ST 1.19 world-info.js 原生导出的 openWorldInfoEditor
   if (typeof state.hostWorldInfoModule?.openWorldInfoEditor === 'function') {
     try {
       state.hostWorldInfoModule.openWorldInfoEditor(targetName);
       jumped = true;
-    } catch (err) {
-      console.warn(`[${MODULE_ID}] openWorldInfoEditor 调用异常，回退 DOM 触发:`, err);
-    }
+    } catch (_err) {}
   }
 
-  // 2. DOM + getContext().reloadWorldInfoEditor 兼容路径
   if (!jumped) {
     const wiDrawerContent =
       document.querySelector('#WorldInfo') ||
@@ -514,14 +579,10 @@ async function jumpToWorldbookInHost(worldbookName, { fromWardrobeModal = false 
   }
 
   if (!jumped) {
-    globalThis.toastr?.warning?.(
-      `在酒馆世界书列表中未找到「${targetName}」，请确认该世界书是否存在。`,
-      '世界书跳转'
-    );
+    globalThis.toastr?.warning?.(`未找到世界书「${targetName}」`);
     return false;
   }
 
-  // 3. 如果是从我们的衣柜全屏弹窗点过来的，自动收起弹窗并在右下角放一个「← 返回 User 人设衣柜」胶囊按钮
   if (fromWardrobeModal) {
     const modal = document.querySelector('#st_pw_wardrobe_modal');
     if (modal) {
@@ -530,7 +591,6 @@ async function jumpToWorldbookInHost(worldbookName, { fromWardrobeModal = false 
     }
   }
 
-  globalThis.toastr?.info?.(`已在酒馆世界书编辑器中打开：${targetName}`, '世界书跳转');
   return true;
 }
 
@@ -545,8 +605,8 @@ function showReturnToWardrobePill(bookName) {
   const pill = document.createElement('button');
   pill.id = 'st_pw_return_pill';
   pill.type = 'button';
-  pill.className = 'st-pw-return-pill';
-  pill.innerHTML = `<i class="fa-solid fa-rotate-left"></i> <span>正在编辑「${sanitizeHtml(bookName)}」· 点击返回 User 人设衣柜</span>`;
+  pill.className = 'menu_button st-pw-return-pill';
+  pill.innerHTML = `<i class="fa-solid fa-arrow-left"></i> <span>返回人设管理 (${sanitizeHtml(bookName)})</span>`;
   pill.addEventListener('click', () => {
     removeReturnToWardrobePill();
     openWardrobeModal();
@@ -563,9 +623,6 @@ function removeReturnToWardrobePill() {
   document.querySelector('#st_pw_return_pill')?.remove();
 }
 
-/**
- * 读取世界书完整数据（优先使用 ST 1.19 context.loadWorldInfo 保持与酒馆内部 worldInfoCache 同步）
- */
 async function fetchWorldbookData(worldbookName) {
   const name = String(worldbookName || '').trim();
   if (!name) throw new Error('世界书名称为空');
@@ -614,9 +671,6 @@ async function fetchWorldbookData(worldbookName) {
   return data;
 }
 
-/**
- * 保存修改后的世界书条目（优先使用 ST 1.19 context.saveWorldInfo + reloadWorldInfoEditor）
- */
 async function saveWorldbookData(worldbookName, worldData) {
   const name = String(worldbookName || '').trim();
   if (!name || !worldData) throw new Error('世界书名称或数据为空');
@@ -664,12 +718,12 @@ async function saveWorldbookData(worldbookName, worldData) {
 }
 
 /**
- * 打开「世界书条目弹窗速览与直接开关/编辑」二级弹窗
+ * 世界书条目管理弹窗（高密度紧凑列表，点击才展开编辑）
  */
 async function openWorldbookInspectorModal(worldbookName) {
   const name = String(worldbookName || '').trim();
   if (!name) {
-    globalThis.toastr?.warning?.('请先为该 User 选择或绑定一本世界书。', '世界书弹窗');
+    globalThis.toastr?.warning?.('请先选择一本世界书');
     return;
   }
 
@@ -683,21 +737,18 @@ async function openWorldbookInspectorModal(worldbookName) {
 
   modal.classList.remove('st-pw-hidden');
   modal.innerHTML = `
-    <div class="st-pw-wb-dialog" role="dialog" aria-modal="true" aria-label="世界书条目管理">
+    <div class="st-pw-wb-dialog" role="dialog" aria-modal="true">
       <div class="st-pw-modal-header">
-        <div class="st-pw-modal-title-wrap">
-          <i class="fa-solid fa-book-atlas st-pw-accent-icon"></i>
-          <div>
-            <h3 class="st-pw-modal-title">世界书弹窗速编：${sanitizeHtml(name)}</h3>
-            <p class="st-pw-modal-subtitle">正在读取条目数据…</p>
-          </div>
+        <div class="st-pw-header-left">
+          <span class="st-pw-modal-title">${sanitizeHtml(name)}</span>
+          <span class="st-pw-header-meta">读取中…</span>
         </div>
         <div class="st-pw-modal-header-actions">
           <button type="button" class="menu_button st-pw-close-wb-modal">关闭</button>
         </div>
       </div>
       <div class="st-pw-wb-body st-pw-loading-state">
-        <i class="fa-solid fa-spinner fa-spin"></i> 正在从酒馆加载「${sanitizeHtml(name)}」的条目…
+        正在加载「${sanitizeHtml(name)}」…
       </div>
     </div>
   `;
@@ -714,10 +765,9 @@ async function openWorldbookInspectorModal(worldbookName) {
     if (bodyEl) {
       bodyEl.innerHTML = `
         <div class="st-pw-error-box">
-          <p><strong>无法直接读取世界书接口：</strong>${sanitizeHtml(err.message)}</p>
-          <p>你仍然可以点击下方按钮，直接跳转到酒馆原生的世界书编辑器打开它：</p>
+          <p>读取失败：${sanitizeHtml(err.message)}</p>
           <button type="button" class="menu_button st-pw-fallback-jump-btn">
-            <i class="fa-solid fa-arrow-up-right-from-square"></i> 跳转到酒馆世界书面板打开「${sanitizeHtml(name)}」
+            在酒馆世界书编辑器中打开
           </button>
         </div>
       `;
@@ -731,7 +781,8 @@ async function openWorldbookInspectorModal(worldbookName) {
 
 function renderWorldbookInspectorContent(modal, worldbookName, worldData) {
   let searchFilter = '';
-  let editingUid = null;
+  let statusFilter = 'all';
+  let expandedKey = null;
 
   function getEntriesArray() {
     const entriesObj = worldData.entries || {};
@@ -745,128 +796,136 @@ function renderWorldbookInspectorContent(modal, worldbookName, worldData) {
         constant: Boolean(entry.constant),
         disable: Boolean(entry.disable),
         order: Number(entry.order ?? 100),
+        depth: Number(entry.depth ?? 4),
         raw: entry,
       }))
-      .sort((a, b) => a.order - b.order || String(a.uid).localeCompare(String(b.uid)));
+      .sort((a, b) => b.order - a.order || Number(a.uid) - Number(b.uid));
   }
 
   function redraw() {
     const allEntries = getEntriesArray();
     const enabledCount = allEntries.filter((e) => !e.disable).length;
     const constantCount = allEntries.filter((e) => !e.disable && e.constant).length;
+    const keywordCount = enabledCount - constantCount;
+    const disabledCount = allEntries.length - enabledCount;
     const q = searchFilter.trim().toLowerCase();
 
     const filtered = allEntries.filter((item) => {
+      if (statusFilter === 'enabled' && item.disable) return false;
+      if (statusFilter === 'constant' && (item.disable || !item.constant)) return false;
+      if (statusFilter === 'keyword' && (item.disable || item.constant)) return false;
+      if (statusFilter === 'disabled' && !item.disable) return false;
+
       if (!q) return true;
-      const inTitle = item.comment.toLowerCase().includes(q);
-      const inKeys = item.keyList.join(', ').toLowerCase().includes(q);
-      const inContent = item.content.toLowerCase().includes(q);
-      return inTitle || inKeys || inContent;
+      return (
+        item.comment.toLowerCase().includes(q) ||
+        item.keyList.join(', ').toLowerCase().includes(q) ||
+        item.content.toLowerCase().includes(q)
+      );
     });
 
     modal.innerHTML = `
-      <div class="st-pw-wb-dialog" role="dialog" aria-modal="true" aria-label="世界书条目管理">
+      <div class="st-pw-wb-dialog" role="dialog" aria-modal="true">
         <div class="st-pw-modal-header">
-          <div class="st-pw-modal-title-wrap">
-            <i class="fa-solid fa-book-open st-pw-accent-icon"></i>
-            <div>
-              <h3 class="st-pw-modal-title">${sanitizeHtml(worldbookName)}</h3>
-              <p class="st-pw-modal-subtitle">
-                共 ${allEntries.length} 条 · 已启用 <strong>${enabledCount}</strong> 条（常驻蓝灯 ${constantCount} 条 / 关键词绿灯 ${enabledCount - constantCount} 条）
-              </p>
-            </div>
+          <div class="st-pw-header-left">
+            <span class="st-pw-modal-title">${sanitizeHtml(worldbookName)}</span>
+            <span class="st-pw-header-meta">${enabledCount} / ${allEntries.length} 启用</span>
           </div>
           <div class="st-pw-modal-header-actions">
-            <button type="button" class="menu_button st-pw-wb-jump-host-btn" title="在酒馆原生世界书编辑器中打开">
-              <i class="fa-solid fa-arrow-up-right-from-square"></i> 跳转酒馆原生编辑器
+            <button type="button" class="menu_button st-pw-wb-jump-host-btn" title="在酒馆原生世界书面板中打开">
+              <i class="fa-solid fa-arrow-up-right-from-square"></i> 原生编辑器
             </button>
             <button type="button" class="menu_button st-pw-wb-add-entry-btn">
-              <i class="fa-solid fa-plus"></i> 新增条目
+              <i class="fa-solid fa-plus"></i> 新建条目
             </button>
-            <button type="button" class="menu_button st-pw-close-wb-modal">
-              <i class="fa-solid fa-xmark"></i> 关闭
+            <button type="button" class="menu_button st-pw-close-wb-modal" title="关闭">
+              <i class="fa-solid fa-xmark"></i>
             </button>
           </div>
         </div>
 
         <div class="st-pw-wb-toolbar">
-          <div class="st-pw-search-wrap">
-            <i class="fa-solid fa-magnifying-glass"></i>
-            <input type="search" class="text_pole st-pw-wb-search-input" placeholder="搜索条目标题、触发关键词或正文内容…" value="${escapeAttr(searchFilter)}" />
+          <input type="search" class="text_pole st-pw-wb-search-input" placeholder="搜索标题、关键词或内容…" value="${escapeAttr(searchFilter)}" />
+          <div class="st-pw-wb-filter-tabs">
+            <button type="button" class="st-pw-filter-pill ${statusFilter === 'all' ? 'active' : ''}" data-filter="all">全部 (${allEntries.length})</button>
+            <button type="button" class="st-pw-filter-pill ${statusFilter === 'constant' ? 'active' : ''}" data-filter="constant">常驻 (${constantCount})</button>
+            <button type="button" class="st-pw-filter-pill ${statusFilter === 'keyword' ? 'active' : ''}" data-filter="keyword">关键词 (${keywordCount})</button>
+            <button type="button" class="st-pw-filter-pill ${statusFilter === 'disabled' ? 'active' : ''}" data-filter="disabled">停用 (${disabledCount})</button>
           </div>
           <div class="st-pw-wb-bulk-btns">
-            <button type="button" class="menu_button st-pw-mini-btn st-pw-wb-enable-all">全部启用</button>
-            <button type="button" class="menu_button st-pw-mini-btn st-pw-wb-disable-all">全部停用</button>
+            <button type="button" class="menu_button st-pw-mini-btn st-pw-wb-enable-all">全开</button>
+            <button type="button" class="menu_button st-pw-mini-btn st-pw-wb-disable-all">全关</button>
           </div>
         </div>
 
         <div class="st-pw-wb-list">
           ${
             filtered.length === 0
-              ? `<div class="st-pw-empty-state">没有匹配的条目。你可以点击右上角「+ 新增条目」直接往这本世界书里添设定。</div>`
+              ? `<div class="st-pw-empty-state">无匹配条目</div>`
               : filtered
                   .map((item) => {
-                    const isEditing = editingUid === String(item._key);
-                    const statusBadge = item.disable
-                      ? `<span class="st-pw-badge st-pw-badge-muted">已停用</span>`
-                      : item.constant
-                        ? `<span class="st-pw-badge st-pw-badge-blue">🔵 常驻生效</span>`
-                        : `<span class="st-pw-badge st-pw-badge-green">🟢 关键词触发</span>`;
+                    const isExpanded = expandedKey === String(item._key);
+                    const modeClass = item.constant ? 'is-constant' : 'is-keyword';
+                    const modeLabel = item.constant ? '常驻' : '关键词';
+                    const keysText = item.constant
+                      ? ''
+                      : item.keyList.length
+                        ? item.keyList.join(', ')
+                        : '未设关键词';
+
                     return `
-                      <div class="st-pw-wb-entry-card ${item.disable ? 'is-disabled' : ''}" data-entry-key="${escapeAttr(item._key)}">
-                        <div class="st-pw-wb-entry-head">
-                          <label class="st-pw-switch" title="启用/停用此条目">
-                            <input type="checkbox" class="st-pw-wb-toggle-enable" data-entry-key="${escapeAttr(item._key)}" ${!item.disable ? 'checked' : ''} />
-                            <span class="st-pw-slider"></span>
-                          </label>
-                          <div class="st-pw-wb-entry-main">
-                            <div class="st-pw-wb-entry-title-row">
-                              <strong class="st-pw-wb-entry-title">${sanitizeHtml(item.comment || `(未命名条目 #${item.uid})`)}</strong>
-                              ${statusBadge}
-                            </div>
-                            <div class="st-pw-wb-entry-keys">
-                              ${
-                                item.constant
-                                  ? `<span>无需关键词，激活该 User 时始终注入</span>`
-                                  : `<span>触发词：${sanitizeHtml(item.keyList.join('、') || '（未填触发词）')}</span>`
-                              }
-                            </div>
+                      <div class="st-pw-wb-row ${item.disable ? 'is-disabled' : ''} ${isExpanded ? 'is-expanded' : ''}" data-entry-key="${escapeAttr(item._key)}">
+                        <div class="st-pw-wb-row-bar">
+                          <input type="checkbox" class="st-pw-wb-toggle-enable" data-entry-key="${escapeAttr(item._key)}" ${!item.disable ? 'checked' : ''} title="启用/停用" />
+                          <button type="button" class="st-pw-mode-tag ${modeClass} st-pw-wb-toggle-constant" data-entry-key="${escapeAttr(item._key)}" title="点击切换常驻 / 关键词触发">
+                            <span class="st-pw-dot"></span>${modeLabel}
+                          </button>
+                          <div class="st-pw-wb-row-title st-pw-wb-expand-trigger" data-entry-key="${escapeAttr(item._key)}">
+                            <span class="st-pw-entry-name">${sanitizeHtml(item.comment || `(未命名 #${item.uid})`)}</span>
+                            ${
+                              keysText
+                                ? `<span class="st-pw-entry-keys">${sanitizeHtml(keysText)}</span>`
+                                : ''
+                            }
                           </div>
-                          <div class="st-pw-wb-entry-actions">
-                            <button type="button" class="menu_button st-pw-mini-btn st-pw-wb-toggle-constant" data-entry-key="${escapeAttr(item._key)}" title="切换常驻蓝灯 / 关键词绿灯">
-                              ${item.constant ? '切为关键词' : '设为常驻'}
-                            </button>
-                            <button type="button" class="menu_button st-pw-mini-btn st-pw-wb-edit-btn" data-entry-key="${escapeAttr(item._key)}">
-                              <i class="fa-solid fa-pen"></i> ${isEditing ? '收起' : '编辑'}
-                            </button>
-                          </div>
+                          <span class="st-pw-entry-order" title="插入顺序 (Order)">#${item.order}</span>
+                          <button type="button" class="st-pw-icon-btn st-pw-wb-expand-trigger" data-entry-key="${escapeAttr(item._key)}" title="展开/收起编辑">
+                            <i class="fa-solid fa-chevron-${isExpanded ? 'up' : 'down'}"></i>
+                          </button>
                         </div>
                         ${
-                          !isEditing
-                            ? `<div class="st-pw-wb-entry-preview">${sanitizeHtml(item.content.slice(0, 180))}${item.content.length > 180 ? '…' : ''}</div>`
-                            : `
-                              <div class="st-pw-wb-entry-editor">
-                                <div class="st-pw-form-grid">
+                          isExpanded
+                            ? `
+                              <div class="st-pw-wb-row-detail">
+                                <div class="st-pw-wb-detail-grid">
                                   <div>
-                                    <label>条目标题 (Comment)</label>
+                                    <label>标题</label>
                                     <input type="text" class="text_pole st-pw-edit-comment" value="${escapeAttr(item.comment)}" />
                                   </div>
                                   <div>
-                                    <label>触发关键词（逗号分隔，绿灯模式下生效）</label>
-                                    <input type="text" class="text_pole st-pw-edit-keys" value="${escapeAttr(item.keyList.join(', '))}" />
+                                    <label>触发关键词（逗号分隔）</label>
+                                    <input type="text" class="text_pole st-pw-edit-keys" value="${escapeAttr(item.keyList.join(', '))}" placeholder="${item.constant ? '当前为常驻模式，无需关键词' : '输入触发词…'}" />
+                                  </div>
+                                  <div>
+                                    <label>权重顺序 (Order)</label>
+                                    <input type="number" class="text_pole st-pw-edit-order" value="${escapeAttr(item.order)}" />
                                   </div>
                                 </div>
                                 <div class="st-pw-form-row">
-                                  <label>条目设定正文 (Content)</label>
-                                  <textarea class="text_pole st-pw-edit-content" rows="5">${sanitizeHtml(item.content)}</textarea>
+                                  <label>内容 (${item.content.length} 字)</label>
+                                  <textarea class="text_pole st-pw-edit-content" rows="6">${sanitizeHtml(item.content)}</textarea>
                                 </div>
                                 <div class="st-pw-editor-footer">
-                                  <button type="button" class="menu_button st-pw-primary-action-btn st-pw-save-entry-btn" data-entry-key="${escapeAttr(item._key)}">
-                                    <i class="fa-solid fa-floppy-disk"></i> 保存此条目到世界书
+                                  <button type="button" class="menu_button st-pw-delete-entry-btn" data-entry-key="${escapeAttr(item._key)}">
+                                    删除条目
+                                  </button>
+                                  <button type="button" class="menu_button st-pw-primary-btn st-pw-save-entry-btn" data-entry-key="${escapeAttr(item._key)}">
+                                    保存修改
                                   </button>
                                 </div>
                               </div>
                             `
+                            : ''
                         }
                       </div>
                     `;
@@ -898,6 +957,13 @@ function renderWorldbookInspectorContent(modal, worldbookName, worldData) {
       }
     });
 
+    modal.querySelectorAll('.st-pw-filter-pill').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        statusFilter = btn.getAttribute('data-filter') || 'all';
+        redraw();
+      });
+    });
+
     modal.querySelector('.st-pw-wb-add-entry-btn')?.addEventListener('click', async () => {
       const existingKeys = Object.keys(worldData.entries || {}).map(Number).filter(Number.isFinite);
       const nextUid = existingKeys.length ? Math.max(...existingKeys) + 1 : 0;
@@ -906,7 +972,7 @@ function renderWorldbookInspectorContent(modal, worldbookName, worldData) {
         uid: nextUid,
         key: [],
         keysecondary: [],
-        comment: `新 User 设定条目 #${nextUid + 1}`,
+        comment: `新条目 #${nextUid + 1}`,
         content: '',
         constant: true,
         vectorized: false,
@@ -935,26 +1001,29 @@ function renderWorldbookInspectorContent(modal, worldbookName, worldData) {
         cooldown: 0,
         delay: 0,
       };
-      editingUid = keyStr;
+      expandedKey = keyStr;
+      statusFilter = 'all';
       await saveWorldbookData(worldbookName, worldData);
       redraw();
     });
 
     modal.querySelector('.st-pw-wb-enable-all')?.addEventListener('click', async () => {
-      for (const entry of Object.values(worldData.entries || {})) {
-        entry.disable = false;
+      for (const item of filtered) {
+        if (worldData.entries?.[item._key]) {
+          worldData.entries[item._key].disable = false;
+        }
       }
       await saveWorldbookData(worldbookName, worldData);
-      globalThis.toastr?.success?.('已启用该世界书全部条目', '世界书弹窗');
       redraw();
     });
 
     modal.querySelector('.st-pw-wb-disable-all')?.addEventListener('click', async () => {
-      for (const entry of Object.values(worldData.entries || {})) {
-        entry.disable = true;
+      for (const item of filtered) {
+        if (worldData.entries?.[item._key]) {
+          worldData.entries[item._key].disable = true;
+        }
       }
       await saveWorldbookData(worldbookName, worldData);
-      globalThis.toastr?.info?.('已停用该世界书全部条目', '世界书弹窗');
       redraw();
     });
 
@@ -970,7 +1039,8 @@ function renderWorldbookInspectorContent(modal, worldbookName, worldData) {
     });
 
     modal.querySelectorAll('.st-pw-wb-toggle-constant').forEach((btn) => {
-      btn.addEventListener('click', async () => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
         const key = btn.getAttribute('data-entry-key');
         if (key && worldData.entries?.[key]) {
           worldData.entries[key].constant = !worldData.entries[key].constant;
@@ -980,10 +1050,10 @@ function renderWorldbookInspectorContent(modal, worldbookName, worldData) {
       });
     });
 
-    modal.querySelectorAll('.st-pw-wb-edit-btn').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const key = btn.getAttribute('data-entry-key');
-        editingUid = editingUid === key ? null : key;
+    modal.querySelectorAll('.st-pw-wb-expand-trigger').forEach((el) => {
+      el.addEventListener('click', () => {
+        const key = el.getAttribute('data-entry-key');
+        expandedKey = expandedKey === key ? null : key;
         redraw();
       });
     });
@@ -991,22 +1061,39 @@ function renderWorldbookInspectorContent(modal, worldbookName, worldData) {
     modal.querySelectorAll('.st-pw-save-entry-btn').forEach((btn) => {
       btn.addEventListener('click', async () => {
         const key = btn.getAttribute('data-entry-key');
-        const card = btn.closest('.st-pw-wb-entry-card');
-        if (!key || !card || !worldData.entries?.[key]) return;
-        const commentVal = card.querySelector('.st-pw-edit-comment')?.value ?? '';
-        const keysRaw = card.querySelector('.st-pw-edit-keys')?.value ?? '';
-        const contentVal = card.querySelector('.st-pw-edit-content')?.value ?? '';
+        const row = btn.closest('.st-pw-wb-row');
+        if (!key || !row || !worldData.entries?.[key]) return;
+        const commentVal = row.querySelector('.st-pw-edit-comment')?.value ?? '';
+        const keysRaw = row.querySelector('.st-pw-edit-keys')?.value ?? '';
+        const orderVal = Number(row.querySelector('.st-pw-edit-order')?.value ?? 100);
+        const contentVal = row.querySelector('.st-pw-edit-content')?.value ?? '';
 
         worldData.entries[key].comment = commentVal.trim();
         worldData.entries[key].key = keysRaw
           .split(/[,，]/)
           .map((s) => s.trim())
           .filter(Boolean);
+        if (Number.isFinite(orderVal)) {
+          worldData.entries[key].order = orderVal;
+        }
         worldData.entries[key].content = contentVal;
 
         await saveWorldbookData(worldbookName, worldData);
-        globalThis.toastr?.success?.('条目已保存回酒馆世界书', '世界书弹窗');
-        editingUid = null;
+        globalThis.toastr?.success?.('已保存');
+        expandedKey = null;
+        redraw();
+      });
+    });
+
+    modal.querySelectorAll('.st-pw-delete-entry-btn').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const key = btn.getAttribute('data-entry-key');
+        if (!key || !worldData.entries?.[key]) return;
+        const title = worldData.entries[key].comment || `#${key}`;
+        if (!window.confirm(`确定删除条目「${title}」吗？`)) return;
+        delete worldData.entries[key];
+        expandedKey = null;
+        await saveWorldbookData(worldbookName, worldData);
         redraw();
       });
     });
@@ -1015,9 +1102,6 @@ function renderWorldbookInspectorContent(modal, worldbookName, worldData) {
   redraw();
 }
 
-/**
- * 计算当前激活 User 将在本次对话中注入的所有扩展内容（随身设定卡片 A + 附加世界书 B）
- */
 async function evaluateActivePersonaInjections(chatMessages = []) {
   const settings = getSettings();
   if (!settings.enabled) {
@@ -1040,7 +1124,6 @@ async function evaluateActivePersonaInjections(chatMessages = []) {
   const blocks = [];
   const summary = [];
 
-  // 1. 随身设定卡片 (A)
   for (const trait of profile.traits) {
     if (!trait || !trait.enabled || !String(trait.content || '').trim()) continue;
     if (trait.triggerMode === 'keyword') {
@@ -1050,23 +1133,22 @@ async function evaluateActivePersonaInjections(chatMessages = []) {
         .filter(Boolean);
       const matchedKw = kwList.find((kw) => recentText.includes(kw));
       if (!matchedKw) continue;
-      blocks.push(`[User 随身设定 · ${trait.title || '触发设定'}]\n${trait.content.trim()}`);
+      blocks.push(`[${trait.title || '设定'}]\n${trait.content.trim()}`);
       summary.push({
         type: 'trait',
         title: trait.title || '未命名设定',
-        reason: `关键词触发 (${matchedKw})`,
+        reason: `关键词: ${matchedKw}`,
       });
     } else {
-      blocks.push(`[User 随身设定 · ${trait.title || '常驻设定'}]\n${trait.content.trim()}`);
+      blocks.push(`[${trait.title || '设定'}]\n${trait.content.trim()}`);
       summary.push({
         type: 'trait',
         title: trait.title || '未命名设定',
-        reason: '常驻生效',
+        reason: '常驻',
       });
     }
   }
 
-  // 2. 附加绑定世界书 (B)
   for (const extraBook of profile.extraWorldbooks) {
     if (!extraBook || !extraBook.enabled || !extraBook.name) continue;
     try {
@@ -1082,8 +1164,8 @@ async function evaluateActivePersonaInjections(chatMessages = []) {
           summary.push({
             type: 'worldbook',
             book: extraBook.name,
-            title: entry.comment || `条目 #${entry.uid}`,
-            reason: '附加书·常驻蓝灯',
+            title: entry.comment || `#${entry.uid}`,
+            reason: '常驻',
           });
         } else {
           const keys = Array.isArray(entry.key) ? entry.key : [];
@@ -1096,8 +1178,8 @@ async function evaluateActivePersonaInjections(chatMessages = []) {
             summary.push({
               type: 'worldbook',
               book: extraBook.name,
-              title: entry.comment || `条目 #${entry.uid}`,
-              reason: `附加书·关键词 (${hit})`,
+              title: entry.comment || `#${entry.uid}`,
+              reason: `关键词: ${hit}`,
             });
           }
         }
@@ -1111,9 +1193,6 @@ async function evaluateActivePersonaInjections(chatMessages = []) {
   return { blocks, summary };
 }
 
-/**
- * 全局生成拦截器（在 manifest.json 的 generate_interceptor 中声明，必须挂在 globalThis 上）
- */
 globalThis.PersonaWardrobe_interceptGeneration = async function (
   chat,
   _contextSize,
@@ -1130,7 +1209,7 @@ globalThis.PersonaWardrobe_interceptGeneration = async function (
       is_system: false,
       name: 'Persona Wardrobe',
       send_date: Date.now(),
-      mes: `[当前 User 扩展设定补充]\n${blocks.join('\n\n')}`,
+      mes: blocks.join('\n\n'),
       extra: {
         isSmallSys: true,
         source: MODULE_ID,
@@ -1144,9 +1223,6 @@ globalThis.PersonaWardrobe_interceptGeneration = async function (
   }
 };
 
-/**
- * 打开主界面：「User 人设与世界书衣柜总管」全屏/大弹窗
- */
 function openWardrobeModal(initialAvatarId = null) {
   removeReturnToWardrobePill();
   const personas = getHostPersonas();
@@ -1169,6 +1245,29 @@ function openWardrobeModal(initialAvatarId = null) {
   renderWardrobeModalContent();
 }
 
+/**
+ * 统计每个角色卡下面绑定了哪些 User 人设（支持一个角色绑多个 User 人设）
+ */
+function buildCharacterGroupMap(personas) {
+  const currentChar = getCurrentCharacter();
+  const map = new Map();
+
+  if (currentChar?.name) {
+    map.set(currentChar.name, []);
+  }
+
+  for (const p of personas) {
+    for (const cName of p.meta.boundCharacters) {
+      const clean = String(cName || '').trim();
+      if (!clean) continue;
+      if (!map.has(clean)) map.set(clean, []);
+      map.get(clean).push(p);
+    }
+  }
+
+  return { currentCharName: currentChar?.name || '', map };
+}
+
 function renderWardrobeModalContent() {
   const modal = document.querySelector('#st_pw_wardrobe_modal');
   if (!modal || modal.classList.contains('st-pw-hidden')) return;
@@ -1176,6 +1275,9 @@ function renderWardrobeModalContent() {
   const settings = getSettings();
   const personas = getHostPersonas();
   const availableBooks = getAvailableWorldbooks();
+  const hostChars = getHostCharacters();
+  const { currentCharName, map: charGroupMap } = buildCharacterGroupMap(personas);
+
   const activePersona = personas.find((p) => p.isActive) || null;
   const selectedPersona =
     personas.find((p) => p.avatarId === state.selectedAvatarId) ||
@@ -1187,24 +1289,51 @@ function renderWardrobeModalContent() {
     state.selectedAvatarId = selectedPersona.avatarId;
   }
 
+  // 如果在「按绑定角色」模式下，确定当前选中的角色分组
+  const charGroupNames = [...charGroupMap.keys()];
+  let effectiveCharFilter = state.activeCharFilter;
+  if (effectiveCharFilter === '__current__') {
+    effectiveCharFilter = currentCharName || charGroupNames[0] || '__unbound__';
+  }
+  if (
+    effectiveCharFilter !== '__unbound__' &&
+    effectiveCharFilter !== '__all_chars__' &&
+    !charGroupMap.has(effectiveCharFilter)
+  ) {
+    effectiveCharFilter = currentCharName || charGroupNames[0] || '__unbound__';
+  }
+
   const q = state.searchQuery.trim().toLowerCase();
   const filteredPersonas = personas
     .filter((p) => {
-      if (state.activeModalTab === 'fav' && !p.meta.favorite) return false;
-      if (
-        state.activeModalTab === 'linked' &&
-        !p.lorebook &&
-        p.meta.extraWorldbooks.length === 0 &&
-        p.meta.traits.length === 0
-      ) {
-        return false;
-      }
-      if (
-        state.activeModalTab !== 'all' &&
-        state.activeModalTab !== 'fav' &&
-        state.activeModalTab !== 'linked'
-      ) {
-        if (p.meta.group !== state.activeModalTab) return false;
+      if (state.sidebarMode === 'character') {
+        if (effectiveCharFilter === '__unbound__') {
+          if (p.meta.boundCharacters.length > 0) return false;
+        } else if (effectiveCharFilter !== '__all_chars__') {
+          const hitChar = p.meta.boundCharacters.some(
+            (c) => c.toLowerCase() === effectiveCharFilter.toLowerCase()
+          );
+          if (!hitChar) return false;
+        }
+      } else {
+        if (state.activeModalTab === 'fav' && !p.meta.favorite) return false;
+        if (
+          state.activeModalTab === 'linked' &&
+          !p.lorebook &&
+          p.meta.extraWorldbooks.length === 0 &&
+          p.meta.traits.length === 0
+        ) {
+          return false;
+        }
+        if (state.activeModalTab === '__ungrouped__' && p.meta.group) return false;
+        if (
+          state.activeModalTab !== 'all' &&
+          state.activeModalTab !== 'fav' &&
+          state.activeModalTab !== 'linked' &&
+          state.activeModalTab !== '__ungrouped__'
+        ) {
+          if (p.meta.group !== state.activeModalTab) return false;
+        }
       }
 
       if (!q) return true;
@@ -1238,151 +1367,177 @@ function renderWardrobeModalContent() {
     ? activeMeta.traits.filter((t) => t.enabled && String(t.content || '').trim())
     : [];
 
-  modal.innerHTML = `
-    <div class="st-pw-wardrobe-dialog" role="dialog" aria-modal="true" aria-label="User 人设与世界书衣柜总管">
-      <!-- 顶部栏 -->
-      <div class="st-pw-modal-header">
-        <div class="st-pw-modal-title-wrap">
-          <i class="fa-solid fa-id-card-clip st-pw-accent-icon"></i>
-          <div>
-            <h3 class="st-pw-modal-title">User 人设与世界书总管</h3>
-            <p class="st-pw-modal-subtitle">
-              共收纳 <strong>${personas.length}</strong> 个 User 档案 · 支持分类检索、跨分页一键切人设、世界书跳转与弹窗直接改条目
-            </p>
-          </div>
-        </div>
-        <div class="st-pw-modal-header-actions">
-          <button type="button" class="menu_button st-pw-preview-active-prompt-btn" title="查看当前激活 User 实际生效的完整设定与世界书清单">
-            <i class="fa-solid fa-eye"></i> 预览当前生效设定
-          </button>
-          <button type="button" class="menu_button st-pw-refresh-host-btn" title="重新从酒馆同步最新 User 与世界书列表">
-            <i class="fa-solid fa-rotate"></i> 刷新同步
-          </button>
-          <button type="button" class="menu_button st-pw-close-wardrobe-btn">
-            <i class="fa-solid fa-xmark"></i> 关闭
-          </button>
-        </div>
-      </div>
+  // 自定义分组模式下，若当前选中的是某个自定义分组，显示分组重命名/删除与批量移入条
+  const isCustomGroupSelected =
+    state.sidebarMode === 'group' &&
+    settings.groups.includes(state.activeModalTab);
 
-      <!-- C. 顶部「当前正在生效总览条」 -->
-      <div class="st-pw-active-banner">
-        <div class="st-pw-active-banner-left">
-          <span class="st-pw-banner-tag">当前激活 User</span>
-          <strong>${sanitizeHtml(activePersona ? activePersona.name : '未检测到激活 User')}</strong>
+  // 角色分组模式下，若当前选中的是某个具体角色，可一键把其他现有 User 绑定到该角色下
+  const isSpecificCharSelected =
+    state.sidebarMode === 'character' &&
+    effectiveCharFilter &&
+    effectiveCharFilter !== '__unbound__' &&
+    effectiveCharFilter !== '__all_chars__';
+
+  modal.innerHTML = `
+    <div class="st-pw-wardrobe-dialog" role="dialog" aria-modal="true">
+      <div class="st-pw-modal-header">
+        <div class="st-pw-header-left">
+          <span class="st-pw-modal-title">User 人设管理</span>
+          <span class="st-pw-header-meta">当前：<strong>${sanitizeHtml(activePersona ? activePersona.name : '无')}</strong></span>
           ${
-            activePersona?.meta?.group
-              ? `<span class="st-pw-chip">${sanitizeHtml(activePersona.meta.group)}</span>`
+            activePersona?.lorebook
+              ? `
+                <span class="st-pw-header-divider">|</span>
+                <span class="st-pw-header-meta">世界书：<strong>${sanitizeHtml(activePersona.lorebook)}</strong></span>
+                <button type="button" class="menu_button st-pw-mini-btn st-pw-act-popup-book" data-book="${escapeAttr(activePersona.lorebook)}">条目</button>
+                <button type="button" class="menu_button st-pw-mini-btn st-pw-act-jump-book" data-book="${escapeAttr(activePersona.lorebook)}">跳转</button>
+              `
+              : ''
+          }
+          ${
+            activeExtraBooks.length || activeTraits.length
+              ? `<span class="st-pw-header-divider">|</span><span class="st-pw-header-meta">附加书 ${activeExtraBooks.length} · 随身设定 ${activeTraits.length}</span>`
               : ''
           }
         </div>
-        <div class="st-pw-active-banner-books">
-          <div class="st-pw-banner-book-item">
-            <span class="st-pw-muted">原生主世界书：</span>
-            ${
-              activePersona?.lorebook
-                ? `
-                  <strong class="st-pw-highlight-book">${sanitizeHtml(activePersona.lorebook)}</strong>
-                  <button type="button" class="menu_button st-pw-mini-btn st-pw-act-jump-book" data-book="${escapeAttr(activePersona.lorebook)}" title="在酒馆世界书面板中跳转打开">
-                    <i class="fa-solid fa-arrow-up-right-from-square"></i> 跳转面板
-                  </button>
-                  <button type="button" class="menu_button st-pw-mini-btn st-pw-act-popup-book" data-book="${escapeAttr(activePersona.lorebook)}" title="直接在弹窗内查看和开关条目">
-                    <i class="fa-solid fa-book-open"></i> 弹窗条目
-                  </button>
-                `
-                : `<span class="st-pw-muted">未绑定</span>`
-            }
-          </div>
-          <div class="st-pw-banner-book-item">
-            <span class="st-pw-muted">附加世界书：</span>
-            <strong>${activeExtraBooks.length} 本启用</strong>
-            <span class="st-pw-muted">· 随身设定卡：</span>
-            <strong>${activeTraits.length} 条启用</strong>
-          </div>
+        <div class="st-pw-modal-header-actions">
+          <button type="button" class="menu_button st-pw-mini-btn st-pw-preview-active-prompt-btn">生效预览</button>
+          <button type="button" class="menu_button st-pw-mini-btn st-pw-refresh-host-btn" title="同步列表"><i class="fa-solid fa-rotate"></i></button>
+          <button type="button" class="menu_button st-pw-mini-btn st-pw-close-wardrobe-btn" title="关闭"><i class="fa-solid fa-xmark"></i></button>
         </div>
       </div>
 
-      <!-- 主体双栏工作台 -->
       <div class="st-pw-workbench">
-        <!-- 左栏：分类导航 + 搜索 + User 卡片列表 -->
         <aside class="st-pw-sidebar">
-          <div class="st-pw-search-wrap">
-            <i class="fa-solid fa-magnifying-glass"></i>
-            <input type="search" id="st_pw_search_input" class="text_pole" placeholder="搜 User 名、设定词、标签、世界书或关联卡…" value="${escapeAttr(state.searchQuery)}" />
+          <!-- 分组维度切换：自定义分组 vs 按角色分组（一个角色下绑多个人设） -->
+          <div class="st-pw-mode-switch">
+            <button type="button" class="st-pw-mode-btn ${state.sidebarMode === 'group' ? 'active' : ''}" data-mode="group">
+              自定义分组
+            </button>
+            <button type="button" class="st-pw-mode-btn ${state.sidebarMode === 'character' ? 'active' : ''}" data-mode="character">
+              按绑定角色 (${charGroupNames.length})
+            </button>
           </div>
 
-          <div class="st-pw-group-tabs">
-            <button type="button" class="st-pw-tab-btn ${state.activeModalTab === 'all' ? 'active' : ''}" data-tab="all">
-              全部 (${personas.length})
-            </button>
-            <button type="button" class="st-pw-tab-btn ${state.activeModalTab === 'fav' ? 'active' : ''}" data-tab="fav">
-              ★ 收藏 (${personas.filter((p) => p.meta.favorite).length})
-            </button>
-            <button type="button" class="st-pw-tab-btn ${state.activeModalTab === 'linked' ? 'active' : ''}" data-tab="linked">
-              已绑设定 (${personas.filter((p) => p.lorebook || p.meta.extraWorldbooks.length || p.meta.traits.length).length})
-            </button>
-            ${settings.groups
-              .map((g) => {
-                const count = personas.filter((p) => p.meta.group === g).length;
-                return `
-                  <button type="button" class="st-pw-tab-btn ${state.activeModalTab === g ? 'active' : ''}" data-tab="${escapeAttr(g)}">
-                    ${sanitizeHtml(g)} (${count})
-                  </button>
-                `;
-              })
-              .join('')}
-            <button type="button" class="st-pw-tab-btn st-pw-add-group-btn" title="新增自定义分组">+ 分组</button>
-          </div>
+          <input type="search" id="st_pw_search_input" class="text_pole st-pw-sidebar-search" placeholder="搜索人设、标签、世界书、角色…" value="${escapeAttr(state.searchQuery)}" />
+
+          ${
+            state.sidebarMode === 'group'
+              ? `
+                <div class="st-pw-group-tabs">
+                  <button type="button" class="st-pw-filter-pill ${state.activeModalTab === 'all' ? 'active' : ''}" data-tab="all">全部 (${personas.length})</button>
+                  <button type="button" class="st-pw-filter-pill ${state.activeModalTab === 'fav' ? 'active' : ''}" data-tab="fav">收藏 (${personas.filter((p) => p.meta.favorite).length})</button>
+                  <button type="button" class="st-pw-filter-pill ${state.activeModalTab === 'linked' ? 'active' : ''}" data-tab="linked">已绑书 (${personas.filter((p) => p.lorebook || p.meta.extraWorldbooks.length || p.meta.traits.length).length})</button>
+                  ${settings.groups
+                    .map((g) => {
+                      const count = personas.filter((p) => p.meta.group === g).length;
+                      return `<button type="button" class="st-pw-filter-pill ${state.activeModalTab === g ? 'active' : ''}" data-tab="${escapeAttr(g)}">${sanitizeHtml(g)} (${count})</button>`;
+                    })
+                    .join('')}
+                  <button type="button" class="st-pw-filter-pill ${state.activeModalTab === '__ungrouped__' ? 'active' : ''}" data-tab="__ungrouped__">未分类 (${personas.filter((p) => !p.meta.group).length})</button>
+                  <button type="button" class="st-pw-filter-pill st-pw-add-group-btn" title="新建自定义分组">+ 新建</button>
+                </div>
+                ${
+                  isCustomGroupSelected
+                    ? `
+                      <div class="st-pw-group-ops-bar">
+                        <span class="st-pw-group-ops-name">${sanitizeHtml(state.activeModalTab)}</span>
+                        <div class="st-pw-group-ops-btns">
+                          <button type="button" class="st-pw-link-btn st-pw-rename-group-btn">重命名</button>
+                          <button type="button" class="st-pw-link-btn st-pw-delete-group-btn">删除分组</button>
+                        </div>
+                      </div>
+                    `
+                    : ''
+                }
+              `
+              : `
+                <div class="st-pw-group-tabs">
+                  ${
+                    currentCharName
+                      ? `<button type="button" class="st-pw-filter-pill ${effectiveCharFilter === currentCharName ? 'active' : ''}" data-char="${escapeAttr(currentCharName)}">当前角色: ${sanitizeHtml(currentCharName)} (${(charGroupMap.get(currentCharName) || []).length})</button>`
+                      : ''
+                  }
+                  ${charGroupNames
+                    .filter((c) => c !== currentCharName)
+                    .map((c) => {
+                      const list = charGroupMap.get(c) || [];
+                      return `<button type="button" class="st-pw-filter-pill ${effectiveCharFilter === c ? 'active' : ''}" data-char="${escapeAttr(c)}">${sanitizeHtml(c)} (${list.length})</button>`;
+                    })
+                    .join('')}
+                  <button type="button" class="st-pw-filter-pill ${effectiveCharFilter === '__unbound__' ? 'active' : ''}" data-char="__unbound__">未绑角色 (${personas.filter((p) => p.meta.boundCharacters.length === 0).length})</button>
+                </div>
+                ${
+                  isSpecificCharSelected
+                    ? `
+                      <div class="st-pw-char-assign-bar">
+                        <select id="st_pw_quick_assign_persona_to_char" class="text_pole st-pw-flex-select">
+                          <option value="">+ 将其他人设绑到「${sanitizeHtml(effectiveCharFilter)}」…</option>
+                          ${personas
+                            .filter(
+                              (p) =>
+                                !p.meta.boundCharacters.some(
+                                  (c) => c.toLowerCase() === effectiveCharFilter.toLowerCase()
+                                )
+                            )
+                            .map(
+                              (p) =>
+                                `<option value="${escapeAttr(p.avatarId)}">${sanitizeHtml(p.name)}</option>`
+                            )
+                            .join('')}
+                        </select>
+                      </div>
+                    `
+                    : ''
+                }
+              `
+          }
 
           <div class="st-pw-persona-list">
             ${
               filteredPersonas.length === 0
-                ? `<div class="st-pw-empty-state">没有匹配的 User 人设。可尝试清空搜索词或切换分组标签。</div>`
+                ? `<div class="st-pw-empty-state">${
+                    isSpecificCharSelected
+                      ? `角色「${sanitizeHtml(effectiveCharFilter)}」下暂未绑定人设，可在上方下拉框直接添加。`
+                      : '无匹配人设'
+                  }</div>`
                 : filteredPersonas
                     .map((p) => {
                       const isSelected = selectedPersona?.avatarId === p.avatarId;
-                      const enabledExtraCount = p.meta.extraWorldbooks.filter((b) => b.enabled).length;
-                      const enabledTraitCount = p.meta.traits.filter((t) => t.enabled).length;
+                      const extraCount = p.meta.extraWorldbooks.filter((b) => b.enabled).length;
+                      const traitCount = p.meta.traits.filter((t) => t.enabled).length;
                       return `
-                        <div class="st-pw-persona-card ${isSelected ? 'is-selected' : ''} ${p.isActive ? 'is-active-user' : ''}" data-avatar-id="${escapeAttr(p.avatarId)}">
-                          <div class="st-pw-avatar-box">
-                            <img src="${escapeAttr(p.avatarUrl)}" alt="${escapeAttr(p.name)}" onerror="this.style.display='none'" />
-                            ${p.isActive ? `<span class="st-pw-active-dot" title="当前正在使用"></span>` : ''}
-                          </div>
-                          <div class="st-pw-card-info">
-                            <div class="st-pw-card-top-row">
-                              <strong class="st-pw-card-name">${sanitizeHtml(p.name)}</strong>
-                              <button type="button" class="st-pw-fav-btn ${p.meta.favorite ? 'is-fav' : ''}" data-avatar-id="${escapeAttr(p.avatarId)}" title="收藏置顶">
-                                ★
-                              </button>
+                        <div class="st-pw-persona-item ${isSelected ? 'is-selected' : ''} ${p.isActive ? 'is-active-user' : ''}" data-avatar-id="${escapeAttr(p.avatarId)}">
+                          <img class="st-pw-item-avatar" src="${escapeAttr(p.avatarUrl)}" alt="" onerror="this.style.visibility='hidden'" />
+                          <div class="st-pw-item-main">
+                            <div class="st-pw-item-title-line">
+                              <span class="st-pw-item-name">${sanitizeHtml(p.name)}</span>
+                              ${p.meta.group ? `<span class="st-pw-tiny-tag">${sanitizeHtml(p.meta.group)}</span>` : ''}
                             </div>
-                            <div class="st-pw-card-badges">
-                              ${p.isActive ? `<span class="st-pw-badge st-pw-badge-amber">使用中</span>` : ''}
-                              ${p.meta.group ? `<span class="st-pw-badge">${sanitizeHtml(p.meta.group)}</span>` : ''}
+                            <div class="st-pw-item-sub-line">
                               ${
                                 p.lorebook
-                                  ? `<span class="st-pw-badge st-pw-badge-blue" title="原生主世界书：${escapeAttr(p.lorebook)}"><i class="fa-solid fa-book"></i> ${sanitizeHtml(p.lorebook)}</span>`
-                                  : ''
+                                  ? `<span class="st-pw-item-book">${sanitizeHtml(p.lorebook)}</span>`
+                                  : `<span class="st-pw-muted">未绑书</span>`
                               }
+                              ${extraCount ? `<span>+${extraCount}书</span>` : ''}
+                              ${traitCount ? `<span>· ${traitCount}设定</span>` : ''}
                               ${
-                                enabledExtraCount > 0
-                                  ? `<span class="st-pw-badge st-pw-badge-green">+${enabledExtraCount} 附加书</span>`
+                                p.meta.boundCharacters.length
+                                  ? `<span class="st-pw-muted">· ${p.meta.boundCharacters.length}角色</span>`
                                   : ''
                               }
-                              ${
-                                enabledTraitCount > 0
-                                  ? `<span class="st-pw-badge st-pw-badge-purple">${enabledTraitCount} 随身卡</span>`
-                                  : ''
-                              }
-                            </div>
-                            <div class="st-pw-card-desc-snippet">
-                              ${sanitizeHtml((p.description || p.meta.note || '暂无描述').slice(0, 60))}
                             </div>
                           </div>
-                          <div class="st-pw-card-quick-action">
+                          <div class="st-pw-item-actions">
+                            <button type="button" class="st-pw-fav-btn ${p.meta.favorite ? 'is-fav' : ''}" data-avatar-id="${escapeAttr(p.avatarId)}" title="收藏">
+                              <i class="fa-${p.meta.favorite ? 'solid' : 'regular'} fa-star"></i>
+                            </button>
                             ${
                               p.isActive
-                                ? `<span class="st-pw-in-use-label">当前</span>`
-                                : `<button type="button" class="menu_button st-pw-mini-btn st-pw-use-persona-btn" data-avatar-id="${escapeAttr(p.avatarId)}">切换</button>`
+                                ? `<span class="st-pw-active-label">当前</span>`
+                                : `<button type="button" class="menu_button st-pw-mini-btn st-pw-use-persona-btn" data-avatar-id="${escapeAttr(p.avatarId)}">使用</button>`
                             }
                           </div>
                         </div>
@@ -1393,51 +1548,49 @@ function renderWardrobeModalContent() {
           </div>
         </aside>
 
-        <!-- 右栏：选中 User 的详情、世界书跳转/弹窗中心、附加世界书、随身设定卡片 -->
         <main class="st-pw-detail-pane">
           ${
             !selectedPersona
-              ? `<div class="st-pw-empty-state">尚未在酒馆中检测到任何 User 人设。</div>`
-              : renderSelectedPersonaDetail(selectedPersona, availableBooks, settings)
+              ? `<div class="st-pw-empty-state">未选择 User</div>`
+              : renderSelectedPersonaDetail(selectedPersona, availableBooks, hostChars, currentCharName, settings)
           }
         </main>
       </div>
     </div>
   `;
 
-  bindWardrobeModalEvents(modal, selectedPersona, availableBooks);
+  bindWardrobeModalEvents(modal, selectedPersona, availableBooks, effectiveCharFilter);
 }
 
-function renderSelectedPersonaDetail(persona, availableBooks, settings) {
+function renderSelectedPersonaDetail(persona, availableBooks, hostChars, currentCharName, settings) {
   const meta = persona.meta;
   const bookOptionsHtml = [
-    `<option value="">— 未绑定主世界书 —</option>`,
+    `<option value="">— 未绑定 —</option>`,
     ...availableBooks.map(
       (b) =>
         `<option value="${escapeAttr(b)}" ${persona.lorebook === b ? 'selected' : ''}>${sanitizeHtml(b)}</option>`
     ),
   ].join('');
 
+  const isCurrentCharBound =
+    currentCharName &&
+    meta.boundCharacters.some((c) => c.toLowerCase() === currentCharName.toLowerCase());
+
+  const unboundHostChars = hostChars.filter(
+    (c) => !meta.boundCharacters.some((bc) => bc.toLowerCase() === c.name.toLowerCase())
+  );
+
   return `
-    <!-- 详情头部 -->
-    <div class="st-pw-detail-header">
-      <div class="st-pw-detail-identity">
-        <img class="st-pw-detail-avatar" src="${escapeAttr(persona.avatarUrl)}" alt="${escapeAttr(persona.name)}" onerror="this.style.display='none'" />
-        <div>
-          <div class="st-pw-detail-title-row">
-            <h2>${sanitizeHtml(persona.name)}</h2>
+    <div class="st-pw-detail-top">
+      <div class="st-pw-detail-user-row">
+        <img class="st-pw-detail-avatar" src="${escapeAttr(persona.avatarUrl)}" alt="" onerror="this.style.visibility='hidden'" />
+        <div class="st-pw-detail-user-info">
+          <div class="st-pw-detail-name-line">
+            <strong>${sanitizeHtml(persona.name)}</strong>
             <span class="st-pw-mono-id">${sanitizeHtml(persona.avatarId)}</span>
-            ${
-              persona.isActive
-                ? `<span class="st-pw-badge st-pw-badge-amber">当前正在使用此 User</span>`
-                : `<button type="button" class="menu_button st-pw-primary-action-btn st-pw-detail-switch-btn" data-avatar-id="${escapeAttr(persona.avatarId)}">
-                    <i class="fa-solid fa-check"></i> 一键切换为此 User
-                  </button>`
-            }
           </div>
-          <div class="st-pw-detail-meta-bar">
-            <label>所属分类：</label>
-            <select id="st_pw_detail_group" class="text_pole st-pw-inline-select">
+          <div class="st-pw-detail-meta-inputs">
+            <select id="st_pw_detail_group" class="text_pole" title="自定义分组">
               <option value="">未分类</option>
               ${settings.groups
                 .map(
@@ -1445,182 +1598,183 @@ function renderSelectedPersonaDetail(persona, availableBooks, settings) {
                     `<option value="${escapeAttr(g)}" ${meta.group === g ? 'selected' : ''}>${sanitizeHtml(g)}</option>`
                 )
                 .join('')}
+              <option value="__new__">+ 新建分组…</option>
             </select>
-            <label>标签（逗号分隔）：</label>
-            <input type="text" id="st_pw_detail_tags" class="text_pole st-pw-inline-input" placeholder="如：高冷, 调查员, 现代" value="${escapeAttr(meta.tags.join(', '))}" />
-            <label>常用关联角色卡：</label>
-            <input type="text" id="st_pw_detail_chars" class="text_pole st-pw-inline-input" placeholder="填角色名，切聊天可提醒" value="${escapeAttr(meta.boundCharacters.join(', '))}" />
+            <input type="text" id="st_pw_detail_tags" class="text_pole" placeholder="标签 (逗号分隔)" value="${escapeAttr(meta.tags.join(', '))}" />
           </div>
+        </div>
+        <div>
+          ${
+            persona.isActive
+              ? `<span class="st-pw-current-pill">当前使用中</span>`
+              : `<button type="button" class="menu_button st-pw-primary-btn st-pw-detail-switch-btn" data-avatar-id="${escapeAttr(persona.avatarId)}">切换为此 User</button>`
+          }
         </div>
       </div>
     </div>
 
-    <!-- 模块 1：世界书绑定、一键跳转与弹窗速编中心 -->
-    <section class="st-pw-section-card">
-      <div class="st-pw-section-head">
-        <div>
-          <h3><i class="fa-solid fa-earth-asia st-pw-accent-icon"></i> 关联世界书总控（支持一键跳转面板 & 弹窗直接改条目）</h3>
-          <p class="st-pw-section-desc">
-            原生主世界书会直接同步给酒馆自带的 Persona Lorebook（无需再按 Shift 点那个小地球）；你还可以额外绑定多本附加世界书，切换此 User 时自动联动生效。
-          </p>
-        </div>
-      </div>
-
-      <!-- 1.1 原生主绑定世界书 -->
-      <div class="st-pw-primary-book-box">
-        <div class="st-pw-book-box-label">
-          <strong>原生主绑定世界书 (Primary Lorebook)</strong>
-          <span class="st-pw-muted">与酒馆原生 User 面板双向同步</span>
-        </div>
-        <div class="st-pw-book-controls-row">
-          <select id="st_pw_primary_book_select" class="text_pole st-pw-book-select">
-            ${bookOptionsHtml}
-          </select>
-          <button type="button" class="menu_button st-pw-act-jump-book" data-book="${escapeAttr(persona.lorebook)}" ${!persona.lorebook ? 'disabled' : ''} title="像角色世界书一样，直接打开酒馆世界书面板并选中这本书">
-            <i class="fa-solid fa-arrow-up-right-from-square"></i> 跳转世界书面板
-          </button>
-          <button type="button" class="menu_button st-pw-primary-action-btn st-pw-act-popup-book" data-book="${escapeAttr(persona.lorebook)}" ${!persona.lorebook ? 'disabled' : ''} title="不离开当前页面，直接弹窗查看、搜索、开关和修改里面的条目">
-            <i class="fa-solid fa-book-open"></i> 弹窗管理条目
-          </button>
-        </div>
-      </div>
-
-      <!-- 1.2 附加绑定世界书 (B: 多世界书绑定) -->
-      <div class="st-pw-extra-books-box">
-        <div class="st-pw-book-box-label">
-          <strong>附加关联世界书（突破原生只能绑 1 本的限制）</strong>
-          <div class="st-pw-add-extra-book-row">
-            <select id="st_pw_add_extra_book_select" class="text_pole st-pw-inline-select">
-              <option value="">+ 选择一本现有世界书加入关联…</option>
-              ${availableBooks
-                .filter((b) => b !== persona.lorebook && !meta.extraWorldbooks.some((eb) => eb.name === b))
-                .map((b) => `<option value="${escapeAttr(b)}">${sanitizeHtml(b)}</option>`)
-                .join('')}
-            </select>
-            <button type="button" id="st_pw_add_extra_book_btn" class="menu_button st-pw-mini-btn">
-              <i class="fa-solid fa-plus"></i> 添加绑定
-            </button>
-          </div>
-        </div>
-
+    <!-- 角色分组绑定：支持一个角色下绑定多套 User 人设，也支持一个 User 绑多个角色 -->
+    <div class="st-pw-block">
+      <div class="st-pw-block-header">
+        <span class="st-pw-block-title">绑定角色卡（同一角色下可绑定多个人设，与酒馆原生角色锁定互通）</span>
         ${
-          meta.extraWorldbooks.length === 0
-            ? `<div class="st-pw-subtle-empty">暂未绑定额外世界书。若该 User 需要同时挂载「通用背景书 + 个人关系书 + 道具书」，可在右上角下拉框添加。</div>`
-            : `
-              <div class="st-pw-extra-book-list">
-                ${meta.extraWorldbooks
-                  .map(
-                    (eb, idx) => `
-                      <div class="st-pw-extra-book-item ${eb.enabled ? '' : 'is-disabled'}" data-idx="${idx}">
-                        <label class="st-pw-switch" title="启用/暂停此附加世界书">
-                          <input type="checkbox" class="st-pw-toggle-extra-book" data-idx="${idx}" ${eb.enabled ? 'checked' : ''} />
-                          <span class="st-pw-slider"></span>
-                        </label>
-                        <strong class="st-pw-extra-book-name"><i class="fa-solid fa-book-bookmark"></i> ${sanitizeHtml(eb.name)}</strong>
-                        <span class="st-pw-badge st-pw-badge-green">随此 User 自动扫描生效</span>
-                        <div class="st-pw-extra-book-btns">
-                          <button type="button" class="menu_button st-pw-mini-btn st-pw-act-jump-book" data-book="${escapeAttr(eb.name)}">
-                            <i class="fa-solid fa-arrow-up-right-from-square"></i> 跳转面板
-                          </button>
-                          <button type="button" class="menu_button st-pw-mini-btn st-pw-act-popup-book" data-book="${escapeAttr(eb.name)}">
-                            <i class="fa-solid fa-book-open"></i> 弹窗条目
-                          </button>
-                          <button type="button" class="menu_button st-pw-mini-btn st-pw-remove-extra-book" data-idx="${idx}" title="移除关联（不会删除原世界书文件）">
-                            <i class="fa-solid fa-trash-can"></i>
-                          </button>
-                        </div>
-                      </div>
-                    `
-                  )
-                  .join('')}
-              </div>
-            `
+          currentCharName && !isCurrentCharBound
+            ? `<button type="button" id="st_pw_bind_current_char_btn" class="menu_button st-pw-mini-btn" data-char="${escapeAttr(currentCharName)}">+ 绑定当前角色「${sanitizeHtml(currentCharName)}」</button>`
+            : ''
         }
       </div>
-    </section>
+      <div class="st-pw-char-chips-row">
+        ${
+          meta.boundCharacters.length === 0
+            ? `<span class="st-pw-muted" style="font-size:0.82rem;">暂未绑定角色卡</span>`
+            : meta.boundCharacters
+                .map(
+                  (cName) => `
+                    <span class="st-pw-char-chip">
+                      <span class="st-pw-char-chip-jump" data-char="${escapeAttr(cName)}" title="点击查看该角色下的所有人设">${sanitizeHtml(cName)}</span>
+                      <button type="button" class="st-pw-chip-remove" data-char="${escapeAttr(cName)}" title="解除绑定">×</button>
+                    </span>
+                  `
+                )
+                .join('')
+        }
+        <select id="st_pw_bind_char_select" class="text_pole st-pw-char-add-select">
+          <option value="">+ 选择角色卡绑定…</option>
+          ${unboundHostChars
+            .map((c) => `<option value="${escapeAttr(c.name)}">${sanitizeHtml(c.name)}</option>`)
+            .join('')}
+          <option value="__custom__">手动输入角色名…</option>
+        </select>
+      </div>
+    </div>
 
-    <!-- 模块 2：A. User 随身设定卡片 -->
-    <section class="st-pw-section-card">
-      <div class="st-pw-section-head">
-        <div>
-          <h3><i class="fa-solid fa-layer-group st-pw-accent-icon"></i> 随身设定卡片（模块化人设开关）</h3>
-          <p class="st-pw-section-desc">
-            把「表面身份」「隐藏过往」「当前服装/状态」「对某角色的特殊关系」拆成独立小卡片，随时打勾启用，支持常驻或关键词触发。
-          </p>
-        </div>
-        <button type="button" id="st_pw_add_trait_btn" class="menu_button st-pw-primary-action-btn">
-          <i class="fa-solid fa-plus"></i> 新增随身设定卡
+    <!-- 世界书绑定 -->
+    <div class="st-pw-block">
+      <div class="st-pw-block-title">世界书绑定</div>
+      <div class="st-pw-wb-bind-row">
+        <span class="st-pw-field-label">主世界书</span>
+        <select id="st_pw_primary_book_select" class="text_pole st-pw-flex-select">
+          ${bookOptionsHtml}
+        </select>
+        <button type="button" class="menu_button st-pw-act-popup-book" data-book="${escapeAttr(persona.lorebook)}" ${!persona.lorebook ? 'disabled' : ''}>
+          查看条目
+        </button>
+        <button type="button" class="menu_button st-pw-act-jump-book" data-book="${escapeAttr(persona.lorebook)}" ${!persona.lorebook ? 'disabled' : ''}>
+          跳转编辑器
         </button>
       </div>
 
+      <div class="st-pw-wb-bind-row">
+        <span class="st-pw-field-label">附加书</span>
+        <select id="st_pw_add_extra_book_select" class="text_pole st-pw-flex-select">
+          <option value="">添加额外关联世界书…</option>
+          ${availableBooks
+            .filter((b) => b !== persona.lorebook && !meta.extraWorldbooks.some((eb) => eb.name === b))
+            .map((b) => `<option value="${escapeAttr(b)}">${sanitizeHtml(b)}</option>`)
+            .join('')}
+        </select>
+        <button type="button" id="st_pw_add_extra_book_btn" class="menu_button">添加</button>
+      </div>
+
       ${
-        meta.traits.length === 0
-          ? `<div class="st-pw-subtle-empty">还没有随身设定卡。点击右上角「+ 新增随身设定卡」，可以把零散设定拆开管理，不用每次去世界书里大海捞针。</div>`
-          : `
-            <div class="st-pw-trait-list">
-              ${meta.traits
+        meta.extraWorldbooks.length > 0
+          ? `
+            <div class="st-pw-compact-rows">
+              ${meta.extraWorldbooks
                 .map(
-                  (trait, idx) => `
-                    <div class="st-pw-trait-card ${trait.enabled ? '' : 'is-disabled'}" data-idx="${idx}">
-                      <div class="st-pw-trait-header">
-                        <label class="st-pw-switch" title="启用/停用此设定卡">
-                          <input type="checkbox" class="st-pw-trait-enable" data-idx="${idx}" ${trait.enabled ? 'checked' : ''} />
-                          <span class="st-pw-slider"></span>
-                        </label>
-                        <input type="text" class="text_pole st-pw-trait-title" data-idx="${idx}" placeholder="设定卡标题（如：隐藏身份 / 战损状态 / 随身背包）" value="${escapeAttr(trait.title)}" />
-                        <select class="text_pole st-pw-trait-mode" data-idx="${idx}">
-                          <option value="always" ${trait.triggerMode !== 'keyword' ? 'selected' : ''}>🔵 常驻生效</option>
-                          <option value="keyword" ${trait.triggerMode === 'keyword' ? 'selected' : ''}>🟢 关键词触发</option>
-                        </select>
-                        <button type="button" class="menu_button st-pw-mini-btn st-pw-trait-delete" data-idx="${idx}" title="删除此设定卡">
-                          <i class="fa-solid fa-trash-can"></i>
-                        </button>
-                      </div>
-                      ${
-                        trait.triggerMode === 'keyword'
-                          ? `
-                            <div class="st-pw-trait-kw-row">
-                              <input type="text" class="text_pole st-pw-trait-keywords" data-idx="${idx}" placeholder="输入触发关键词，多个词用逗号分隔（最近消息提及即自动注入）" value="${escapeAttr(trait.keywords || '')}" />
-                            </div>
-                          `
-                          : ''
-                      }
-                      <textarea class="text_pole st-pw-trait-content" data-idx="${idx}" rows="3" placeholder="输入这段随身设定的具体内容…">${sanitizeHtml(trait.content || '')}</textarea>
+                  (eb, idx) => `
+                    <div class="st-pw-compact-row ${eb.enabled ? '' : 'is-disabled'}" data-idx="${idx}">
+                      <input type="checkbox" class="st-pw-toggle-extra-book" data-idx="${idx}" ${eb.enabled ? 'checked' : ''} />
+                      <span class="st-pw-row-main-text">${sanitizeHtml(eb.name)}</span>
+                      <button type="button" class="menu_button st-pw-mini-btn st-pw-act-popup-book" data-book="${escapeAttr(eb.name)}">条目</button>
+                      <button type="button" class="menu_button st-pw-mini-btn st-pw-act-jump-book" data-book="${escapeAttr(eb.name)}">跳转</button>
+                      <button type="button" class="st-pw-icon-btn st-pw-remove-extra-book" data-idx="${idx}" title="移除"><i class="fa-solid fa-xmark"></i></button>
                     </div>
                   `
                 )
                 .join('')}
             </div>
           `
+          : ''
       }
-    </section>
+    </div>
 
-    <!-- 模块 3：原生基础人设描述 & 私密备忘 -->
-    <section class="st-pw-section-card">
-      <div class="st-pw-section-head">
-        <div>
-          <h3><i class="fa-solid fa-user-pen st-pw-accent-icon"></i> 基础人设描述与私密备注</h3>
-          <p class="st-pw-section-desc">左侧直接同步修改酒馆原生的 Persona Description；右侧备忘仅供你自己识别，不会发送给 AI。</p>
-        </div>
-        <button type="button" id="st_pw_save_base_desc_btn" class="menu_button">
-          <i class="fa-solid fa-floppy-disk"></i> 保存基础描述
-        </button>
+    <!-- 随身设定 -->
+    <div class="st-pw-block">
+      <div class="st-pw-block-header">
+        <span class="st-pw-block-title">随身设定 (${meta.traits.filter((t) => t.enabled).length}/${meta.traits.length})</span>
+        <button type="button" id="st_pw_add_trait_btn" class="menu_button st-pw-mini-btn">+ 添加设定</button>
+      </div>
+      ${
+        meta.traits.length === 0
+          ? `<div class="st-pw-muted-hint">可添加随该 User 独立开关的补充设定片段（支持常驻或关键词触发）。</div>`
+          : `
+            <div class="st-pw-compact-rows">
+              ${meta.traits
+                .map((trait, idx) => {
+                  const isExp = state.expandedTraitIdx === idx;
+                  const isKw = trait.triggerMode === 'keyword';
+                  return `
+                    <div class="st-pw-trait-row ${trait.enabled ? '' : 'is-disabled'}" data-idx="${idx}">
+                      <div class="st-pw-compact-row">
+                        <input type="checkbox" class="st-pw-trait-enable" data-idx="${idx}" ${trait.enabled ? 'checked' : ''} />
+                        <button type="button" class="st-pw-mode-tag ${isKw ? 'is-keyword' : 'is-constant'} st-pw-trait-toggle-mode" data-idx="${idx}" title="点击切换常驻 / 关键词">
+                          <span class="st-pw-dot"></span>${isKw ? '关键词' : '常驻'}
+                        </button>
+                        <span class="st-pw-row-main-text st-pw-trait-expand" data-idx="${idx}">
+                          ${sanitizeHtml(trait.title || `设定 #${idx + 1}`)}
+                          ${isKw && trait.keywords ? `<small class="st-pw-muted"> (${sanitizeHtml(trait.keywords)})</small>` : ''}
+                        </span>
+                        <button type="button" class="st-pw-icon-btn st-pw-trait-expand" data-idx="${idx}">
+                          <i class="fa-solid fa-chevron-${isExp ? 'up' : 'down'}"></i>
+                        </button>
+                        <button type="button" class="st-pw-icon-btn st-pw-trait-delete" data-idx="${idx}" title="删除">
+                          <i class="fa-solid fa-xmark"></i>
+                        </button>
+                      </div>
+                      ${
+                        isExp
+                          ? `
+                            <div class="st-pw-trait-editor">
+                              <div class="st-pw-form-grid">
+                                <input type="text" class="text_pole st-pw-trait-title" data-idx="${idx}" placeholder="标题" value="${escapeAttr(trait.title)}" />
+                                <input type="text" class="text_pole st-pw-trait-keywords" data-idx="${idx}" placeholder="触发关键词（逗号分隔，仅关键词模式生效）" value="${escapeAttr(trait.keywords || '')}" />
+                              </div>
+                              <textarea class="text_pole st-pw-trait-content" data-idx="${idx}" rows="4" placeholder="设定内容…">${sanitizeHtml(trait.content || '')}</textarea>
+                            </div>
+                          `
+                          : ''
+                      }
+                    </div>
+                  `;
+                })
+                .join('')}
+            </div>
+          `
+      }
+    </div>
+
+    <!-- 人设描述 & 备注 -->
+    <div class="st-pw-block">
+      <div class="st-pw-block-header">
+        <span class="st-pw-block-title">人设描述 & 备注</span>
+        <button type="button" id="st_pw_save_base_desc_btn" class="menu_button st-pw-mini-btn">保存描述</button>
       </div>
       <div class="st-pw-form-grid">
         <div>
-          <label for="st_pw_base_description">原生 User 人设描述 (Persona Description)</label>
-          <textarea id="st_pw_base_description" class="text_pole" rows="5" placeholder="该 User 的常驻基础描述…">${sanitizeHtml(persona.description)}</textarea>
+          <label class="st-pw-sub-label">原生人设描述 (Persona Description)</label>
+          <textarea id="st_pw_base_description" class="text_pole" rows="6" placeholder="发送给 AI 的基础人设描述…">${sanitizeHtml(persona.description)}</textarea>
         </div>
         <div>
-          <label for="st_pw_private_note">衣柜私密备注（不发给 AI，仅自己可见）</label>
-          <textarea id="st_pw_private_note" class="text_pole" rows="5" placeholder="记录这个 User 适合什么题材、配哪张角色卡、当前玩到哪条线…">${sanitizeHtml(meta.note)}</textarea>
+          <label class="st-pw-sub-label">私密备注（仅自己可见，不发给 AI）</label>
+          <textarea id="st_pw_private_note" class="text_pole" rows="6" placeholder="备注适用角色卡或剧情线…">${sanitizeHtml(meta.note)}</textarea>
         </div>
       </div>
-    </section>
+    </div>
   `;
 }
 
-function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
+function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks, effectiveCharFilter) {
   const settings = getSettings();
 
   modal.querySelector('.st-pw-close-wardrobe-btn')?.addEventListener('click', () => {
@@ -1629,11 +1783,19 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
 
   modal.querySelector('.st-pw-refresh-host-btn')?.addEventListener('click', () => {
     refreshAllViews();
-    globalThis.toastr?.info?.('已同步酒馆最新 User 与世界书列表', 'User 人设衣柜');
+    globalThis.toastr?.info?.('已刷新');
   });
 
   modal.querySelector('.st-pw-preview-active-prompt-btn')?.addEventListener('click', async () => {
     await openActivePromptPreviewModal();
+  });
+
+  // 切换「自定义分组」与「按绑定角色」两种视图模式
+  modal.querySelectorAll('.st-pw-mode-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.sidebarMode = btn.getAttribute('data-mode') || 'group';
+      renderWardrobeModalContent();
+    });
   });
 
   const searchInput = modal.querySelector('#st_pw_search_input');
@@ -1648,15 +1810,35 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
     }
   });
 
-  modal.querySelectorAll('.st-pw-tab-btn[data-tab]').forEach((btn) => {
+  // 自定义分组标签点击
+  modal.querySelectorAll('.st-pw-filter-pill[data-tab]').forEach((btn) => {
     btn.addEventListener('click', () => {
       state.activeModalTab = btn.getAttribute('data-tab') || 'all';
       renderWardrobeModalContent();
     });
   });
 
+  // 角色分组标签点击
+  modal.querySelectorAll('.st-pw-filter-pill[data-char]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.activeCharFilter = btn.getAttribute('data-char') || '__current__';
+      renderWardrobeModalContent();
+    });
+  });
+
+  // 在角色分组视图下，一键将其他 User 人设绑定到当前查看的角色下
+  modal.querySelector('#st_pw_quick_assign_persona_to_char')?.addEventListener('change', (e) => {
+    const targetAvatarId = e.target.value;
+    if (targetAvatarId && effectiveCharFilter) {
+      bindPersonaToCharacter(targetAvatarId, effectiveCharFilter);
+      state.selectedAvatarId = targetAvatarId;
+      globalThis.toastr?.success?.(`已将人设绑定到「${effectiveCharFilter}」`);
+    }
+  });
+
+  // 新建自定义分组
   modal.querySelector('.st-pw-add-group-btn')?.addEventListener('click', () => {
-    const newGroup = window.prompt('请输入新的人设分类名称（例如：克苏鲁跑团、校园恋爱）：');
+    const newGroup = window.prompt('输入新分组名称：');
     if (newGroup && newGroup.trim()) {
       const clean = newGroup.trim();
       if (!settings.groups.includes(clean)) {
@@ -1668,15 +1850,46 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
     }
   });
 
-  modal.querySelectorAll('.st-pw-persona-card').forEach((card) => {
+  // 重命名当前自定义分组
+  modal.querySelector('.st-pw-rename-group-btn')?.addEventListener('click', () => {
+    const oldName = state.activeModalTab;
+    if (!settings.groups.includes(oldName)) return;
+    const nextName = window.prompt(`重命名分组「${oldName}」：`, oldName);
+    if (!nextName || !nextName.trim() || nextName.trim() === oldName) return;
+    const clean = nextName.trim();
+    const idx = settings.groups.indexOf(oldName);
+    if (idx !== -1) settings.groups[idx] = clean;
+    for (const prof of Object.values(settings.profiles)) {
+      if (prof && prof.group === oldName) prof.group = clean;
+    }
+    state.activeModalTab = clean;
+    saveSettings();
+    renderWardrobeModalContent();
+  });
+
+  // 删除当前自定义分组（不删人设，仅清空所属分组字段）
+  modal.querySelector('.st-pw-delete-group-btn')?.addEventListener('click', () => {
+    const oldName = state.activeModalTab;
+    if (!settings.groups.includes(oldName)) return;
+    if (!window.confirm(`确定删除分组「${oldName}」吗？（组内人设不会被删除，只会变为未分类）`)) {
+      return;
+    }
+    settings.groups = settings.groups.filter((g) => g !== oldName);
+    for (const prof of Object.values(settings.profiles)) {
+      if (prof && prof.group === oldName) prof.group = '';
+    }
+    state.activeModalTab = 'all';
+    saveSettings();
+    renderWardrobeModalContent();
+  });
+
+  modal.querySelectorAll('.st-pw-persona-item').forEach((card) => {
     card.addEventListener('click', (e) => {
-      if (
-        e.target.closest('.st-pw-fav-btn') ||
-        e.target.closest('.st-pw-use-persona-btn')
-      ) {
+      if (e.target.closest('.st-pw-fav-btn') || e.target.closest('.st-pw-use-persona-btn')) {
         return;
       }
       state.selectedAvatarId = card.getAttribute('data-avatar-id');
+      state.expandedTraitIdx = null;
       renderWardrobeModalContent();
     });
   });
@@ -1722,7 +1935,16 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
   const meta = selectedPersona.meta;
 
   modal.querySelector('#st_pw_detail_group')?.addEventListener('change', (e) => {
-    meta.group = e.target.value;
+    if (e.target.value === '__new__') {
+      const newGroup = window.prompt('输入新分组名称：');
+      if (newGroup && newGroup.trim()) {
+        const clean = newGroup.trim();
+        if (!settings.groups.includes(clean)) settings.groups.push(clean);
+        meta.group = clean;
+      }
+    } else {
+      meta.group = e.target.value;
+    }
     saveSettings();
     renderWardrobeModalContent();
   });
@@ -1736,30 +1958,56 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
     renderWardrobeModalContent();
   });
 
-  modal.querySelector('#st_pw_detail_chars')?.addEventListener('change', (e) => {
-    meta.boundCharacters = e.target.value
-      .split(/[,，]/)
-      .map((s) => s.trim())
-      .filter(Boolean);
-    saveSettings();
+  // 角色绑定操作
+  modal.querySelector('#st_pw_bind_current_char_btn')?.addEventListener('click', (e) => {
+    const cName = e.currentTarget.getAttribute('data-char');
+    if (cName) {
+      bindPersonaToCharacter(selectedPersona.avatarId, cName);
+    }
+  });
+
+  modal.querySelector('#st_pw_bind_char_select')?.addEventListener('change', (e) => {
+    let val = e.target.value;
+    if (!val) return;
+    if (val === '__custom__') {
+      val = window.prompt('输入要绑定的角色卡名称：') || '';
+    }
+    if (val.trim()) {
+      bindPersonaToCharacter(selectedPersona.avatarId, val.trim());
+    } else {
+      e.target.value = '';
+    }
+  });
+
+  modal.querySelectorAll('.st-pw-chip-remove').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const cName = btn.getAttribute('data-char');
+      if (cName) {
+        unbindPersonaFromCharacter(selectedPersona.avatarId, cName);
+      }
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-char-chip-jump').forEach((el) => {
+    el.addEventListener('click', () => {
+      const cName = el.getAttribute('data-char');
+      if (cName) {
+        state.sidebarMode = 'character';
+        state.activeCharFilter = cName;
+        renderWardrobeModalContent();
+      }
+    });
   });
 
   modal.querySelector('#st_pw_primary_book_select')?.addEventListener('change', (e) => {
     const newBook = e.target.value;
     updateHostPersonaData(selectedPersona.avatarId, { lorebook: newBook });
-    globalThis.toastr?.success?.(
-      newBook ? `已将该 User 主世界书绑定为「${newBook}」` : '已解除该 User 的主世界书绑定',
-      'User 人设衣柜'
-    );
   });
 
   modal.querySelector('#st_pw_add_extra_book_btn')?.addEventListener('click', () => {
     const sel = modal.querySelector('#st_pw_add_extra_book_select');
     const bookName = sel?.value?.trim();
-    if (!bookName) {
-      globalThis.toastr?.info?.('请先从下拉框选择一本要关联的世界书', '附加世界书');
-      return;
-    }
+    if (!bookName) return;
     if (!meta.extraWorldbooks.some((b) => b.name === bookName)) {
       meta.extraWorldbooks.push({ name: bookName, enabled: true });
       saveSettings();
@@ -1790,12 +2038,13 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
   modal.querySelector('#st_pw_add_trait_btn')?.addEventListener('click', () => {
     meta.traits.push({
       id: `trait_${Date.now()}`,
-      title: `随身设定 #${meta.traits.length + 1}`,
+      title: `设定 #${meta.traits.length + 1}`,
       content: '',
       enabled: true,
       triggerMode: 'always',
       keywords: '',
     });
+    state.expandedTraitIdx = meta.traits.length - 1;
     saveSettings();
     renderWardrobeModalContent();
   });
@@ -1811,21 +2060,32 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
     });
   });
 
+  modal.querySelectorAll('.st-pw-trait-toggle-mode').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const idx = Number(btn.getAttribute('data-idx'));
+      if (meta.traits[idx]) {
+        meta.traits[idx].triggerMode =
+          meta.traits[idx].triggerMode === 'keyword' ? 'always' : 'keyword';
+        state.expandedTraitIdx = idx;
+        saveSettings();
+        renderWardrobeModalContent();
+      }
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-trait-expand').forEach((el) => {
+    el.addEventListener('click', () => {
+      const idx = Number(el.getAttribute('data-idx'));
+      state.expandedTraitIdx = state.expandedTraitIdx === idx ? null : idx;
+      renderWardrobeModalContent();
+    });
+  });
+
   modal.querySelectorAll('.st-pw-trait-title').forEach((input) => {
     input.addEventListener('change', (e) => {
       const idx = Number(e.target.getAttribute('data-idx'));
       if (meta.traits[idx]) {
         meta.traits[idx].title = e.target.value.trim();
-        saveSettings();
-      }
-    });
-  });
-
-  modal.querySelectorAll('.st-pw-trait-mode').forEach((sel) => {
-    sel.addEventListener('change', (e) => {
-      const idx = Number(e.target.getAttribute('data-idx'));
-      if (meta.traits[idx]) {
-        meta.traits[idx].triggerMode = e.target.value;
         saveSettings();
         renderWardrobeModalContent();
       }
@@ -1856,6 +2116,7 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
     btn.addEventListener('click', () => {
       const idx = Number(btn.getAttribute('data-idx'));
       meta.traits.splice(idx, 1);
+      if (state.expandedTraitIdx === idx) state.expandedTraitIdx = null;
       saveSettings();
       renderWardrobeModalContent();
     });
@@ -1866,7 +2127,7 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
     const newNote = modal.querySelector('#st_pw_private_note')?.value ?? '';
     meta.note = newNote;
     updateHostPersonaData(selectedPersona.avatarId, { description: newDesc });
-    globalThis.toastr?.success?.('已保存基础人设描述与备注', 'User 人设衣柜');
+    globalThis.toastr?.success?.('已保存');
   });
 
   modal.querySelector('#st_pw_private_note')?.addEventListener('change', (e) => {
@@ -1875,9 +2136,6 @@ function bindWardrobeModalEvents(modal, selectedPersona, _availableBooks) {
   });
 }
 
-/**
- * C. 预览当前激活 User 实际生效的设定清单与合成文本弹窗
- */
 async function openActivePromptPreviewModal() {
   const personas = getHostPersonas();
   const active = personas.find((p) => p.isActive);
@@ -1898,41 +2156,33 @@ async function openActivePromptPreviewModal() {
   modal.classList.remove('st-pw-hidden');
 
   modal.innerHTML = `
-    <div class="st-pw-wb-dialog" role="dialog" aria-modal="true" aria-label="当前 User 生效设定预览">
+    <div class="st-pw-wb-dialog" role="dialog" aria-modal="true">
       <div class="st-pw-modal-header">
-        <div class="st-pw-modal-title-wrap">
-          <i class="fa-solid fa-eye st-pw-accent-icon"></i>
-          <div>
-            <h3 class="st-pw-modal-title">当前生效设定总览：${sanitizeHtml(active?.name || '未选中 User')}</h3>
-            <p class="st-pw-modal-subtitle">以下为你当前聊天轮次中，随该 User 一同生效的人设、原生主世界书与扩展注入内容</p>
-          </div>
+        <div class="st-pw-header-left">
+          <span class="st-pw-modal-title">当前生效预览：${sanitizeHtml(active?.name || '无')}</span>
         </div>
         <button type="button" class="menu_button st-pw-close-preview-btn">关闭</button>
       </div>
       <div class="st-pw-wb-body">
-        <div class="st-pw-preview-section">
-          <h4>1. 原生基础人设 (Persona Description)</h4>
+        <div class="st-pw-block">
+          <div class="st-pw-block-title">原生人设描述</div>
           <pre class="st-pw-code-preview">${sanitizeHtml(active?.description || '（空）')}</pre>
         </div>
-        <div class="st-pw-preview-section">
-          <h4>2. 原生主绑定世界书 (Primary Lorebook)</h4>
-          <p>${
-            active?.lorebook
-              ? `已绑定 <strong>${sanitizeHtml(active.lorebook)}</strong>（由酒馆原生世界书引擎扫描激活，可点「弹窗管理条目」或「跳转世界书面板」检查具体条目）`
-              : '未绑定原生主世界书'
-          }</p>
+        <div class="st-pw-block">
+          <div class="st-pw-block-title">主绑定世界书</div>
+          <div>${active?.lorebook ? sanitizeHtml(active.lorebook) : '未绑定'}</div>
         </div>
-        <div class="st-pw-preview-section">
-          <h4>3. 本插件在当前聊天命中的随身设定卡 & 附加世界书条目 (${summary.length} 项)</h4>
+        <div class="st-pw-block">
+          <div class="st-pw-block-title">本轮命中的附加书与随身设定 (${summary.length})</div>
           ${
             summary.length === 0
-              ? `<p class="st-pw-muted">当前无额外命中的随身设定卡或附加世界书条目。</p>`
+              ? `<div class="st-pw-muted">无额外命中项</div>`
               : `
                 <ul class="st-pw-hit-list">
                   ${summary
                     .map(
                       (s) =>
-                        `<li><strong>${sanitizeHtml(s.book ? `[${s.book}] ${s.title}` : s.title)}</strong> — <span class="st-pw-badge st-pw-badge-green">${sanitizeHtml(s.reason)}</span></li>`
+                        `<li><strong>${sanitizeHtml(s.book ? `[${s.book}] ${s.title}` : s.title)}</strong> <span class="st-pw-muted">(${sanitizeHtml(s.reason)})</span></li>`
                     )
                     .join('')}
                 </ul>
@@ -1950,8 +2200,7 @@ async function openActivePromptPreviewModal() {
 }
 
 /**
- * 在酒馆原生 Persona Management 面板（ST 1.19 `#persona_lore_button` 所在控制栏或 `#persona_description` 上方）
- * 注入直观的【当前绑定世界书下拉切换 + ↗ 跳转世界书 + 📖 弹窗条目 + 🗂️ 人设衣柜】工具条
+ * 原生 Persona 面板内嵌控制条（同时支持一键切换当前角色绑定的多套人设 + 切换/弹窗/跳转世界书）
  */
 function syncNativePersonaPanelEnhancement() {
   const settings = getSettings();
@@ -1962,7 +2211,6 @@ function syncNativePersonaPanelEnhancement() {
     return;
   }
 
-  // ST 1.19 真实 DOM 锚点：#persona_lore_button 所在的 .persona_controls_buttons_block 或 #persona_description_lorebook
   const anchorEl =
     document.querySelector('#persona_lore_button')?.closest('.persona_controls_buttons_block') ||
     document.querySelector('#persona_description_lorebook') ||
@@ -1986,10 +2234,31 @@ function syncNativePersonaPanelEnhancement() {
   const active = personas.find((p) => p.isActive);
   const currentBook = active?.lorebook || '';
   const availableBooks = getAvailableWorldbooks();
+  const currentChar = getCurrentCharacter();
+  const charBoundPersonas = currentChar
+    ? personas.filter((p) =>
+        p.meta.boundCharacters.some((c) => c.toLowerCase() === currentChar.name.toLowerCase())
+      )
+    : [];
 
   helperBar.innerHTML = `
-    <span class="st-pw-native-bar-label"><i class="fa-solid fa-book-atlas"></i> 绑定世界书：</span>
-    <select id="st_pw_native_quick_book_select" class="text_pole st-pw-native-quick-select" title="无需按 Shift 点地球，直接在这里切换当前 User 绑定的世界书">
+    ${
+      currentChar && charBoundPersonas.length > 0
+        ? `
+          <span class="st-pw-native-bar-label">${sanitizeHtml(currentChar.name)}的人设</span>
+          <select id="st_pw_native_char_personas_select" class="text_pole st-pw-native-quick-select">
+            ${charBoundPersonas
+              .map(
+                (p) =>
+                  `<option value="${escapeAttr(p.avatarId)}" ${p.isActive ? 'selected' : ''}>${sanitizeHtml(p.name)}</option>`
+              )
+              .join('')}
+          </select>
+        `
+        : ''
+    }
+    <span class="st-pw-native-bar-label">世界书</span>
+    <select id="st_pw_native_quick_book_select" class="text_pole st-pw-native-quick-select">
       <option value="">— 未绑定 —</option>
       ${availableBooks
         .map(
@@ -1998,26 +2267,27 @@ function syncNativePersonaPanelEnhancement() {
         )
         .join('')}
     </select>
-    <button type="button" class="menu_button st-pw-mini-btn st-pw-native-jump-btn" ${!currentBook ? 'disabled' : ''} title="像角色世界书一样直接跳转打开这本世界书">
-      <i class="fa-solid fa-arrow-up-right-from-square"></i> 跳转面板
+    <button type="button" class="menu_button st-pw-mini-btn st-pw-native-popup-btn" ${!currentBook ? 'disabled' : ''}>
+      条目
     </button>
-    <button type="button" class="menu_button st-pw-mini-btn st-pw-native-popup-btn" ${!currentBook ? 'disabled' : ''} title="直接在弹窗里查看、搜索、开关这本世界书的条目">
-      <i class="fa-solid fa-book-open"></i> 弹窗条目
+    <button type="button" class="menu_button st-pw-mini-btn st-pw-native-jump-btn" ${!currentBook ? 'disabled' : ''}>
+      跳转
     </button>
-    <button type="button" class="menu_button st-pw-mini-btn st-pw-primary-action-btn st-pw-native-wardrobe-btn" title="打开多 User 分类衣柜与随身设定总管">
-      <i class="fa-solid fa-id-card-clip"></i> User 衣柜总管
+    <button type="button" class="menu_button st-pw-mini-btn st-pw-native-wardrobe-btn">
+      人设管理
     </button>
   `;
+
+  helperBar.querySelector('#st_pw_native_char_personas_select')?.addEventListener('change', async (e) => {
+    const id = e.target.value;
+    if (id) await switchActivePersona(id);
+  });
 
   helperBar.querySelector('#st_pw_native_quick_book_select')?.addEventListener('change', (e) => {
     const newBook = e.target.value;
     const activeId = getActiveAvatarId();
     if (activeId) {
       updateHostPersonaData(activeId, { lorebook: newBook });
-      globalThis.toastr?.success?.(
-        newBook ? `当前 User 已绑定世界书：${newBook}` : '已解除当前 User 世界书绑定',
-        'User 人设衣柜'
-      );
     }
   });
 
@@ -2034,9 +2304,6 @@ function syncNativePersonaPanelEnhancement() {
   });
 }
 
-/**
- * 同步顶部导航栏与左下角魔棒菜单快捷入口
- */
 function syncQuickEntryButtons() {
   const settings = getSettings();
 
@@ -2053,7 +2320,7 @@ function syncQuickEntryButtons() {
       btn.className = 'drawer st-pw-topbar-drawer';
       btn.innerHTML = `
         <div class="drawer-toggle">
-          <div class="drawer-icon fa-solid fa-id-card-clip fa-fw closedIcon" title="打开 User 人设与世界书衣柜"></div>
+          <div class="drawer-icon fa-solid fa-id-card-clip fa-fw closedIcon" title="User 人设管理"></div>
         </div>
       `;
       btn.addEventListener('click', (e) => {
@@ -2077,7 +2344,7 @@ function syncQuickEntryButtons() {
       item.tabIndex = 0;
       item.innerHTML = `
         <div class="fa-solid fa-id-card-clip extensionsMenuExtensionButton"></div>
-        <span>User 人设与世界书衣柜</span>
+        <span>User 人设管理</span>
       `;
       item.addEventListener('click', () => {
         openWardrobeModal();
@@ -2087,9 +2354,6 @@ function syncQuickEntryButtons() {
   }
 }
 
-/**
- * 刷新扩展右侧抽屉状态与打开中的弹窗
- */
 function refreshAllViews() {
   const personas = getHostPersonas();
   const active = personas.find((p) => p.isActive);
@@ -2109,7 +2373,7 @@ function refreshAllViews() {
   if (extraSummaryEl) {
     const ebCount = active ? active.meta.extraWorldbooks.filter((b) => b.enabled).length : 0;
     const trCount = active ? active.meta.traits.filter((t) => t.enabled).length : 0;
-    extraSummaryEl.textContent = `${ebCount} 本附加世界书 · ${trCount} 条随身设定开启`;
+    extraSummaryEl.textContent = `${ebCount} 附加书 · ${trCount} 随身设定`;
   }
 
   syncNativePersonaPanelEnhancement();
@@ -2123,20 +2387,17 @@ function onChatChanged() {
   if (!settings.autoSwitchOnCharacterChat) return;
 
   try {
-    const context = getContext();
-    const charId = context.characterId;
-    const charObj = charId !== undefined ? context.characters?.[charId] : null;
-    const charName = String(charObj?.name || '').trim();
-    if (!charName) return;
+    const currentChar = getCurrentCharacter();
+    if (!currentChar?.name) return;
 
     const personas = getHostPersonas();
-    const matched = personas.find((p) =>
-      p.meta.boundCharacters.some((c) => c.toLowerCase() === charName.toLowerCase())
+    const matchedList = personas.filter((p) =>
+      p.meta.boundCharacters.some((c) => c.toLowerCase() === currentChar.name.toLowerCase())
     );
-    if (matched && !matched.isActive) {
+    if (matchedList.length > 0 && !matchedList.some((p) => p.isActive)) {
+      const names = matchedList.map((p) => p.name).join(' / ');
       globalThis.toastr?.info?.(
-        `检测到角色「${charName}」关联了专属 User「${matched.name}」，可在人设衣柜一键切换。`,
-        'User 人设衣柜'
+        `角色「${currentChar.name}」绑定了 ${matchedList.length} 套人设：${names}`
       );
     }
   } catch (_e) {}
@@ -2175,13 +2436,13 @@ function registerSlashCommands() {
         unnamedArgumentList: SlashCommandArgument?.fromProps
           ? [
               SlashCommandArgument.fromProps({
-                description: '可选：直接填写要切换的 User 名字，留空则打开人设衣柜面板',
+                description: 'User 名字（留空打开管理面板）',
                 typeList: ARGUMENT_TYPE?.STRING ? [ARGUMENT_TYPE.STRING] : ['string'],
                 isRequired: false,
               }),
             ]
           : [],
-        helpString: '<div>打开 User 人设与世界书衣柜，或直接按名字切换当前 User。</div>',
+        helpString: '<div>打开 User 人设管理，或直接按名字切换当前 User。</div>',
       })
     );
   } catch (err) {
@@ -2259,7 +2520,7 @@ async function mountSettingsPanel() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `st-persona-wardrobe-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    a.download = `st-persona-wardrobe-${new Date().toISOString().slice(0, 10)}.json`;
     a.click();
     URL.revokeObjectURL(url);
   });
@@ -2275,7 +2536,7 @@ async function mountSettingsPanel() {
       const text = await file.text();
       const parsed = JSON.parse(text);
       if (!parsed || typeof parsed !== 'object' || typeof parsed.profiles !== 'object') {
-        throw new Error('配置文件缺少 profiles 字段');
+        throw new Error('缺少 profiles 字段');
       }
       const current = getSettings();
       if (Array.isArray(parsed.groups)) {
@@ -2284,9 +2545,9 @@ async function mountSettingsPanel() {
       Object.assign(current.profiles, parsed.profiles);
       saveSettings();
       refreshAllViews();
-      globalThis.toastr?.success?.('已成功导入 User 衣柜配置', 'User 人设衣柜');
+      globalThis.toastr?.success?.('配置已导入');
     } catch (err) {
-      globalThis.toastr?.error?.(`导入失败：${err.message}`, 'User 人设衣柜');
+      globalThis.toastr?.error?.(`导入失败：${err.message}`);
     } finally {
       importFile.value = '';
     }
