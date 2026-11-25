@@ -893,16 +893,68 @@ function isElementVisible(el) {
   return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetHeight > 0;
 }
 
+function bindModalBackdropEvents(modal) {
+  if (!modal || modal.dataset.backdropBound === '1') return;
+  modal.dataset.backdropBound = '1';
+
+  // 点击/轻触遮罩空白处直接关闭弹窗
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) {
+      modal.classList.add('st-pw-hidden');
+    }
+  });
+
+  // 阻止 touchstart / mousedown 冒泡到 html，避免触发 Luker 全局抽屉自动收起逻辑
+  modal.addEventListener('mousedown', (e) => {
+    e.stopPropagation();
+  });
+  modal.addEventListener(
+    'touchstart',
+    (e) => {
+      e.stopPropagation();
+    },
+    { passive: true }
+  );
+}
+
+function closeTopmostWardrobeModal() {
+  const modalIds = [
+    '#st_pw_preview_modal',
+    '#st_pw_wb_inspector_modal',
+    '#st_pw_wardrobe_modal',
+  ];
+  for (const sel of modalIds) {
+    const el = document.querySelector(sel);
+    if (el && !el.classList.contains('st-pw-hidden')) {
+      el.classList.add('st-pw-hidden');
+      return true;
+    }
+  }
+  return false;
+}
+
 function showReturnToWardrobePill(bookName) {
   removeReturnToWardrobePill();
-  const pill = document.createElement('button');
+  const pill = document.createElement('div');
   pill.id = 'st_pw_return_pill';
-  pill.type = 'button';
   pill.className = 'menu_button st-pw-return-pill';
-  pill.innerHTML = `<i class="fa-solid fa-arrow-left"></i> <span>返回人设管理 (${sanitizeHtml(bookName)})</span>`;
-  pill.addEventListener('click', () => {
+  pill.innerHTML = `
+    <span class="st-pw-return-pill-main" title="返回 User 人设管理">
+      <i class="fa-solid fa-arrow-left"></i>
+      <span>返回人设管理 (${sanitizeHtml(bookName)})</span>
+    </span>
+    <span class="st-pw-return-pill-close" title="关闭此悬浮按钮">
+      <i class="fa-solid fa-xmark"></i>
+    </span>
+  `;
+  pill.querySelector('.st-pw-return-pill-main')?.addEventListener('click', (e) => {
+    e.stopPropagation();
     removeReturnToWardrobePill();
     openWardrobeModal();
+  });
+  pill.querySelector('.st-pw-return-pill-close')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    removeReturnToWardrobePill();
   });
   document.body.appendChild(pill);
   state.minimizedReturnPill = pill;
@@ -1027,6 +1079,7 @@ async function openWorldbookInspectorModal(worldbookName) {
     modal.className = 'st-pw-modal-backdrop';
     document.body.appendChild(modal);
   }
+  bindModalBackdropEvents(modal);
 
   modal.classList.remove('st-pw-hidden');
   modal.innerHTML = `
@@ -1037,7 +1090,7 @@ async function openWorldbookInspectorModal(worldbookName) {
           <span class="st-pw-header-meta">读取中…</span>
         </div>
         <div class="st-pw-modal-header-actions">
-          <button type="button" class="menu_button st-pw-close-wb-modal">关闭</button>
+          <button type="button" class="menu_button st-pw-mini-btn st-pw-close-wb-modal" title="关闭"><i class="fa-solid fa-xmark"></i> 关闭</button>
         </div>
       </div>
       <div class="st-pw-wb-body st-pw-loading-state">
@@ -1125,14 +1178,14 @@ function renderWorldbookInspectorContent(modal, worldbookName, worldData) {
             <span class="st-pw-header-meta">${enabledCount} / ${allEntries.length} 启用</span>
           </div>
           <div class="st-pw-modal-header-actions">
-            <button type="button" class="menu_button st-pw-wb-jump-host-btn" title="在酒馆原生世界书面板中打开">
+            <button type="button" class="menu_button st-pw-mini-btn st-pw-wb-jump-host-btn" title="在酒馆原生世界书面板中打开">
               <i class="fa-solid fa-arrow-up-right-from-square"></i> 原生编辑器
             </button>
-            <button type="button" class="menu_button st-pw-wb-add-entry-btn">
+            <button type="button" class="menu_button st-pw-mini-btn st-pw-wb-add-entry-btn">
               <i class="fa-solid fa-plus"></i> 新建条目
             </button>
-            <button type="button" class="menu_button st-pw-close-wb-modal" title="关闭">
-              <i class="fa-solid fa-xmark"></i>
+            <button type="button" class="menu_button st-pw-mini-btn st-pw-close-wb-modal" title="关闭">
+              <i class="fa-solid fa-xmark"></i> 关闭
             </button>
           </div>
         </div>
@@ -1518,6 +1571,10 @@ globalThis.PersonaWardrobe_interceptGeneration = async function (
 
 function openWardrobeModal(initialAvatarId = null) {
   removeReturnToWardrobePill();
+  const extMenu = document.querySelector('#extensionsMenu');
+  if (extMenu && window.getComputedStyle(extMenu).display !== 'none') {
+    extMenu.style.display = 'none';
+  }
   const personas = getHostPersonas();
   const activeId = getActiveAvatarId();
   if (initialAvatarId) {
@@ -1533,6 +1590,7 @@ function openWardrobeModal(initialAvatarId = null) {
     modal.className = 'st-pw-modal-backdrop';
     document.body.appendChild(modal);
   }
+  bindModalBackdropEvents(modal);
 
   modal.classList.remove('st-pw-hidden');
   renderWardrobeModalContent();
@@ -1810,7 +1868,7 @@ function renderWardrobeModalContent() {
         <div class="st-pw-modal-header-actions">
           <button type="button" class="menu_button st-pw-mini-btn st-pw-preview-active-prompt-btn">生效预览</button>
           <button type="button" class="menu_button st-pw-mini-btn st-pw-refresh-host-btn" title="同步列表"><i class="fa-solid fa-rotate"></i></button>
-          <button type="button" class="menu_button st-pw-mini-btn st-pw-close-wardrobe-btn" title="关闭"><i class="fa-solid fa-xmark"></i></button>
+          <button type="button" class="menu_button st-pw-mini-btn st-pw-close-wardrobe-btn" title="关闭"><i class="fa-solid fa-xmark"></i> 关闭</button>
         </div>
       </div>
 
@@ -2587,6 +2645,7 @@ async function openActivePromptPreviewModal() {
     modal.className = 'st-pw-modal-backdrop';
     document.body.appendChild(modal);
   }
+  bindModalBackdropEvents(modal);
   modal.classList.remove('st-pw-hidden');
 
   modal.innerHTML = `
@@ -2595,7 +2654,9 @@ async function openActivePromptPreviewModal() {
         <div class="st-pw-header-left">
           <span class="st-pw-modal-title">当前生效预览：${sanitizeHtml(active?.name || '无')}</span>
         </div>
-        <button type="button" class="menu_button st-pw-close-preview-btn">关闭</button>
+        <div class="st-pw-modal-header-actions">
+          <button type="button" class="menu_button st-pw-mini-btn st-pw-close-preview-btn" title="关闭"><i class="fa-solid fa-xmark"></i> 关闭</button>
+        </div>
       </div>
       <div class="st-pw-wb-body">
         <div class="st-pw-block">
@@ -3000,6 +3061,16 @@ async function initExtension() {
   await mountSettingsPanel();
   registerSlashCommands();
   refreshAllViews();
+
+  const onGlobalKeydown = (e) => {
+    if (e.key === 'Escape') {
+      if (closeTopmostWardrobeModal()) {
+        e.stopPropagation();
+      }
+    }
+  };
+  document.addEventListener('keydown', onGlobalKeydown);
+  state.disposers.push(() => document.removeEventListener('keydown', onGlobalKeydown));
 
   try {
     const context = getContext();
