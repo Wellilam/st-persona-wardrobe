@@ -1729,6 +1729,67 @@ function harvestCurrentNativeDomAvatars() {
  * 当检测到纯白占位图或第三方云头像脚本时，自动在隐式视口内将原生 #user_avatar_block 展开渲染全量条目，
  * 让任何依赖原生列表（翻页/MutationObserver/IntersectionObserver/is(':visible')）的未知图床/美化脚本一次性吐出全部真实头像！
  */
+function restoreNativeLeftColumnElements(leftCol) {
+  if (!leftCol) return;
+  leftCol.classList?.remove?.('st-pw-left-taken', 'st-pw-harvesting-col');
+  Array.from(leftCol.children || []).forEach((child) => {
+    if (!child || !child.style) return;
+    if (child.dataset?.stPwHiddenNative === '1') {
+      delete child.dataset.stPwHiddenNative;
+      child.style.removeProperty?.('display');
+      child.style.removeProperty?.('position');
+      child.style.removeProperty?.('left');
+      child.style.removeProperty?.('top');
+      child.style.removeProperty?.('width');
+      child.style.removeProperty?.('height');
+      child.style.removeProperty?.('overflow');
+      child.style.removeProperty?.('opacity');
+      child.style.removeProperty?.('pointer-events');
+      child.style.removeProperty?.('clip-path');
+      child.style.removeProperty?.('z-index');
+    }
+  });
+}
+
+function syncNativeLeftColumnVisibility(leftCol) {
+  if (!leftCol) return;
+  const settings = getSettings();
+  if (!settings.enhanceNativePersonaPanel || state.useRawNativeLeftList) {
+    restoreNativeLeftColumnElements(leftCol);
+    return;
+  }
+
+  leftCol.classList?.add?.('st-pw-left-taken');
+  if (state.isHarvestingAvatars) {
+    leftCol.classList?.add?.('st-pw-harvesting-col');
+  } else {
+    leftCol.classList?.remove?.('st-pw-harvesting-col');
+  }
+
+  Array.from(leftCol.children || []).forEach((child) => {
+    if (!child || !child.style) return;
+    if (child.id === 'st_pw_inline_left_panel' || child.id === 'form_upload_avatar') {
+      return;
+    }
+    if (child.dataset) child.dataset.stPwHiddenNative = '1';
+    if (state.isHarvestingAvatars && child.id === 'user_avatar_block') {
+      child.style.removeProperty?.('display');
+      child.style.setProperty?.('position', 'fixed', 'important');
+      child.style.setProperty?.('left', '0', 'important');
+      child.style.setProperty?.('top', '0', 'important');
+      child.style.setProperty?.('width', '1px', 'important');
+      child.style.setProperty?.('height', '1px', 'important');
+      child.style.setProperty?.('overflow', 'hidden', 'important');
+      child.style.setProperty?.('opacity', '0.0001', 'important');
+      child.style.setProperty?.('pointer-events', 'none', 'important');
+      child.style.setProperty?.('clip-path', 'inset(50%)', 'important');
+      child.style.setProperty?.('z-index', '-9999', 'important');
+    } else {
+      child.style.setProperty?.('display', 'none', 'important');
+    }
+  });
+}
+
 async function runUniversalNativeAvatarHarvest({ manual = false } = {}) {
   scanExternalAvatarMappings();
   harvestCurrentNativeDomAvatars();
@@ -1747,12 +1808,14 @@ async function runUniversalNativeAvatarHarvest({ manual = false } = {}) {
   const beforeCount = state.resolvedExternalAvatars.size;
 
   const drawerEl = document.querySelector('#PersonaManagement');
+  const leftColEl = document.querySelector('#PersonaManagement .persona_management_left_column');
   const addedHarvestDrawerClass = Boolean(
     drawerEl && drawerEl.classList.contains('closedDrawer')
   );
   if (addedHarvestDrawerClass) {
     drawerEl.classList.add('st-pw-harvesting-drawer');
   }
+  syncNativeLeftColumnVisibility(leftColEl);
 
   try {
     await probeHostModules();
@@ -1790,6 +1853,7 @@ async function runUniversalNativeAvatarHarvest({ manual = false } = {}) {
       drawerEl.classList.remove('st-pw-harvesting-drawer');
     }
     state.isHarvestingAvatars = false;
+    syncNativeLeftColumnVisibility(leftColEl);
   }
 
   if (manual) {
@@ -3900,6 +3964,11 @@ function renderPersonaRowHtml(p, selectedAvatarId) {
           ${traitCount ? `<span>· ${traitCount}设定</span>` : ''}
           ${presetCount ? `<span>· ${presetCount}快照</span>` : ''}
           ${
+            (p.meta.boundCharacters?.length || 0) >= 2
+              ? `<span title="${escapeAttr(p.meta.boundCharacters.join(' / '))}">· 绑${p.meta.boundCharacters.length}卡</span>`
+              : ''
+          }
+          ${
             hasUsage
               ? `<span class="st-pw-usage-badge" title="已聊 ${usage.charCount} 个角色卡 · ${usage.chatCount} 个聊天档 · 累计 ${formatDurationHuman(usage.durationMs)}">· ${usage.charCount}角/${usage.chatCount}档/${formatDurationShort(usage.durationMs)}</span>`
               : ''
@@ -3956,6 +4025,13 @@ function renderFilterPillsBarHtml(personas, characterGroups, customGroups, ungro
     dedupParts.push(`已合并 ${state.lastMergedDuplicateCount} 条跨卡同名重复`);
   }
 
+  const currentCharGroup = characterGroups.find((cg) => cg.isCurrentChar) || null;
+  const otherCharGroups = characterGroups.filter((cg) => !cg.isCurrentChar);
+  const useCharDropdown = otherCharGroups.length >= 2;
+  const isOtherCharFilterSelected =
+    state.activeFilter.startsWith('char:') &&
+    (!currentCharGroup || state.activeFilter !== currentCharGroup.id);
+
   return `
     <div class="st-pw-group-tabs">
       <button type="button" class="st-pw-filter-pill ${state.activeFilter === 'all' ? 'active' : ''}" data-filter="all" title="所有去重后的真实人设总数">
@@ -3985,15 +4061,38 @@ function renderFilterPillsBarHtml(personas, characterGroups, customGroups, ungro
       <button type="button" class="st-pw-filter-pill ${state.activeFilter === 'fav' ? 'active' : ''}" data-filter="fav">
         收藏 (${favCount})
       </button>
-      ${characterGroups
-        .map(
-          (cg) => `
-            <button type="button" class="st-pw-filter-pill ${state.activeFilter === cg.id ? 'active' : ''}" data-filter="${escapeAttr(cg.id)}" title="角色绑定的 User 自动分组">
-              <i class="fa-solid fa-user-tag"></i> ${sanitizeHtml(cg.name)} (${cg.members.length})
+      ${
+        currentCharGroup
+          ? `
+            <button type="button" class="st-pw-filter-pill ${state.activeFilter === currentCharGroup.id ? 'active' : ''}" data-filter="${escapeAttr(currentCharGroup.id)}" title="当前打开角色绑定的 User">
+              <i class="fa-solid fa-user-tag"></i> ${sanitizeHtml(currentCharGroup.name)} (${currentCharGroup.members.length})
             </button>
           `
-        )
-        .join('')}
+          : ''
+      }
+      ${
+        !useCharDropdown
+          ? otherCharGroups
+              .map(
+                (cg) => `
+                  <button type="button" class="st-pw-filter-pill ${state.activeFilter === cg.id ? 'active' : ''}" data-filter="${escapeAttr(cg.id)}" title="角色绑定的 User 自动分组">
+                    <i class="fa-solid fa-user-tag"></i> ${sanitizeHtml(cg.name)} (${cg.members.length})
+                  </button>
+                `
+              )
+              .join('')
+          : `
+            <select class="text_pole st-pw-char-filter-select ${isOtherCharFilterSelected ? 'is-active-select' : ''}" title="按绑定角色筛选 User（避免大量连线角色撑满屏幕）">
+              <option value="all">按角色筛选 (${characterGroups.length})…</option>
+              ${characterGroups
+                .map(
+                  (cg) =>
+                    `<option value="${escapeAttr(cg.id)}" ${state.activeFilter === cg.id ? 'selected' : ''}>${cg.isCurrentChar ? '★ ' : ''}${sanitizeHtml(cg.name)} (${cg.members.length})</option>`
+                )
+                .join('')}
+            </select>
+          `
+      }
       ${customGroups
         .map(
           (g) => `
@@ -4654,10 +4753,18 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
     }
   });
 
-  // 顶部筛选胶囊
+  // 顶部筛选胶囊与角色筛选下拉框
   modal.querySelectorAll('.st-pw-filter-pill[data-filter]').forEach((btn) => {
     btn.addEventListener('click', () => {
       state.activeFilter = btn.getAttribute('data-filter') || 'all';
+      rerenderPanels();
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-char-filter-select').forEach((sel) => {
+    sel.addEventListener('change', (e) => {
+      state.activeFilter = e.target.value || 'all';
+      e.target.blur?.();
       rerenderPanels();
     });
   });
@@ -5301,15 +5408,40 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
 
   const sections = [];
 
+  // 识别「同一通用 User 被原生连线锁到了 >= 3 个单人角色卡」的情况：
+  // 避免 1 个通用 User 连了 30 张卡时在全部视图中衍生出 30 个重复的单人文件夹刷屏！
+  const soloCharCountByAvatar = new Map();
+  for (const cg of characterGroups) {
+    if (!cg.isCurrentChar && cg.members.length === 1) {
+      const mId = cg.members[0].avatarId;
+      soloCharCountByAvatar.set(mId, (soloCharCountByAvatar.get(mId) || 0) + 1);
+    }
+  }
+  const generalMultiBoundMap = new Map();
+
   // 1) 自动角色分组（绑在同一角色下的多个 User 自动归为一组）
   for (const cg of characterGroups) {
     if (state.activeFilter !== 'all' && state.activeFilter !== cg.id) continue;
-    const visibleMembers = cg.members.filter((p) => matchesSearch(p, q));
-    if (q && visibleMembers.length === 0) continue;
-    const isCollapsed = state.collapsedSections.has(cg.id);
+
     const isBatchOpen =
       state.batchAssignTarget?.type === 'character' &&
       state.batchAssignTarget?.name.toLowerCase() === cg.name.toLowerCase();
+
+    if (
+      state.activeFilter === 'all' &&
+      !cg.isCurrentChar &&
+      !isBatchOpen &&
+      cg.members.length === 1 &&
+      (soloCharCountByAvatar.get(cg.members[0].avatarId) || 0) >= 3
+    ) {
+      const p = cg.members[0];
+      generalMultiBoundMap.set(p.avatarId, p);
+      continue;
+    }
+
+    const visibleMembers = cg.members.filter((p) => matchesSearch(p, q));
+    if (q && visibleMembers.length === 0) continue;
+    const isCollapsed = state.collapsedSections.has(cg.id);
 
     sections.push(`
       <div class="st-pw-folder-section" data-section-id="${escapeAttr(cg.id)}">
@@ -5343,6 +5475,35 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
         }
       </div>
     `);
+  }
+
+  // 1.5) 绑定了 >= 3 个单人角色卡的通用人设聚合组（只展示 1 次，不再重复刷出几十个单人卡片组）
+  if (state.activeFilter === 'all' && generalMultiBoundMap.size > 0) {
+    const generalMembers = [...generalMultiBoundMap.values()].filter(
+      (p) => !p.meta.group && matchesSearch(p, q)
+    );
+    if (generalMembers.length > 0) {
+      const isCollapsed = state.collapsedSections.has('multi_char_general');
+      sections.push(`
+        <div class="st-pw-folder-section" data-section-id="multi_char_general">
+          <div class="st-pw-folder-header">
+            <div class="st-pw-folder-title-wrap st-pw-folder-toggle" data-section-id="multi_char_general">
+              <i class="fa-solid fa-chevron-${isCollapsed ? 'right' : 'down'} st-pw-folder-arrow"></i>
+              <i class="fa-solid fa-users-gear st-pw-folder-icon"></i>
+              <span class="st-pw-folder-name">多角色通用绑定</span>
+              <span class="st-pw-folder-count">${generalMembers.length}</span>
+            </div>
+          </div>
+          ${
+            !isCollapsed
+              ? `<div class="st-pw-folder-body">${generalMembers
+                  .map((p) => renderPersonaRowHtml(p, selectedAvatarId))
+                  .join('')}</div>`
+              : ''
+          }
+        </div>
+      `);
+    }
   }
 
   // 2) 用户自定义分组
@@ -5431,7 +5592,7 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
   const existingRightPanel = document.querySelector('#st_pw_native_persona_helper');
 
   if (!settings.enhanceNativePersonaPanel) {
-    leftCol?.classList.remove('st-pw-left-taken');
+    restoreNativeLeftColumnElements(leftCol);
     existingLeftPanel?.remove();
     existingRightPanel?.remove();
     return;
@@ -5493,7 +5654,7 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
 
     if (!isLeftSelectFocused) {
       if (state.useRawNativeLeftList) {
-        leftCol.classList.remove('st-pw-left-taken');
+        restoreNativeLeftColumnElements(leftCol);
         const rawBarHtml = `
           <div class="st-pw-raw-mode-bar">
             <span class="st-pw-muted">当前为原生平铺列表</span>
@@ -5511,7 +5672,7 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
           });
         }
       } else {
-        leftCol.classList.add('st-pw-left-taken');
+        syncNativeLeftColumnVisibility(leftCol);
         const q = state.searchQuery.trim().toLowerCase();
         const wasSearchFocused =
           document.activeElement &&
@@ -6247,10 +6408,25 @@ function installTauriTavernBackBridge() {
   });
 }
 
+function ensureStylesheetCacheBusted(versionStr) {
+  try {
+    document
+      .querySelectorAll('link[rel="stylesheet"]')
+      .forEach((link) => {
+        const href = link.getAttribute('href') || '';
+        if (href.includes('st-persona-wardrobe/style.css') && !href.includes(`v=${versionStr}`)) {
+          const cleanHref = href.split('?')[0];
+          link.setAttribute('href', `${cleanHref}?v=${versionStr}`);
+        }
+      });
+  } catch (_e) {}
+}
+
 async function initExtension() {
   if (state.initialized) return;
   state.initialized = true;
 
+  ensureStylesheetCacheBusted('1.1.4');
   await waitForTauriTavernReady();
   await probeHostModules();
   await refreshDiskAvatarSet();
@@ -6514,9 +6690,9 @@ export async function onDisable() {
   }
   removeReturnToWardrobePill();
   document.querySelector('#PersonaManagement')?.classList.remove('st-pw-harvesting-drawer');
-  document
-    .querySelector('#PersonaManagement .persona_management_left_column')
-    ?.classList.remove('st-pw-left-taken');
+  restoreNativeLeftColumnElements(
+    document.querySelector('#PersonaManagement .persona_management_left_column')
+  );
   document.querySelector('#st_pw_inline_left_panel')?.remove();
   document.querySelector('#st_pw_wardrobe_modal')?.remove();
   document.querySelector('#st_pw_wb_inspector_modal')?.remove();
