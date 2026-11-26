@@ -34,6 +34,9 @@ const state = {
   batchAssignTarget: null, // null | { type: 'character', key: string, name: string } | { type: 'group', name: string }
   searchQuery: '',
   selectedAvatarId: null,
+  multiSelectMode: false,
+  multiSelectedIds: new Set(),
+  lastMultiClickedAvatarId: '',
   expandedTraitIdx: null,
   showStatsDetail: false,
   isScanningHistory: false,
@@ -2522,7 +2525,7 @@ function buildUnifiedPersonaGroups(personas) {
 /**
  * 将某个 User 绑定到指定角色名（同时开启酒馆原生 persona_allow_multi_connections 并写入 connections）
  */
-async function bindPersonaToCharacter(avatarId, characterName) {
+async function bindPersonaToCharacter(avatarId, characterName, { skipRefresh = false } = {}) {
   const cleanName = String(characterName || '').trim();
   if (!avatarId || !cleanName) return;
 
@@ -2533,7 +2536,10 @@ async function bindPersonaToCharacter(avatarId, characterName) {
 
   try {
     const context = getContext();
-    const rawChars = Array.isArray(context.characters) ? context.characters : [];
+    const rawChars =
+      Array.isArray(context.characters) && context.characters.length > 0
+        ? context.characters
+        : state.cachedHostCharacters;
     const rawChar = rawChars.find(
       (c) => String(c?.name || '').trim().toLowerCase() === cleanName.toLowerCase()
     );
@@ -2594,15 +2600,20 @@ async function bindPersonaToCharacter(avatarId, characterName) {
       }
     }
 
-    state.hostPersonasModule?.updatePersonaConnectionsAvatarList?.();
-    state.hostPersonasModule?.updatePersonaUIStates?.();
+    if (!skipRefresh) {
+      state.hostPersonasModule?.updatePersonaConnectionsAvatarList?.();
+      state.hostPersonasModule?.updatePersonaUIStates?.();
+    }
   } catch (_e) {}
 
-  saveSettings();
-  refreshAllViews();
+  if (!skipRefresh) {
+    invalidateRenderedHtmlCache();
+    saveSettings();
+    refreshAllViews();
+  }
 }
 
-async function unbindPersonaFromCharacter(avatarId, characterName) {
+async function unbindPersonaFromCharacter(avatarId, characterName, { skipRefresh = false } = {}) {
   const cleanName = String(characterName || '').trim();
   if (!avatarId || !cleanName) return;
 
@@ -2613,7 +2624,10 @@ async function unbindPersonaFromCharacter(avatarId, characterName) {
 
   try {
     const context = getContext();
-    const rawChars = Array.isArray(context.characters) ? context.characters : [];
+    const rawChars =
+      Array.isArray(context.characters) && context.characters.length > 0
+        ? context.characters
+        : state.cachedHostCharacters;
     const rawChar = rawChars.find(
       (c) => String(c?.name || '').trim().toLowerCase() === cleanName.toLowerCase()
     );
@@ -2644,12 +2658,294 @@ async function unbindPersonaFromCharacter(avatarId, characterName) {
           (c) => !(c.type === 'character' && c.id === rawChar.avatar)
         );
     }
-    state.hostPersonasModule?.updatePersonaConnectionsAvatarList?.();
-    state.hostPersonasModule?.updatePersonaUIStates?.();
+    if (!skipRefresh) {
+      state.hostPersonasModule?.updatePersonaConnectionsAvatarList?.();
+      state.hostPersonasModule?.updatePersonaUIStates?.();
+    }
   } catch (_e) {}
 
+  if (!skipRefresh) {
+    invalidateRenderedHtmlCache();
+    saveSettings();
+    refreshAllViews();
+  }
+}
+
+function getValidMultiSelectedIds() {
+  const validSet = new Set(getHostPersonas().map((p) => p.avatarId));
+  for (const id of [...state.multiSelectedIds]) {
+    if (!validSet.has(id)) {
+      state.multiSelectedIds.delete(id);
+    }
+  }
+  return [...state.multiSelectedIds];
+}
+
+/**
+ * 原位刷新多选勾选状态与工具栏数字（零 innerHTML 重建、零列表回顶）
+ */
+function syncMultiSelectionDomInPlace() {
+  const count = state.multiSelectedIds.size;
+  const hasAny = count > 0;
+
+  document
+    .querySelectorAll(
+      '#st_pw_inline_left_panel .st-pw-persona-item[data-avatar-id], #st_pw_wardrobe_modal .st-pw-persona-item[data-avatar-id]'
+    )
+    .forEach((row) => {
+      const id = row.getAttribute('data-avatar-id') || '';
+      const checked = state.multiSelectedIds.has(id);
+      row.classList.toggle('is-multi-checked', checked);
+      const chk = row.querySelector('.st-pw-multi-check');
+      if (chk && chk.checked !== checked) {
+        chk.checked = checked;
+      }
+    });
+
+  document.querySelectorAll('.st-pw-multi-count-num').forEach((el) => {
+    el.textContent = String(count);
+  });
+
+  document.querySelectorAll('.st-pw-toggle-multi-btn').forEach((btn) => {
+    if (state.multiSelectMode) {
+      btn.classList.add('is-active-mode');
+      btn.innerHTML = `<i class="fa-solid fa-check-double"></i> 完成${count > 0 ? ` (${count})` : ''}`;
+    } else {
+      btn.classList.remove('is-active-mode');
+      btn.innerHTML = `<i class="fa-regular fa-square-check"></i> 多选`;
+    }
+  });
+
+  document
+    .querySelectorAll(
+      '.st-pw-multi-group-select, .st-pw-multi-char-select, .st-pw-multi-book-select, .st-pw-multi-fav-on, .st-pw-multi-fav-off, .st-pw-multi-delete, .st-pw-multi-clear'
+    )
+    .forEach((ctrl) => {
+      ctrl.disabled = !hasAny;
+    });
+}
+
+async function executeBatchMoveToGroup(rawTargetGroup) {
+  const ids = getValidMultiSelectedIds();
+  if (ids.length === 0) return;
+
+  const settings = getSettings();
+  let finalGroup = '';
+
+  if (rawTargetGroup === '__new__') {
+    const entered = await promptUserText('新建自定义分组并批量移入', '', {
+      subtitle: `将当前选中的 ${ids.length} 个 User 一并移入新分组`,
+      placeholder: '输入新分组名称…',
+    });
+    if (!entered || !entered.trim()) return;
+    finalGroup = entered.trim();
+    if (!settings.groups.includes(finalGroup)) {
+      settings.groups.push(finalGroup);
+    }
+  } else if (rawTargetGroup === '__ungroup__') {
+    finalGroup = '';
+  } else {
+    finalGroup = String(rawTargetGroup || '').trim();
+    if (!finalGroup) return;
+  }
+
+  for (const id of ids) {
+    const meta = ensureProfileMeta(id);
+    meta.group = finalGroup;
+  }
+  if (finalGroup) {
+    state.collapsedSections.delete(`group:${finalGroup}`);
+  }
+  // 批量归组后自动清空勾选并保持多选开启，方便紧接着勾选下一批人设归入其他分组！
+  state.multiSelectedIds.clear();
+  invalidateRenderedHtmlCache();
   saveSettings();
   refreshAllViews();
+  globalThis.toastr?.success?.(
+    finalGroup
+      ? `已将 ${ids.length} 个 User 移入分组「${finalGroup}」`
+      : `已将 ${ids.length} 个 User 移出自定义分组`
+  );
+}
+
+async function executeBatchCharacterAction(rawAction) {
+  const ids = getValidMultiSelectedIds();
+  if (ids.length === 0 || !rawAction) return;
+
+  if (rawAction === '__clear_all_chars__') {
+    if (
+      !(await confirmUserAction(
+        '批量解绑角色卡',
+        `确定清空所选 ${ids.length} 个 User 身上的全部角色连线/绑定吗？`
+      ))
+    ) {
+      return;
+    }
+    const allPersonas = getHostPersonas();
+    const personaMap = new Map(allPersonas.map((p) => [p.avatarId, p]));
+    for (const id of ids) {
+      const p = personaMap.get(id);
+      const boundList = [...(p?.meta?.boundCharacters || [])];
+      for (const cName of boundList) {
+        await unbindPersonaFromCharacter(id, cName, { skipRefresh: true });
+      }
+      const meta = ensureProfileMeta(id);
+      meta.boundCharacters = [];
+      try {
+        const pu = getContext().powerUserSettings || globalThis.power_user;
+        if (Array.isArray(pu?.persona_descriptions?.[id]?.connections)) {
+          pu.persona_descriptions[id].connections = [];
+        }
+      } catch (_e) {}
+    }
+    state.hostPersonasModule?.updatePersonaConnectionsAvatarList?.();
+    state.hostPersonasModule?.updatePersonaUIStates?.();
+    state.multiSelectedIds.clear();
+    invalidateRenderedHtmlCache();
+    saveSettings();
+    refreshAllViews();
+    globalThis.toastr?.success?.(`已清空 ${ids.length} 个 User 的全部角色绑定`);
+    return;
+  }
+
+  let targetCharName = rawAction;
+  if (rawAction === '__custom_char__') {
+    const entered = await promptUserText('批量绑定到角色名', '', {
+      subtitle: `将选中的 ${ids.length} 个 User 绑定到同一角色组`,
+      placeholder: '输入角色名称…',
+    });
+    if (!entered || !entered.trim()) return;
+    targetCharName = entered.trim();
+  }
+
+  await probeHostModules();
+  for (const id of ids) {
+    await bindPersonaToCharacter(id, targetCharName, { skipRefresh: true });
+  }
+  state.hostPersonasModule?.updatePersonaConnectionsAvatarList?.();
+  state.hostPersonasModule?.updatePersonaUIStates?.();
+  state.collapsedSections.delete(`char:${targetCharName}`);
+  state.multiSelectedIds.clear();
+  invalidateRenderedHtmlCache();
+  saveSettings();
+  refreshAllViews();
+  globalThis.toastr?.success?.(`已将 ${ids.length} 个 User 绑定到角色「${targetCharName}」`);
+}
+
+async function executeBatchWorldbookAction(rawBook) {
+  const ids = getValidMultiSelectedIds();
+  if (ids.length === 0 || !rawBook) return;
+  const nextBook = rawBook === '__clear_book__' ? '' : String(rawBook).trim();
+
+  await probeHostModules();
+  for (const id of ids) {
+    await updateHostPersonaData(id, { lorebook: nextBook });
+  }
+  invalidateRenderedHtmlCache();
+  saveSettings();
+  refreshAllViews();
+  globalThis.toastr?.success?.(
+    nextBook
+      ? `已为 ${ids.length} 个 User 批量绑定主世界书「${nextBook}」`
+      : `已解绑 ${ids.length} 个 User 的主世界书`
+  );
+}
+
+function executeBatchFavorite(favState) {
+  const ids = getValidMultiSelectedIds();
+  if (ids.length === 0) return;
+  for (const id of ids) {
+    const meta = ensureProfileMeta(id);
+    meta.favorite = Boolean(favState);
+  }
+  invalidateRenderedHtmlCache();
+  saveSettings();
+  refreshAllViews();
+  globalThis.toastr?.success?.(
+    favState ? `已批量收藏 ${ids.length} 个 User` : `已取消 ${ids.length} 个 User 的收藏`
+  );
+}
+
+async function executeBatchDeletePersonas() {
+  const ids = getValidMultiSelectedIds();
+  if (ids.length === 0) return;
+
+  const activeId = getActiveAvatarId();
+  const protectedIds = [];
+  const deletableIds = [];
+  for (const id of ids) {
+    if (id === 'user-default.png' || id === activeId || id.startsWith('luker_dedicated__')) {
+      protectedIds.push(id);
+    } else {
+      deletableIds.push(id);
+    }
+  }
+
+  if (deletableIds.length === 0) {
+    globalThis.toastr?.warning?.('当前正在使用的人设与系统默认人设受保护，不可在批量操作中直接删除');
+    return;
+  }
+
+  const allPersonas = getHostPersonas();
+  const nameById = new Map(allPersonas.map((p) => [p.avatarId, p.name]));
+  const previewNames = deletableIds
+    .slice(0, 6)
+    .map((id) => nameById.get(id) || id)
+    .join('、');
+  const skipHint =
+    protectedIds.length > 0
+      ? `\n（已自动跳过 ${protectedIds.length} 个当前使用中/默认保护人设）`
+      : '';
+
+  if (
+    !(await confirmUserAction(
+      `批量删除 ${deletableIds.length} 个人设`,
+      `确定永久删除「${previewNames}${deletableIds.length > 6 ? '…' : ''}」共 ${deletableIds.length} 个人设及其头像吗？此操作不可撤销！${skipHint}`
+    ))
+  ) {
+    return;
+  }
+
+  const context = getContext();
+  const headers =
+    typeof context.getRequestHeaders === 'function'
+      ? context.getRequestHeaders()
+      : { 'Content-Type': 'application/json' };
+  const pu = context.powerUserSettings || globalThis.power_user || {};
+  const settings = getSettings();
+
+  let deletedCount = 0;
+  for (const id of deletableIds) {
+    try {
+      const res = await fetch('/api/avatars/delete', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ avatar: id }),
+      });
+      if (res.ok) {
+        deletedCount++;
+        if (pu.personas) delete pu.personas[id];
+        if (pu.persona_descriptions) delete pu.persona_descriptions[id];
+        if (pu.default_persona === id) pu.default_persona = null;
+        delete settings.profiles[id];
+        if (settings.avatarUrlCache) delete settings.avatarUrlCache[id];
+        state.multiSelectedIds.delete(id);
+      }
+    } catch (err) {
+      console.warn(`[${MODULE_ID}] 批量删除 ${id} 跳过:`, err);
+    }
+  }
+
+  await refreshDiskAvatarSet();
+  try {
+    await state.hostPersonasModule?.getUserAvatars?.(true, getActiveAvatarId());
+  } catch (_e) {}
+  invalidateRenderedHtmlCache();
+  saveSettings();
+  refreshAllViews();
+  globalThis.toastr?.success?.(
+    `已成功批量删除 ${deletedCount} 个人设${protectedIds.length ? `（保留 ${protectedIds.length} 个受保护项）` : ''}`
+  );
 }
 
 async function switchActivePersona(avatarId) {
@@ -3933,8 +4229,74 @@ function openWardrobeModal(initialAvatarId = null) {
   renderWardrobeModalContent({ force: true });
 }
 
+function renderMultiSelectToolbarHtml(settings, hostChars, currentCharName, availableBooks) {
+  if (!state.multiSelectMode) return '';
+  const selectedCount = state.multiSelectedIds.size;
+  const disAttr = selectedCount === 0 ? 'disabled' : '';
+
+  return `
+    <div class="st-pw-multi-bar">
+      <div class="st-pw-multi-bar-top">
+        <span class="st-pw-multi-count">已选 <strong class="st-pw-multi-count-num">${selectedCount}</strong> 项</span>
+        <div class="st-pw-multi-quick-btns">
+          <button type="button" class="menu_button st-pw-mini-btn st-pw-multi-select-visible" title="全选当前列表中的所有可见人设（配合搜索框使用更高效）">全选当前</button>
+          <button type="button" class="menu_button st-pw-mini-btn st-pw-multi-invert-visible" title="反选当前列表中的可见人设">反选</button>
+          <button type="button" class="menu_button st-pw-mini-btn st-pw-multi-clear" ${disAttr}>清空</button>
+          <button type="button" class="menu_button st-pw-mini-btn st-pw-multi-exit">退出</button>
+        </div>
+      </div>
+
+      <div class="st-pw-multi-bar-actions">
+        <select class="text_pole st-pw-multi-select-ctrl st-pw-multi-group-select" ${disAttr} title="将已勾选的 User 一次性批量移入指定分组">
+          <option value="">批量移入分组…</option>
+          ${(settings.groups || [])
+            .map((g) => `<option value="${escapeAttr(g)}">移入分组：${sanitizeHtml(g)}</option>`)
+            .join('')}
+          <option value="__new__">+ 新建分组并移入…</option>
+          <option value="__ungroup__">— 移出自定义分组（恢复未分组）—</option>
+        </select>
+
+        <select class="text_pole st-pw-multi-select-ctrl st-pw-multi-char-select" ${disAttr} title="将已勾选的 User 一次性绑定到角色卡或清空绑定">
+          <option value="">批量角色绑定…</option>
+          ${
+            currentCharName
+              ? `<option value="${escapeAttr(currentCharName)}">★ 绑到当前：${sanitizeHtml(currentCharName)}</option>`
+              : ''
+          }
+          ${hostChars
+            .filter((c) => c.name !== currentCharName)
+            .map((c) => `<option value="${escapeAttr(c.name)}">绑到角色：${sanitizeHtml(c.name)}</option>`)
+            .join('')}
+          <option value="__custom_char__">+ 手动输入角色名绑定…</option>
+          <option value="__clear_all_chars__">— 清空所选的全部角色绑定 —</option>
+        </select>
+
+        <select class="text_pole st-pw-multi-select-ctrl st-pw-multi-book-select" ${disAttr} title="为已勾选的 User 批量设置或解绑主世界书">
+          <option value="">批量设世界书…</option>
+          ${availableBooks
+            .map((b) => `<option value="${escapeAttr(b)}">设为主书：${sanitizeHtml(b)}</option>`)
+            .join('')}
+          <option value="__clear_book__">— 解绑主世界书 —</option>
+        </select>
+
+        <button type="button" class="menu_button st-pw-mini-btn st-pw-multi-fav-on" ${disAttr} title="批量设为收藏">
+          <i class="fa-solid fa-star"></i> 收藏
+        </button>
+        <button type="button" class="menu_button st-pw-mini-btn st-pw-multi-fav-off" ${disAttr} title="批量取消收藏">
+          <i class="fa-regular fa-star"></i> 取消收藏
+        </button>
+        <button type="button" class="menu_button st-pw-mini-btn st-pw-multi-delete" ${disAttr} title="批量删除已勾选人设（自动保护当前使用中人设与系统默认人设）">
+          <i class="fa-solid fa-trash-can"></i> 删除
+        </button>
+      </div>
+    </div>
+  `;
+}
+
 function renderPersonaRowHtml(p, selectedAvatarId) {
-  const isSelected = selectedAvatarId === p.avatarId;
+  const isMulti = Boolean(state.multiSelectMode);
+  const isMultiChecked = isMulti && state.multiSelectedIds.has(p.avatarId);
+  const isSelected = !isMulti && selectedAvatarId === p.avatarId;
   const extraCount = p.meta.extraWorldbooks.filter((b) => b.enabled).length;
   const traitCount = p.meta.traits.filter((t) => t.enabled).length;
   const presetCount = Array.isArray(p.meta.presets) ? p.meta.presets.length : 0;
@@ -3946,7 +4308,12 @@ function renderPersonaRowHtml(p, selectedAvatarId) {
     !state.resolvedExternalAvatars.has(p.avatarId) &&
     !getSettings().avatarUrlCache?.[p.avatarId];
   return `
-    <div class="st-pw-persona-item ${isSelected ? 'is-selected' : ''} ${p.isActive ? 'is-active-user' : ''}" data-avatar-id="${escapeAttr(p.avatarId)}">
+    <div class="st-pw-persona-item ${isMulti ? 'is-multi-mode' : ''} ${isMultiChecked ? 'is-multi-checked' : ''} ${isSelected ? 'is-selected' : ''} ${p.isActive ? 'is-active-user' : ''}" data-avatar-id="${escapeAttr(p.avatarId)}">
+      ${
+        isMulti
+          ? `<input type="checkbox" class="st-pw-multi-check" data-avatar-id="${escapeAttr(p.avatarId)}" ${isMultiChecked ? 'checked' : ''} aria-label="勾选 ${escapeAttr(p.name)}" />`
+          : ''
+      }
       <img class="st-pw-item-avatar b-loaded loaded ${isPendingPlaceholder ? 'st-pw-placeholder-pending' : ''}" src="${escapeAttr(p.avatarUrl)}" data-real-src="${escapeAttr(p.avatarUrl)}" data-no-lazy="1" data-loaded="true" data-avatar-id="${escapeAttr(p.avatarId)}" data-fallback-src="${escapeAttr(fallbackAvatarUrl)}" decoding="async" alt="" />
       <div class="st-pw-item-main">
         <div class="st-pw-item-title-line">
@@ -3982,7 +4349,9 @@ function renderPersonaRowHtml(p, selectedAvatarId) {
         ${
           p.isActive
             ? `<span class="st-pw-active-label">当前</span>`
-            : `<button type="button" class="menu_button st-pw-mini-btn st-pw-use-persona-btn" data-avatar-id="${escapeAttr(p.avatarId)}">使用</button>`
+            : isMulti
+              ? ''
+              : `<button type="button" class="menu_button st-pw-mini-btn st-pw-use-persona-btn" data-avatar-id="${escapeAttr(p.avatarId)}">使用</button>`
         }
       </div>
     </div>
@@ -4213,6 +4582,9 @@ function renderWardrobeModalContent({ force = false } = {}) {
         <aside class="st-pw-sidebar">
           <div class="st-pw-inline-left-top">
             <input type="search" id="st_pw_search_input" class="text_pole st-pw-sidebar-search" placeholder="搜索 User、角色组、自定义组、世界书…" value="${escapeAttr(state.searchQuery)}" />
+            <button type="button" class="menu_button st-pw-mini-btn st-pw-toggle-multi-btn ${state.multiSelectMode ? 'is-active-mode' : ''}" title="开启多选模式，一次性将多个 User 批量移入分组、绑卡、绑世界书或删除">
+              <i class="fa-${state.multiSelectMode ? 'solid fa-check-double' : 'regular fa-square-check'}"></i> ${state.multiSelectMode ? `完成${state.multiSelectedIds.size > 0 ? ` (${state.multiSelectedIds.size})` : ''}` : '多选'}
+            </button>
             <button type="button" class="menu_button st-pw-mini-btn st-pw-modal-create-btn" title="调用原生新建人设">
               <i class="fa-solid fa-plus"></i> 新建
             </button>
@@ -4241,6 +4613,7 @@ function renderWardrobeModalContent({ force = false } = {}) {
           </div>
 
           ${renderFilterPillsBarHtml(personas, characterGroups, customGroups, ungroupedMembers)}
+          ${renderMultiSelectToolbarHtml(settings, hostChars, currentCharName, availableBooks)}
 
           <!-- 分组树列表：同一角色下绑的多个 User 自动归在一组，自定义组也自动归在一组 -->
           <div class="st-pw-persona-list">
@@ -4930,14 +5303,188 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
     });
   });
 
+  // ==================== 多选批量管理事件 ====================
+  modal.querySelectorAll('.st-pw-toggle-multi-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      state.multiSelectMode = !state.multiSelectMode;
+      if (!state.multiSelectMode) {
+        state.multiSelectedIds.clear();
+        state.lastMultiClickedAvatarId = '';
+      }
+      invalidateRenderedHtmlCache();
+      rerenderPanels();
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-multi-exit').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      state.multiSelectMode = false;
+      state.multiSelectedIds.clear();
+      state.lastMultiClickedAvatarId = '';
+      invalidateRenderedHtmlCache();
+      rerenderPanels();
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-multi-select-visible').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      modal
+        .querySelectorAll('.st-pw-persona-list .st-pw-persona-item[data-avatar-id]')
+        .forEach((row) => {
+          const id = row.getAttribute('data-avatar-id');
+          if (id) state.multiSelectedIds.add(id);
+        });
+      syncMultiSelectionDomInPlace();
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-multi-invert-visible').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const seen = new Set();
+      modal
+        .querySelectorAll('.st-pw-persona-list .st-pw-persona-item[data-avatar-id]')
+        .forEach((row) => {
+          const id = row.getAttribute('data-avatar-id');
+          if (!id || seen.has(id)) return;
+          seen.add(id);
+          if (state.multiSelectedIds.has(id)) {
+            state.multiSelectedIds.delete(id);
+          } else {
+            state.multiSelectedIds.add(id);
+          }
+        });
+      syncMultiSelectionDomInPlace();
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-multi-clear').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      state.multiSelectedIds.clear();
+      state.lastMultiClickedAvatarId = '';
+      syncMultiSelectionDomInPlace();
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-multi-select-section').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const secEl = btn.closest('.st-pw-folder-section');
+      if (!secEl) return;
+      const rows = Array.from(secEl.querySelectorAll('.st-pw-persona-item[data-avatar-id]'));
+      const ids = rows.map((r) => r.getAttribute('data-avatar-id')).filter(Boolean);
+      if (ids.length === 0) return;
+      const allSelected = ids.every((id) => state.multiSelectedIds.has(id));
+      for (const id of ids) {
+        if (allSelected) {
+          state.multiSelectedIds.delete(id);
+        } else {
+          state.multiSelectedIds.add(id);
+        }
+      }
+      syncMultiSelectionDomInPlace();
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-multi-group-select').forEach((sel) => {
+    sel.addEventListener('change', async (e) => {
+      const val = e.target.value;
+      e.target.value = '';
+      e.target.blur?.();
+      if (!val) return;
+      await executeBatchMoveToGroup(val);
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-multi-char-select').forEach((sel) => {
+    sel.addEventListener('change', async (e) => {
+      const val = e.target.value;
+      e.target.value = '';
+      e.target.blur?.();
+      if (!val) return;
+      await executeBatchCharacterAction(val);
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-multi-book-select').forEach((sel) => {
+    sel.addEventListener('change', async (e) => {
+      const val = e.target.value;
+      e.target.value = '';
+      e.target.blur?.();
+      if (!val) return;
+      await executeBatchWorldbookAction(val);
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-multi-fav-on').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      executeBatchFavorite(true);
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-multi-fav-off').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      executeBatchFavorite(false);
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-multi-delete').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await executeBatchDeletePersonas();
+    });
+  });
+
   modal.querySelectorAll('.st-pw-persona-item').forEach((card) => {
     card.addEventListener('click', (e) => {
       if (e.target.closest('.st-pw-fav-btn') || e.target.closest('.st-pw-use-persona-btn')) {
         return;
       }
-      state.selectedAvatarId = card.getAttribute('data-avatar-id');
-      state.expandedTraitIdx = null;
-      renderWardrobeModalContent();
+      const id = card.getAttribute('data-avatar-id');
+      if (!id) return;
+
+      if (state.multiSelectMode) {
+        const shouldCheck = !state.multiSelectedIds.has(id);
+        // 支持桌面端按住 Shift 连选一整段人设
+        if (e.shiftKey && state.lastMultiClickedAvatarId && state.lastMultiClickedAvatarId !== id) {
+          const allVisibleRows = Array.from(
+            modal.querySelectorAll('.st-pw-persona-list .st-pw-persona-item[data-avatar-id]')
+          );
+          const idxA = allVisibleRows.findIndex(
+            (r) => r.getAttribute('data-avatar-id') === state.lastMultiClickedAvatarId
+          );
+          const idxB = allVisibleRows.findIndex((r) => r.getAttribute('data-avatar-id') === id);
+          if (idxA !== -1 && idxB !== -1) {
+            const [start, end] = idxA < idxB ? [idxA, idxB] : [idxB, idxA];
+            for (let k = start; k <= end; k++) {
+              const rangeId = allVisibleRows[k].getAttribute('data-avatar-id');
+              if (!rangeId) continue;
+              if (shouldCheck) state.multiSelectedIds.add(rangeId);
+              else state.multiSelectedIds.delete(rangeId);
+            }
+          }
+        }
+        if (shouldCheck) {
+          state.multiSelectedIds.add(id);
+        } else {
+          state.multiSelectedIds.delete(id);
+        }
+        state.lastMultiClickedAvatarId = id;
+        syncMultiSelectionDomInPlace();
+        return;
+      }
+
+      if (modal.id === 'st_pw_wardrobe_modal') {
+        state.selectedAvatarId = id;
+        state.expandedTraitIdx = null;
+        renderWardrobeModalContent();
+      }
     });
   });
 
@@ -5458,6 +6005,11 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
             ${cg.isCurrentChar ? `<span class="st-pw-tiny-tag">当前角色</span>` : ''}
           </div>
           <div class="st-pw-folder-actions">
+            ${
+              state.multiSelectMode && !isCollapsed && visibleMembers.length > 0
+                ? `<button type="button" class="st-pw-link-btn st-pw-multi-select-section" title="全选或取消本组所有可见人设">全选本组</button>`
+                : ''
+            }
             <button type="button" class="st-pw-icon-btn st-pw-open-batch-char" data-char-name="${escapeAttr(cg.name)}" title="勾选/管理绑定到此角色下的多个 User">
               <i class="fa-solid fa-user-plus"></i>
             </button>
@@ -5493,6 +6045,11 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
               <span class="st-pw-folder-name">多角色通用绑定</span>
               <span class="st-pw-folder-count">${generalMembers.length}</span>
             </div>
+            ${
+              state.multiSelectMode && !isCollapsed && generalMembers.length > 0
+                ? `<div class="st-pw-folder-actions"><button type="button" class="st-pw-link-btn st-pw-multi-select-section">全选本组</button></div>`
+                : ''
+            }
           </div>
           ${
             !isCollapsed
@@ -5526,6 +6083,11 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
             <span class="st-pw-folder-count">${grp.members.length}</span>
           </div>
           <div class="st-pw-folder-actions">
+            ${
+              state.multiSelectMode && !isCollapsed && visibleMembers.length > 0
+                ? `<button type="button" class="st-pw-link-btn st-pw-multi-select-section" title="全选或取消本组所有可见人设">全选本组</button>`
+                : ''
+            }
             <button type="button" class="st-pw-icon-btn st-pw-open-batch-group" data-group-name="${escapeAttr(grp.name)}" title="批量勾选移入此分组的 User">
               <i class="fa-solid fa-user-plus"></i>
             </button>
@@ -5569,6 +6131,11 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
               <span class="st-pw-folder-name st-pw-muted">未分组</span>
               <span class="st-pw-folder-count">${visibleUngrouped.length}</span>
             </div>
+            ${
+              state.multiSelectMode && !isCollapsed && visibleUngrouped.length > 0
+                ? `<div class="st-pw-folder-actions"><button type="button" class="st-pw-link-btn st-pw-multi-select-section" title="一键全选未分组人设">全选本组</button></div>`
+                : ''
+            }
           </div>
           ${
             !isCollapsed
@@ -5682,6 +6249,9 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
         const nextLeftHtml = `
           <div class="st-pw-inline-left-top">
             <input type="search" id="st_pw_inline_search_input" class="text_pole st-pw-sidebar-search" placeholder="搜索 User、角色组、自定义组、世界书…" value="${escapeAttr(state.searchQuery)}" />
+            <button type="button" class="menu_button st-pw-mini-btn st-pw-toggle-multi-btn ${state.multiSelectMode ? 'is-active-mode' : ''}" title="开启多选模式，一次性将多个 User 批量移入分组、绑卡、绑世界书或删除">
+              <i class="fa-${state.multiSelectMode ? 'solid fa-check-double' : 'regular fa-square-check'}"></i> ${state.multiSelectMode ? `完成${state.multiSelectedIds.size > 0 ? ` (${state.multiSelectedIds.size})` : ''}` : '多选'}
+            </button>
             <button type="button" class="menu_button st-pw-mini-btn st-pw-inline-create-btn" title="调用原生新建人设">
               <i class="fa-solid fa-plus"></i> 新建
             </button>
@@ -5720,6 +6290,7 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
           </div>
 
           ${renderFilterPillsBarHtml(personas, characterGroups, customGroups, ungroupedMembers)}
+          ${renderMultiSelectToolbarHtml(settings, hostChars, currentCharName, availableBooks)}
 
           <div class="st-pw-persona-list st-pw-inline-persona-list">
             ${buildGroupedTreeSectionsHtml(
@@ -5799,9 +6370,10 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
           // 使用与主窗口一致的分组树交互绑定
           bindWardrobeModalEvents(leftPanel, targetPersona, personas);
 
-          // 在原生人设栏目左栏点击某个人设行时，直接切换为该人设（联动右栏原生表单）
+          // 在原生人设栏目左栏点击某个人设行时，直接切换为该人设（多选模式下仅勾选，不触发切换）
           leftPanel.querySelectorAll('.st-pw-persona-item').forEach((card) => {
             card.addEventListener('click', async (e) => {
+              if (state.multiSelectMode) return;
               if (
                 e.target.closest('.st-pw-fav-btn') ||
                 e.target.closest('.st-pw-use-persona-btn')
@@ -6426,7 +6998,7 @@ async function initExtension() {
   if (state.initialized) return;
   state.initialized = true;
 
-  ensureStylesheetCacheBusted('1.1.4');
+  ensureStylesheetCacheBusted('1.2.0');
   await waitForTauriTavernReady();
   await probeHostModules();
   await refreshDiskAvatarSet();

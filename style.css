@@ -872,6 +872,61 @@
   gap: 3px;
 }
 
+.st-pw-toggle-multi-btn.is-active-mode {
+  background: var(--white20a, rgba(255, 255, 255, 0.16)) !important;
+  border-color: var(--SmartThemeQuoteColor, rgba(255, 255, 255, 0.48)) !important;
+  font-weight: 700;
+}
+
+.st-pw-multi-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 7px 8px;
+  background: var(--black30a, rgba(0, 0, 0, 0.28));
+  border: 1px solid var(--SmartThemeQuoteColor, rgba(255, 255, 255, 0.28));
+  border-radius: 5px;
+}
+
+.st-pw-multi-bar-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.st-pw-multi-count {
+  font-size: 0.8rem;
+}
+
+.st-pw-multi-quick-btns {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.st-pw-multi-bar-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.st-pw-multi-select-ctrl {
+  flex: 1 1 118px;
+  min-width: 105px;
+  height: 26px !important;
+  padding: 0 6px !important;
+  margin: 0 !important;
+  font-size: 0.78rem !important;
+}
+
+.st-pw-multi-delete:not(:disabled) {
+  color: #f87171 !important;
+}
+
 .st-pw-persona-item {
   display: grid;
   grid-template-columns: 36px 1fr auto;
@@ -880,6 +935,23 @@
   padding: 6px 8px;
   border-radius: 4px;
   border: 1px solid transparent;
+  cursor: pointer;
+}
+
+.st-pw-persona-item.is-multi-mode {
+  grid-template-columns: 20px 36px 1fr auto;
+  user-select: none;
+}
+
+.st-pw-persona-item.is-multi-checked {
+  background: var(--white20a, rgba(255, 255, 255, 0.12));
+  border-color: var(--SmartThemeQuoteColor, rgba(255, 255, 255, 0.42));
+}
+
+.st-pw-multi-check {
+  width: 16px !important;
+  height: 16px !important;
+  margin: 0 !important;
   cursor: pointer;
 }
 
