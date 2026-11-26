@@ -41,6 +41,15 @@ const state = {
   useRawNativeLeftList: false,
   diskAvatarSet: null,
   diskAvatarFetched: false,
+  personaThumbnailUnsupported: false,
+  avatarCacheBust: new Map(),
+  lastLeftRenderedHtml: '',
+  lastRightRenderedHtml: '',
+  lastModalRenderedHtml: '',
+  savedInlineListScrollTop: 0,
+  savedModalListScrollTop: 0,
+  savedModalDetailScrollTop: 0,
+  lastUsageDirty: false,
   lastExcludedOrphanCount: 0,
   lastMergedDuplicateCount: 0,
   worldbookCache: new Map(),
@@ -49,6 +58,12 @@ const state = {
   hostPersonasModule: null,
   hostWorldInfoModule: null,
 };
+
+function invalidateRenderedHtmlCache() {
+  state.lastLeftRenderedHtml = '';
+  state.lastRightRenderedHtml = '';
+  state.lastModalRenderedHtml = '';
+}
 
 async function refreshDiskAvatarSet() {
   try {
@@ -455,24 +470,38 @@ function attributeChatMessagesToPersonas({
   );
   const chatRecordKey = `${charAvatar || charName}::${chatId}`;
 
+  let anyChanged = false;
   for (const [avatarId, uCount] of userHitsCount.entries()) {
     const share = userHitsCount.size === 1 ? 1 : Math.max(0.1, uCount / totalAttributedUserMsgs);
     const meta = ensureProfileMeta(avatarId);
     const prev = meta.usageStats.chats[chatRecordKey];
     const computedDur = Math.round(estimatedTotalMs * share);
+    const nextAiMsgs = Math.round(totalAiMsgs * share);
+    const nextDur = Math.max(prev?.durationMs || 0, computedDur);
+    const nextLastChatAt = lastChatAt || prev?.lastChatAt || Date.now();
+
+    if (
+      !prev ||
+      prev.userMsgs !== uCount ||
+      prev.aiMsgs !== nextAiMsgs ||
+      nextDur - (prev.durationMs || 0) >= 30_000 ||
+      prev.charName !== charName
+    ) {
+      anyChanged = true;
+    }
 
     meta.usageStats.chats[chatRecordKey] = {
       charName,
       charAvatar: charAvatar || '',
       chatId,
       userMsgs: uCount,
-      aiMsgs: Math.round(totalAiMsgs * share),
-      durationMs: Math.max(prev?.durationMs || 0, computedDur),
-      lastChatAt: lastChatAt || prev?.lastChatAt || Date.now(),
+      aiMsgs: nextAiMsgs,
+      durationMs: nextDur,
+      lastChatAt: nextLastChatAt,
     };
   }
 
-  return true;
+  return anyChanged;
 }
 
 /**
@@ -763,14 +792,141 @@ function getActiveAvatarId() {
   return '';
 }
 
-function resolvePersonaAvatarUrl(avatarId) {
+function detectHostPersonaAvatarMode() {
+  if (state.personaThumbnailUnsupported) return;
   try {
-    const context = getContext();
-    if (typeof context.getThumbnailUrl === 'function') {
-      return context.getThumbnailUrl('persona', avatarId);
+    const sampleImg = document.querySelector(
+      '#user_avatar_block .avatar-container[data-avatar-id] img[src]'
+    );
+    const src = sampleImg?.getAttribute('src') || '';
+    if (src && src.includes('User Avatars/') && !src.includes('thumbnail')) {
+      state.personaThumbnailUnsupported = true;
     }
   } catch (_e) {}
-  return `/User Avatars/${encodeURIComponent(avatarId)}`;
+}
+
+function resolvePersonaDirectAvatarUrl(avatarId) {
+  const clean = String(avatarId || '').trim();
+  if (!clean) return 'img/ai4.png';
+  const bust = state.avatarCacheBust.get(clean);
+  return `User Avatars/${encodeURIComponent(clean)}${bust ? `?t=${bust}` : ''}`;
+}
+
+function resolvePersonaAvatarUrl(avatarId) {
+  const clean = String(avatarId || '').trim();
+  if (!clean) return 'img/ai4.png';
+
+  detectHostPersonaAvatarMode();
+  const bust = state.avatarCacheBust.get(clean);
+
+  // 如果酒馆原生列表 DOM 中已有该人设头像节点且由美化/云端插件改写过有效地址，优先复用（除非刚更新过头像需强刷缓存）
+  if (!bust) {
+    try {
+      const domImg = document.querySelector(
+        `#user_avatar_block .avatar-container[data-avatar-id="${CSS.escape(clean)}"] img[src]`
+      );
+      const domSrc = domImg?.getAttribute('src')?.trim();
+      if (domSrc) return domSrc;
+    } catch (_e) {}
+  }
+
+  if (!state.personaThumbnailUnsupported) {
+    try {
+      const context = getContext();
+      if (typeof context.getThumbnailUrl === 'function') {
+        const thumbUrl = context.getThumbnailUrl('persona', clean);
+        return bust
+          ? `${thumbUrl}${thumbUrl.includes('?') ? '&' : '?'}t=${bust}`
+          : thumbUrl;
+      }
+    } catch (_e) {}
+  }
+
+  return resolvePersonaDirectAvatarUrl(clean);
+}
+
+/**
+ * 为面板容器绑定捕获阶段的头像加载失败自动降级链：
+ * 1) 若 /thumbnail?type=persona 返回 400/404（旧版 ST 或缩略图生成超时），自动标记并切换全部未加载头像到 User Avatars/<file> 原图直链
+ * 2) 若原图直链仍不存在，兜底显示酒馆默认人设剪影 img/ai4.png，绝不空白隐藏
+ */
+function bindAvatarErrorFallback(container) {
+  if (!container || container.dataset.avatarErrBound === '1') return;
+  container.dataset.avatarErrBound = '1';
+
+  container.addEventListener(
+    'error',
+    (e) => {
+      const img = e.target;
+      if (!(img instanceof HTMLImageElement)) return;
+      const avatarId = img.getAttribute('data-avatar-id');
+      if (!avatarId) return;
+
+      const currentSrc = img.getAttribute('src') || '';
+      const directSrc = img.getAttribute('data-fallback-src') || resolvePersonaDirectAvatarUrl(avatarId);
+
+      if (!img.dataset.triedDirect && currentSrc !== directSrc) {
+        img.dataset.triedDirect = '1';
+        if (currentSrc.includes('thumbnail') && currentSrc.includes('persona')) {
+          state.personaThumbnailUnsupported = true;
+          document
+            .querySelectorAll('img[data-avatar-id][data-fallback-src]')
+            .forEach((otherImg) => {
+              const otherSrc = otherImg.getAttribute('src') || '';
+              const otherDirect = otherImg.getAttribute('data-fallback-src') || '';
+              if (
+                otherImg !== img &&
+                !otherImg.dataset.triedDirect &&
+                otherDirect &&
+                otherSrc.includes('thumbnail') &&
+                otherSrc.includes('persona')
+              ) {
+                otherImg.dataset.triedDirect = '1';
+                otherImg.setAttribute('src', otherDirect);
+              }
+            });
+        }
+        img.setAttribute('src', directSrc);
+        return;
+      }
+
+      if (!img.dataset.triedDefault) {
+        img.dataset.triedDefault = '1';
+        img.setAttribute('src', 'img/ai4.png');
+      }
+    },
+    true
+  );
+}
+
+/**
+ * 直接在插件中触发上传新建人设头像 / 更换指定人设头像（无需先切去原生人设栏目）
+ */
+async function triggerPersonaAvatarUpload({ targetAvatarId = '' } = {}) {
+  if (targetAvatarId) {
+    const activeId = getActiveAvatarId();
+    if (activeId !== targetAvatarId) {
+      await switchActivePersona(targetAvatarId);
+    }
+    const setBtn = document.querySelector('#persona_set_image_button');
+    if (setBtn) {
+      setBtn.click();
+      return;
+    }
+    const overwriteInput = document.querySelector('#avatar_upload_overwrite');
+    if (overwriteInput) overwriteInput.value = targetAvatarId;
+    document.querySelector('#avatar_upload_file')?.click();
+    return;
+  }
+
+  const uploadTrigger = document.querySelector('#user_avatar_block .avatar_upload');
+  if (uploadTrigger) {
+    uploadTrigger.click();
+  } else {
+    const overwriteInput = document.querySelector('#avatar_upload_overwrite');
+    if (overwriteInput) overwriteInput.value = '';
+    document.querySelector('#avatar_upload_file')?.click();
+  }
 }
 
 /**
@@ -964,7 +1120,7 @@ function getHostPersonas() {
       node.getAttribute('title') ||
       avatarId;
     const domDesc = node.querySelector('.ch_description')?.textContent?.trim() || '';
-    const imgSrc = node.querySelector('img')?.getAttribute('src') || resolvePersonaAvatarUrl(avatarId);
+    const resolvedSrc = resolvePersonaAvatarUrl(avatarId);
     const isSelected = node.classList.contains('selected') || avatarId === activeAvatarId;
     const descObj = descMap[avatarId] || {};
 
@@ -978,15 +1134,39 @@ function getHostPersonas() {
         connections: Array.isArray(descObj.connections) ? descObj.connections : [],
         lukerDedicatedChars: [],
         isLukerCharacterOnly: false,
-        avatarUrl: imgSrc,
+        avatarUrl: resolvedSrc,
         isActive: isSelected,
       });
     } else {
       const existing = resultMap.get(avatarId);
       if (isSelected) existing.isActive = true;
-      if (imgSrc) existing.avatarUrl = imgSrc;
+      if (resolvedSrc) existing.avatarUrl = resolvedSrc;
     }
   });
+
+  // 标准 SillyTavern 兼容：若磁盘 User Avatars/ 下有尚未经原生人设面板首次打开注册的新头像文件，直接补齐显示（Luker 因存在卡内专属文件不自动升为全局）
+  const isLukerHost =
+    typeof state.hostPersonasModule?.getDedicatedPersonaEntriesFromCharacter === 'function' ||
+    typeof state.hostPersonasModule?.setCharacterDedicatedPersonaEntries === 'function';
+  if (!isLukerHost && hasDiskFilter) {
+    for (const diskFile of state.diskAvatarSet) {
+      if (!resultMap.has(diskFile)) {
+        const descObj = descMap[diskFile] || {};
+        resultMap.set(diskFile, {
+          avatarId: diskFile,
+          name: String(personasMap[diskFile] || diskFile.replace(/\.(png|webp|jpg|jpeg|gif)$/i, '')),
+          description: String(descObj.description ?? ''),
+          lorebook: String(descObj.lorebook ?? ''),
+          title: String(descObj.title ?? ''),
+          connections: Array.isArray(descObj.connections) ? descObj.connections : [],
+          lukerDedicatedChars: [],
+          isLukerCharacterOnly: false,
+          avatarUrl: resolvePersonaAvatarUrl(diskFile),
+          isActive: diskFile === activeAvatarId,
+        });
+      }
+    }
+  }
 
   const list = [...resultMap.values()];
   for (const item of list) {
@@ -1729,11 +1909,24 @@ function closeTopmostWardrobeModal() {
   return false;
 }
 
-function openNativePersonaDrawer() {
+function openNativePersonaDrawer({ fromWandClick = false } = {}) {
   removeReturnToWardrobePill();
-  const extMenu = document.querySelector('#extensionsMenu');
-  if (extMenu && window.getComputedStyle(extMenu).display !== 'none') {
-    extMenu.style.display = 'none';
+  if (!fromWandClick) {
+    const extMenu = document.querySelector('#extensionsMenu');
+    const extBtn = document.querySelector('#extensionsMenuButton');
+    if (extMenu && window.getComputedStyle(extMenu).display !== 'none') {
+      if (extBtn) {
+        extBtn.click();
+      } else {
+        extMenu.style.display = 'none';
+      }
+    }
+  }
+  if (!state.diskAvatarFetched || !state.diskAvatarSet || state.diskAvatarSet.size === 0) {
+    refreshDiskAvatarSet().then(() => {
+      invalidateRenderedHtmlCache();
+      refreshAllViews();
+    });
   }
   const drawerContent = document.querySelector('#PersonaManagement');
   const drawerToggle =
@@ -2393,8 +2586,19 @@ globalThis.PersonaWardrobe_interceptGeneration = async function (
 function openWardrobeModal(initialAvatarId = null) {
   removeReturnToWardrobePill();
   const extMenu = document.querySelector('#extensionsMenu');
+  const extBtn = document.querySelector('#extensionsMenuButton');
   if (extMenu && window.getComputedStyle(extMenu).display !== 'none') {
-    extMenu.style.display = 'none';
+    if (extBtn) {
+      extBtn.click();
+    } else {
+      extMenu.style.display = 'none';
+    }
+  }
+  if (!state.diskAvatarFetched || !state.diskAvatarSet || state.diskAvatarSet.size === 0) {
+    refreshDiskAvatarSet().then(() => {
+      invalidateRenderedHtmlCache();
+      renderWardrobeModalContent({ force: true });
+    });
   }
   const personas = getHostPersonas();
   const activeId = getActiveAvatarId();
@@ -2412,6 +2616,7 @@ function openWardrobeModal(initialAvatarId = null) {
     document.body.appendChild(modal);
   }
   bindModalBackdropEvents(modal);
+  bindAvatarErrorFallback(modal);
 
   modal.classList.remove('st-pw-hidden');
   renderWardrobeModalContent({ force: true });
@@ -2424,9 +2629,10 @@ function renderPersonaRowHtml(p, selectedAvatarId) {
   const presetCount = Array.isArray(p.meta.presets) ? p.meta.presets.length : 0;
   const usage = getPersonaUsageSummary(p.avatarId);
   const hasUsage = usage.charCount > 0 || usage.chatCount > 0 || usage.durationMs > 0;
+  const fallbackAvatarUrl = resolvePersonaDirectAvatarUrl(p.avatarId);
   return `
     <div class="st-pw-persona-item ${isSelected ? 'is-selected' : ''} ${p.isActive ? 'is-active-user' : ''}" data-avatar-id="${escapeAttr(p.avatarId)}">
-      <img class="st-pw-item-avatar" src="${escapeAttr(p.avatarUrl)}" alt="" onerror="this.style.visibility='hidden'" />
+      <img class="st-pw-item-avatar" src="${escapeAttr(p.avatarUrl)}" data-avatar-id="${escapeAttr(p.avatarId)}" data-fallback-src="${escapeAttr(fallbackAvatarUrl)}" loading="lazy" decoding="async" alt="" />
       <div class="st-pw-item-main">
         <div class="st-pw-item-title-line">
           <span class="st-pw-item-name">${sanitizeHtml(p.name)}</span>
@@ -2620,7 +2826,7 @@ function renderWardrobeModalContent({ force = false } = {}) {
     ? activeMeta.traits.filter((t) => t.enabled && String(t.content || '').trim())
     : [];
 
-  modal.innerHTML = `
+  const nextModalHtml = `
     <div class="st-pw-wardrobe-dialog" role="dialog" aria-modal="true">
       <div class="st-pw-modal-header">
         <div class="st-pw-header-left">
@@ -2655,7 +2861,15 @@ function renderWardrobeModalContent({ force = false } = {}) {
 
       <div class="st-pw-workbench">
         <aside class="st-pw-sidebar">
-          <input type="search" id="st_pw_search_input" class="text_pole st-pw-sidebar-search" placeholder="搜索 User、角色组、自定义组、世界书…" value="${escapeAttr(state.searchQuery)}" />
+          <div class="st-pw-inline-left-top">
+            <input type="search" id="st_pw_search_input" class="text_pole st-pw-sidebar-search" placeholder="搜索 User、角色组、自定义组、世界书…" value="${escapeAttr(state.searchQuery)}" />
+            <button type="button" class="menu_button st-pw-mini-btn st-pw-modal-create-btn" title="调用原生新建人设">
+              <i class="fa-solid fa-plus"></i> 新建
+            </button>
+            <button type="button" class="menu_button st-pw-mini-btn st-pw-modal-upload-btn" title="上传头像新建人设">
+              <i class="fa-solid fa-image"></i> 头像
+            </button>
+          </div>
 
           <!-- 快捷创建组：按角色建组（把多个 User 绑到同一角色下自动成组） / 新建自定义组 -->
           <div class="st-pw-sidebar-create-bar">
@@ -2702,7 +2916,42 @@ function renderWardrobeModalContent({ force = false } = {}) {
     </div>
   `;
 
+  if (modal.childElementCount > 0 && nextModalHtml === state.lastModalRenderedHtml) {
+    return;
+  }
+
+  const prevListEl = modal.querySelector('.st-pw-persona-list');
+  const prevDetailEl = modal.querySelector('.st-pw-detail-pane');
+  const savedListScroll = prevListEl ? prevListEl.scrollTop : state.savedModalListScrollTop;
+  const savedDetailScroll = prevDetailEl ? prevDetailEl.scrollTop : state.savedModalDetailScrollTop;
+
+  state.lastModalRenderedHtml = nextModalHtml;
+  modal.innerHTML = nextModalHtml;
+  bindAvatarErrorFallback(modal);
   bindWardrobeModalEvents(modal, selectedPersona, personas);
+
+  const nextListEl = modal.querySelector('.st-pw-persona-list');
+  const nextDetailEl = modal.querySelector('.st-pw-detail-pane');
+  if (nextListEl) {
+    nextListEl.scrollTop = savedListScroll;
+    nextListEl.addEventListener(
+      'scroll',
+      () => {
+        state.savedModalListScrollTop = nextListEl.scrollTop;
+      },
+      { passive: true }
+    );
+  }
+  if (nextDetailEl) {
+    nextDetailEl.scrollTop = savedDetailScroll;
+    nextDetailEl.addEventListener(
+      'scroll',
+      () => {
+        state.savedModalDetailScrollTop = nextDetailEl.scrollTop;
+      },
+      { passive: true }
+    );
+  }
 }
 
 /**
@@ -2904,11 +3153,14 @@ function renderSelectedPersonaDetail(persona, availableBooks, hostChars, current
   return `
     <div class="st-pw-detail-top">
       <div class="st-pw-detail-user-row">
-        <img class="st-pw-detail-avatar" src="${escapeAttr(persona.avatarUrl)}" alt="" onerror="this.style.visibility='hidden'" />
+        <img class="st-pw-detail-avatar" src="${escapeAttr(persona.avatarUrl)}" data-avatar-id="${escapeAttr(persona.avatarId)}" data-fallback-src="${escapeAttr(resolvePersonaDirectAvatarUrl(persona.avatarId))}" decoding="async" alt="" />
         <div class="st-pw-detail-user-info">
           <div class="st-pw-detail-name-line">
             <strong>${sanitizeHtml(persona.name)}</strong>
             <span class="st-pw-mono-id">${sanitizeHtml(persona.avatarId)}</span>
+            <button type="button" class="menu_button st-pw-mini-btn st-pw-change-avatar-btn" data-avatar-id="${escapeAttr(persona.avatarId)}" title="直接上传更换该 User 的头像">
+              <i class="fa-solid fa-image"></i> 换头像
+            </button>
           </div>
           <div class="st-pw-detail-meta-inputs">
             <select id="st_pw_detail_group" class="text_pole" title="所属自定义分组">
@@ -3112,9 +3364,29 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
     modal.classList.add('st-pw-hidden');
   });
 
-  modal.querySelector('.st-pw-refresh-host-btn')?.addEventListener('click', () => {
+  modal.querySelector('.st-pw-refresh-host-btn')?.addEventListener('click', async () => {
+    await refreshDiskAvatarSet();
+    invalidateRenderedHtmlCache();
     refreshAllViews();
-    globalThis.toastr?.info?.('已刷新');
+    globalThis.toastr?.info?.('已同步头像与人设列表');
+  });
+
+  modal.querySelector('.st-pw-modal-create-btn')?.addEventListener('click', () => {
+    document.querySelector('#create_dummy_persona')?.click();
+  });
+
+  modal.querySelector('.st-pw-modal-upload-btn')?.addEventListener('click', async () => {
+    await triggerPersonaAvatarUpload({ targetAvatarId: '' });
+  });
+
+  modal.querySelectorAll('.st-pw-change-avatar-btn').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const targetId = btn.getAttribute('data-avatar-id') || selectedPersona?.avatarId || '';
+      if (targetId) {
+        await triggerPersonaAvatarUpload({ targetAvatarId: targetId });
+      }
+    });
   });
 
   modal.querySelector('.st-pw-preview-active-prompt-btn')?.addEventListener('click', async () => {
@@ -3767,7 +4039,7 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
             <i class="fa-solid fa-chevron-${isCollapsed ? 'right' : 'down'} st-pw-folder-arrow"></i>
             ${
               cg.avatarUrl
-                ? `<img class="st-pw-folder-char-avatar" src="${escapeAttr(cg.avatarUrl)}" alt="" onerror="this.style.display='none'" />`
+                ? `<img class="st-pw-folder-char-avatar" src="${escapeAttr(cg.avatarUrl)}" loading="lazy" decoding="async" alt="" onerror="this.style.display='none'" />`
                 : `<i class="fa-solid fa-user-tag st-pw-folder-icon"></i>`
             }
             <span class="st-pw-folder-name">${sanitizeHtml(cg.name)}</span>
@@ -3919,6 +4191,9 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
     state.selectedAvatarId = targetPersona.avatarId;
   }
 
+  const drawerEl = document.querySelector('#PersonaManagement');
+  const rightCol = document.querySelector('#PersonaManagement .persona_management_right_column');
+
   // ==================== 1. 左栏原位接管 (.persona_management_left_column) ====================
   if (leftCol) {
     let leftPanel = existingLeftPanel;
@@ -3928,6 +4203,7 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
       leftPanel.className = 'st-pw-inline-left-panel';
       leftCol.insertBefore(leftPanel, leftCol.firstChild);
     }
+    bindAvatarErrorFallback(leftPanel);
 
     // 如果用户正在展开左栏的下拉菜单 (<select>)，不要在后台重绘冲掉已打开的下拉框
     const isLeftSelectFocused =
@@ -3939,7 +4215,7 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
     if (!isLeftSelectFocused) {
       if (state.useRawNativeLeftList) {
         leftCol.classList.remove('st-pw-left-taken');
-        leftPanel.innerHTML = `
+        const rawBarHtml = `
           <div class="st-pw-raw-mode-bar">
             <span class="st-pw-muted">当前为原生平铺列表</span>
             <button type="button" class="menu_button st-pw-mini-btn st-pw-toggle-raw-list-btn">
@@ -3947,10 +4223,14 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
             </button>
           </div>
         `;
-        leftPanel.querySelector('.st-pw-toggle-raw-list-btn')?.addEventListener('click', () => {
-          state.useRawNativeLeftList = false;
-          syncNativePersonaPanelEnhancement({ forceRight: true });
-        });
+        if (leftPanel.childElementCount === 0 || state.lastLeftRenderedHtml !== rawBarHtml) {
+          state.lastLeftRenderedHtml = rawBarHtml;
+          leftPanel.innerHTML = rawBarHtml;
+          leftPanel.querySelector('.st-pw-toggle-raw-list-btn')?.addEventListener('click', () => {
+            state.useRawNativeLeftList = false;
+            syncNativePersonaPanelEnhancement({ forceRight: true });
+          });
+        }
       } else {
         leftCol.classList.add('st-pw-left-taken');
         const q = state.searchQuery.trim().toLowerCase();
@@ -3959,7 +4239,7 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
           document.activeElement.id === 'st_pw_inline_search_input';
         const searchCursorPos = wasSearchFocused ? document.activeElement.selectionStart : null;
 
-        leftPanel.innerHTML = `
+        const nextLeftHtml = `
           <div class="st-pw-inline-left-top">
             <input type="search" id="st_pw_inline_search_input" class="text_pole st-pw-sidebar-search" placeholder="搜索 User、角色组、自定义组、世界书…" value="${escapeAttr(state.searchQuery)}" />
             <button type="button" class="menu_button st-pw-mini-btn st-pw-inline-create-btn" title="调用原生新建人设">
@@ -3968,6 +4248,11 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
             <button type="button" class="menu_button st-pw-mini-btn st-pw-inline-upload-btn" title="上传头像新建人设">
               <i class="fa-solid fa-image"></i> 头像
             </button>
+            ${
+              targetPersona
+                ? `<button type="button" class="menu_button st-pw-mini-btn st-pw-inline-change-avatar-btn" title="更换当前选中 User 的头像">换图</button>`
+                : ''
+            }
             <button type="button" class="menu_button st-pw-mini-btn st-pw-toggle-raw-list-btn" title="切换到酒馆原生平铺列表">
               原生列表
             </button>
@@ -4005,58 +4290,104 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
           </div>
         `;
 
-        if (wasSearchFocused) {
-          const nextInput = leftPanel.querySelector('#st_pw_inline_search_input');
-          if (nextInput) {
-            nextInput.focus();
-            if (typeof searchCursorPos === 'number') {
-              nextInput.setSelectionRange(searchCursorPos, searchCursorPos);
+        // 关键防回顶保护：若左栏 HTML 无任何实质变化，绝不重写 innerHTML（0 节点销毁、0 滚动跳回）
+        if (leftPanel.childElementCount === 0 || nextLeftHtml !== state.lastLeftRenderedHtml) {
+          const prevInlineList = leftPanel.querySelector('.st-pw-inline-persona-list');
+          const savedInlineScroll = prevInlineList
+            ? prevInlineList.scrollTop
+            : state.savedInlineListScrollTop;
+          const savedDrawerScroll = drawerEl ? drawerEl.scrollTop : 0;
+          const savedLeftColScroll = leftCol ? leftCol.scrollTop : 0;
+          const prevHeight = leftPanel.offsetHeight;
+          if (prevHeight > 0) {
+            leftPanel.style.minHeight = `${prevHeight}px`;
+          }
+
+          state.lastLeftRenderedHtml = nextLeftHtml;
+          leftPanel.innerHTML = nextLeftHtml;
+
+          if (wasSearchFocused) {
+            const nextInput = leftPanel.querySelector('#st_pw_inline_search_input');
+            if (nextInput) {
+              nextInput.focus({ preventScroll: true });
+              if (typeof searchCursorPos === 'number') {
+                nextInput.setSelectionRange(searchCursorPos, searchCursorPos);
+              }
             }
           }
-        }
 
-        leftPanel.querySelector('#st_pw_inline_search_input')?.addEventListener('input', (e) => {
-          state.searchQuery = e.target.value;
-          syncNativePersonaPanelEnhancement();
-        });
-
-        leftPanel.querySelector('.st-pw-inline-create-btn')?.addEventListener('click', () => {
-          document.querySelector('#create_dummy_persona')?.click();
-        });
-
-        leftPanel.querySelector('.st-pw-inline-upload-btn')?.addEventListener('click', () => {
-          const uploadTrigger = document.querySelector('#user_avatar_block .avatar_upload');
-          if (uploadTrigger) {
-            uploadTrigger.click();
-          } else {
-            const overwriteInput = document.querySelector('#avatar_upload_overwrite');
-            if (overwriteInput) overwriteInput.value = '';
-            document.querySelector('#avatar_upload_file')?.click();
-          }
-        });
-
-        leftPanel.querySelector('.st-pw-toggle-raw-list-btn')?.addEventListener('click', () => {
-          state.useRawNativeLeftList = true;
-          syncNativePersonaPanelEnhancement({ forceRight: true });
-        });
-
-        // 使用与主窗口一致的分组树交互绑定
-        bindWardrobeModalEvents(leftPanel, targetPersona, personas);
-
-        // 在原生人设栏目左栏点击某个人设行时，直接切换为该人设（联动右栏原生表单）
-        leftPanel.querySelectorAll('.st-pw-persona-item').forEach((card) => {
-          card.addEventListener('click', async (e) => {
-            if (e.target.closest('.st-pw-fav-btn') || e.target.closest('.st-pw-use-persona-btn')) {
-              return;
-            }
-            const id = card.getAttribute('data-avatar-id');
-            if (!id) return;
-            state.selectedAvatarId = id;
-            state.expandedTraitIdx = null;
-            await switchActivePersona(id);
-            refreshAllViews();
+          leftPanel.querySelector('#st_pw_inline_search_input')?.addEventListener('input', (e) => {
+            state.searchQuery = e.target.value;
+            state.savedInlineListScrollTop = 0;
+            syncNativePersonaPanelEnhancement();
           });
-        });
+
+          leftPanel.querySelector('.st-pw-inline-create-btn')?.addEventListener('click', () => {
+            document.querySelector('#create_dummy_persona')?.click();
+          });
+
+          leftPanel.querySelector('.st-pw-inline-upload-btn')?.addEventListener('click', async () => {
+            await triggerPersonaAvatarUpload({ targetAvatarId: '' });
+          });
+
+          leftPanel
+            .querySelector('.st-pw-inline-change-avatar-btn')
+            ?.addEventListener('click', async () => {
+              if (targetPersona?.avatarId) {
+                await triggerPersonaAvatarUpload({ targetAvatarId: targetPersona.avatarId });
+              }
+            });
+
+          leftPanel.querySelector('.st-pw-toggle-raw-list-btn')?.addEventListener('click', () => {
+            state.useRawNativeLeftList = true;
+            syncNativePersonaPanelEnhancement({ forceRight: true });
+          });
+
+          // 使用与主窗口一致的分组树交互绑定
+          bindWardrobeModalEvents(leftPanel, targetPersona, personas);
+
+          // 在原生人设栏目左栏点击某个人设行时，直接切换为该人设（联动右栏原生表单）
+          leftPanel.querySelectorAll('.st-pw-persona-item').forEach((card) => {
+            card.addEventListener('click', async (e) => {
+              if (
+                e.target.closest('.st-pw-fav-btn') ||
+                e.target.closest('.st-pw-use-persona-btn')
+              ) {
+                return;
+              }
+              const id = card.getAttribute('data-avatar-id');
+              if (!id) return;
+              state.selectedAvatarId = id;
+              state.expandedTraitIdx = null;
+              await switchActivePersona(id);
+              refreshAllViews();
+            });
+          });
+
+          const nextInlineList = leftPanel.querySelector('.st-pw-inline-persona-list');
+          if (nextInlineList) {
+            nextInlineList.scrollTop = savedInlineScroll;
+            nextInlineList.addEventListener(
+              'scroll',
+              () => {
+                state.savedInlineListScrollTop = nextInlineList.scrollTop;
+              },
+              { passive: true }
+            );
+          }
+          if (leftCol) leftCol.scrollTop = savedLeftColScroll;
+          if (drawerEl) drawerEl.scrollTop = savedDrawerScroll;
+
+          requestAnimationFrame(() => {
+            leftPanel.style.minHeight = '';
+            if (nextInlineList && Math.abs(nextInlineList.scrollTop - savedInlineScroll) > 2) {
+              nextInlineList.scrollTop = savedInlineScroll;
+            }
+            if (drawerEl && Math.abs(drawerEl.scrollTop - savedDrawerScroll) > 2) {
+              drawerEl.scrollTop = savedDrawerScroll;
+            }
+          });
+        }
       }
     }
   }
@@ -4108,7 +4439,7 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
     (c) => !meta.boundCharacters.some((bc) => bc.toLowerCase() === c.name.toLowerCase())
   );
 
-  rightPanel.innerHTML = `
+  const nextRightHtml = `
     <!-- 0. 使用足迹统计（聊过几个角色卡 · 几个聊天档 · 聊了多久） -->
     ${renderUsageStatsBlockHtml(targetPersona)}
 
@@ -4285,11 +4616,35 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
     </div>
   `;
 
+  if (rightPanel.childElementCount > 0 && nextRightHtml === state.lastRightRenderedHtml) {
+    return;
+  }
+
+  const savedDrawerScroll = drawerEl ? drawerEl.scrollTop : 0;
+  const savedRightColScroll = rightCol ? rightCol.scrollTop : 0;
+  const prevRightHeight = rightPanel.offsetHeight;
+  if (prevRightHeight > 0) {
+    rightPanel.style.minHeight = `${prevRightHeight}px`;
+  }
+
+  state.lastRightRenderedHtml = nextRightHtml;
+  rightPanel.innerHTML = nextRightHtml;
+  bindAvatarErrorFallback(rightPanel);
+
   rightPanel.querySelector('.st-pw-native-wardrobe-btn')?.addEventListener('click', () => {
     openWardrobeModal(targetPersona.avatarId);
   });
 
   bindWardrobeModalEvents(rightPanel, targetPersona, personas);
+
+  if (rightCol) rightCol.scrollTop = savedRightColScroll;
+  if (drawerEl) drawerEl.scrollTop = savedDrawerScroll;
+  requestAnimationFrame(() => {
+    rightPanel.style.minHeight = '';
+    if (drawerEl && Math.abs(drawerEl.scrollTop - savedDrawerScroll) > 2) {
+      drawerEl.scrollTop = savedDrawerScroll;
+    }
+  });
 }
 
 function syncQuickEntryButtons() {
@@ -4334,8 +4689,9 @@ function syncQuickEntryButtons() {
         <div class="fa-solid fa-id-card-clip extensionsMenuExtensionButton"></div>
         <span>User 人设管理</span>
       `;
-      item.addEventListener('click', () => {
-        openNativePersonaDrawer();
+      item.addEventListener('click', (e) => {
+        e.preventDefault();
+        openNativePersonaDrawer({ fromWandClick: true });
       });
       extMenu.appendChild(item);
     }
@@ -4576,7 +4932,7 @@ async function initExtension() {
     document.removeEventListener('touchstart', onUserActivity);
   });
 
-  // 实时聊天活跃计时器：当打开某个角色聊天且最近 2 分钟内有交互时，每 15 秒为当前激活 User 累加活跃时长
+  // 实时聊天活跃计时器：仅在内存中静默累加活跃时长，绝不在定时器中调用 saveSettings() 触发全局 SETTINGS_UPDATED 导致滚动回顶
   const liveTimerId = setInterval(() => {
     try {
       if (document.hidden) return;
@@ -4599,18 +4955,45 @@ async function initExtension() {
       } else {
         meta.usageStats.extraLiveMs = (Number(meta.usageStats.extraLiveMs) || 0) + 15_000;
       }
-      const isPersonaDrawerOpen = document
-        .querySelector('#PersonaManagement')
-        ?.classList.contains('openDrawer');
-      const isWardrobeModalOpen =
-        document.querySelector('#st_pw_wardrobe_modal') &&
-        !document.querySelector('#st_pw_wardrobe_modal').classList.contains('st-pw-hidden');
-      if (!isPersonaDrawerOpen && !isWardrobeModalOpen) {
-        saveSettings();
-      }
+      state.lastUsageDirty = true;
     } catch (_e) {}
   }, 15_000);
   state.disposers.push(() => clearInterval(liveTimerId));
+
+  const onVisibilityChange = () => {
+    if (document.hidden && state.lastUsageDirty) {
+      state.lastUsageDirty = false;
+      saveSettings();
+    }
+  };
+  document.addEventListener('visibilitychange', onVisibilityChange);
+  state.disposers.push(() => document.removeEventListener('visibilitychange', onVisibilityChange));
+
+  // 监听原生头像上传文件框 (#avatar_upload_file)：无需先去原生列表，上传或更换头像后自动破除缩略图缓存并刷新插件头像
+  const onAvatarFileSelected = (e) => {
+    const target = e.target;
+    if (!(target instanceof HTMLInputElement) || target.id !== 'avatar_upload_file') return;
+    if (!target.files || target.files.length === 0) return;
+    const overwriteName =
+      document.querySelector('#avatar_upload_overwrite')?.value?.trim() || getActiveAvatarId();
+    for (const delayMs of [700, 2000, 4200]) {
+      setTimeout(async () => {
+        const now = Date.now();
+        if (overwriteName) {
+          state.avatarCacheBust.set(overwriteName, now);
+        }
+        const curActive = getActiveAvatarId();
+        if (curActive) {
+          state.avatarCacheBust.set(curActive, now);
+        }
+        await refreshDiskAvatarSet();
+        invalidateRenderedHtmlCache();
+        refreshAllViews();
+      }, delayMs);
+    }
+  };
+  document.addEventListener('change', onAvatarFileSelected, true);
+  state.disposers.push(() => document.removeEventListener('change', onAvatarFileSelected, true));
 
   // 注意：只监听顶栏笑脸抽屉开关按钮 (.drawer-toggle)，绝不能绑定在父容器 #persona-management-button 上，
   // 否则在 #PersonaManagement 内部点击 <select> 世界书下拉框会冒泡触发 30ms 重绘并直接销毁展开中的下拉菜单！
@@ -4638,13 +5021,33 @@ async function initExtension() {
         state.disposers.push(() => eventSource.removeListener?.(evtName, handler));
       };
 
-      const onChatMessageActivity = () => {
-        state.lastUserInteractionAt = Date.now();
+      const onAppOrSettingsLoaded = async () => {
+        await probeHostModules();
+        await refreshDiskAvatarSet();
+        invalidateRenderedHtmlCache();
         recordCurrentOpenChatStats();
         refreshAllViews();
       };
 
-      subscribe(event_types.CHAT_CHANGED, onChatChanged);
+      const onChatMessageActivity = () => {
+        state.lastUserInteractionAt = Date.now();
+        if (state.lastUsageDirty) {
+          state.lastUsageDirty = false;
+          saveSettings();
+        }
+        recordCurrentOpenChatStats();
+        refreshAllViews();
+      };
+
+      subscribe(event_types.APP_READY, onAppOrSettingsLoaded);
+      subscribe(event_types.SETTINGS_LOADED_AFTER, onAppOrSettingsLoaded);
+      subscribe(event_types.CHAT_CHANGED, () => {
+        if (state.lastUsageDirty) {
+          state.lastUsageDirty = false;
+          saveSettings();
+        }
+        onChatChanged();
+      });
       subscribe(event_types.MESSAGE_SENT, onChatMessageActivity);
       subscribe(event_types.MESSAGE_RECEIVED, onChatMessageActivity);
       subscribe(event_types.GENERATION_ENDED, onChatMessageActivity);
@@ -4659,12 +5062,20 @@ async function initExtension() {
       });
       subscribe(event_types.PERSONA_CREATED, async () => {
         await refreshDiskAvatarSet();
+        invalidateRenderedHtmlCache();
         refreshAllViews();
       });
-      subscribe(event_types.PERSONA_UPDATED, refreshAllViews);
-      subscribe(event_types.PERSONA_RENAMED, refreshAllViews);
+      subscribe(event_types.PERSONA_UPDATED, () => {
+        invalidateRenderedHtmlCache();
+        refreshAllViews();
+      });
+      subscribe(event_types.PERSONA_RENAMED, () => {
+        invalidateRenderedHtmlCache();
+        refreshAllViews();
+      });
       subscribe(event_types.PERSONA_DELETED, async () => {
         await refreshDiskAvatarSet();
+        invalidateRenderedHtmlCache();
         refreshAllViews();
       });
     }
