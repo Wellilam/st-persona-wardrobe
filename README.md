@@ -1,54 +1,56 @@
 # Persona Wardrobe (User 人设与世界书总管)
 
-专为 **SillyTavern** 设计的 User 人设（Persona）分类管理与关联世界书增强扩展。解决「User 攒太多找不到」与「原生绑定世界书无法直接跳转、只能绑一本、不方便临时开关设定」的痛点。
+专为 **SillyTavern**、**Luker** 与 **TauriTavern (TRT)** 全端（桌面端 & Android / iOS / HarmonyOS 移动端）设计的 User 人设（Persona）分类管理、状态快照与关联世界书增强扩展。
+
+原位接管酒馆顶栏原生人设抽屉（`#PersonaManagement`），并保留一键切换原生平铺列表与独立双栏总管窗口。
+
+---
+
+## 多宿主兼容矩阵
+
+| 宿主前端 | 兼容特性 |
+|---|---|
+| **SillyTavern** (`v1.14+` ~ `v1.19+` / Termux) | 原位接管 `#PersonaManagement`、磁盘 `/api/avatars/get` 去重过滤、旧版头像直链自动降级（无需先打开原生列表）、防 `SETTINGS_UPDATED` 滚动回顶 |
+| **Luker** (`funnycups/Luker`) | 识别并去重合并 `character.data.extensions.luker.dedicated_personas` 卡内专属人设、移动端 `html` transform 视口定位修复、阻止抽屉穿透收起 |
+| **TauriTavern / TRT** (`Darkatse/TauriTavern`) | 等待 `__TAURITAVERN__.ready` 延迟激活、全量异步 `<dialog>` 输入/确认弹窗（规避原生 WebView 禁用 `prompt`/`confirm`）、接入 `__TAURITAVERN_HANDLE_BACK__` 安卓/鸿蒙侧滑返回手势、支持 `api.worldInfo.openEntry` 条目深链定位、适配 `download-bridge` 异步导出与软键盘视口压缩 |
 
 ---
 
 ## 核心功能
 
-### 1. 原生 User 绑定世界书：一键跳转 + 弹窗内直接看/改条目
-- **像角色世界书一样一键跳转 (`↗ 跳转世界书面板`)**：
-  - 在原生 User 面板旁、扩展抽屉或衣柜大面板中点击「跳转世界书面板」，自动展开酒馆顶部「世界书（World Info）」抽屉并在 `#world_editor_select` 中定位打开该世界书。
-  - 从衣柜大面板跳转后，右下角会自动悬浮 **「← 点击返回 User 人设衣柜」** 胶囊按钮，改完一键回衣柜。
-- **不切页面直接改条目 (`📖 弹窗管理条目`)**：
-  - 点击即可在弹窗中直接读取该世界书的所有条目，支持按标题/关键词/内容搜索、一键开关条目启用状态、切换「🔵 常驻生效 / 🟢 关键词触发」、直接修改触发词与正文或新增条目，并保存回酒馆世界书。
+### 1. 原位接管人设栏目：角色自动归组 + 自定义分组 + 精准去重
+- **按角色自动成组**：同一角色卡下绑定的多个 User 自动归为以该角色命名的折叠文件夹（当前聊天角色自动置顶），同时支持自定义分组、收藏筛选与 `全部 / 全局 / 卡内专属 / 已聊过` 维度筛选。
+- **精准数量校核**：自动校核 `/api/avatars/get` 过滤已删头像残留键，并自动合并跨卡重复的卡内专属人设。
+- **直接管理头像**：内置 `[头像]` 与 `[换图]` / `[换头像]` 按钮，上传后自动刷新缩略图与原图缓存。
 
-### 2. 多 User 档案衣柜（解决 User 太多难翻找）
-- **自定义分类标签与收藏置顶**：支持按世界观/题材分组（如 `现代都市`、`西幻奇幻`、`赛博科幻`、`古风仙侠`、`无限流` 及任意自定义分组）、★ 收藏置顶、多标签与私密备注。
-- **全文检索与一键切换**：支持按 User 名字、人设描述、标签、绑定的世界书名或常用关联角色卡名称实时检索，点「切换」即刻同步切换当前 User。
-- **关联角色卡提醒**：可为 User 填写常配的角色卡名字，切换到对应角色聊天时自动提示切换。
+### 2. User 变体克隆 & 状态快照预设
+- **状态快照**：一键把当前人设描述、主世界书（含各条目启用/常驻开关）、附加世界书与随身设定保存为命名快照（如「日常态」「战斗态」「IF线」），随时一键切回。
+- **完整克隆变体**：支持将当前 User 或任意快照一键克隆为全新独立 User 档案（含头像复制）。
 
-### 3. 关联多本世界书 & 模块化随身设定卡（A + B + C）
-- **A · 随身设定卡片**：在每个 User 下直接创建可勾选开关的设定模块（如「表面身份」「隐藏过往」「当前服装/状态」「人际关系」），支持常驻或关键词触发，无需每次单独建世界书。
-- **B · 附加关联多本世界书**：突破酒馆原生一个 User 只能绑 1 本世界书的限制，可为单个 User 额外关联多本现有世界书，切换 User 时自动按该 User 的关联书目与条目规则扫描注入。
-- **C · 顶部当前生效总览与预览**：面板顶部实时显示当前激活的 User、主世界书、已开启的附加世界书与随身设定卡数量，点击「预览当前生效设定」即可查看本轮实际注入内容。
+### 3. 使用足迹统计（聊了几个角色卡 · 几个聊天档 · 聊了多久）
+- 实时统计当前聊天互动，并支持 **「扫描历史档」** 一键回溯酒馆内所有历史聊天记录，展示每个 User 聊过的角色卡数、聊天档数、消息轮数、累计活跃时长及按角色展开明细。
+
+### 4. 主世界书 + 多本附加世界书 + 随身设定卡
+- **世界书一键跳转 & 条目定位**：支持直接跳转到酒馆世界书编辑器（在 TauriTavern 下支持 `api.worldInfo.openEntry` 直接定位具体条目），附带左下角 **「← 返回人设」** 悬浮胶囊。
+- **弹窗内快改条目**：无需离开当前页面即可搜索、开关、切换常驻/关键词触发或增删改世界书条目。
+- **突破单书限制**：每个 User 可额外关联多本世界书并配置独立随身设定片段，支持 **「生效预览」** 查看本轮实际注入内容。
 
 ---
 
 ## 安装方式
 
-### 方式一：上传到 GitHub 后在酒馆内通过 Git 链接安装（推荐）
-1. 将本目录推送到你的 GitHub 仓库（例如 `https://github.com/<你的用户名>/st-persona-wardrobe`）。
-2. 打开 SillyTavern → 顶部 **扩展（Extensions）** → **安装扩展（Install Extension）**。
-3. 粘贴你的仓库地址并安装，刷新页面即可使用。
+### 方式一：通过 Git 链接在线安装（推荐，支持 SillyTavern / Luker / TauriTavern）
+1. 打开酒馆顶部 **扩展（Extensions）** → **安装扩展（Install Extension）**。
+2. 粘贴仓库地址：`https://github.com/Wellilam/st-persona-wardrobe`
+3. 安装后刷新页面（或在 TauriTavern 中重新进入）即可直接使用。
 
-### 方式二：直接放入本地酒馆目录
-将 `st-persona-wardrobe` 文件夹复制到以下任一路径后刷新酒馆页面：
-- 当前用户目录（推荐，ST 1.12+）：`SillyTavern/data/<你的用户名>/extensions/st-persona-wardrobe/`
-- 全局第三方扩展目录：`SillyTavern/public/scripts/extensions/third-party/st-persona-wardrobe/`
-
----
-
-## 入口位置
-1. **顶部导航栏图标**：顶部设置栏新增身份证图标（`打开 User 人设与世界书衣柜`）；
-2. **原生 User 人设面板增强条**：在酒馆原生 Persona Management 的「Persona Lorebook」下拉框下方自动出现 `↗ 跳转打开此世界书` / `📖 弹窗管理条目` / `🗂️ User 衣柜总管`；
-3. **输入框左下角魔棒菜单**：点击魔棒 → `User 人设与世界书衣柜`；
-4. **右侧扩展设置面板**：Extensions → `User 人设与世界书总管`（含导入/导出 JSON 备份）；
-5. **斜杠命令**：在聊天框输入 `/pwardrobe` 打开面板，或 `/pwardrobe <User名字>` 直接切换人设。
+### 方式二：放入本地扩展目录
+将 `st-persona-wardrobe` 文件夹放入对应宿主的扩展目录：
+- **SillyTavern / Luker**：`data/<用户名>/extensions/st-persona-wardrobe/` 或 `public/scripts/extensions/third-party/st-persona-wardrobe/`
+- **TauriTavern (TRT)**：在应用内通过「安装扩展」填入 Git URL，或放入 TauriTavern 数据目录的 `data/<user>/extensions/st-persona-wardrobe/`
 
 ---
 
 ## 权限与安全边界说明
-- 本扩展为纯浏览器端 UI Extension，不包含 Server Plugin，不向任何外部服务器发送请求。
-- 仅调用酒馆同源接口 `/api/worldinfo/get` 与 `/api/worldinfo/edit` 读取和保存你主动在弹窗中修改的世界书条目。
-- 禁用扩展（`onDisable`）时会自动移除所有事件监听、快捷按钮与弹窗 DOM，不留残留。
+- 纯前端 UI Extension，不包含 Server Plugin，不向任何外部服务器发送请求。
+- 禁用扩展（`onDisable`）时自动卸载全部事件监听、安卓返回桥接与注入 DOM，零残留。

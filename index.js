@@ -57,7 +57,32 @@ const state = {
   minimizedReturnPill: null,
   hostPersonasModule: null,
   hostWorldInfoModule: null,
+  hostPopupModule: null,
 };
+
+function isTauriTavernHost() {
+  return Boolean(
+    globalThis.__TAURITAVERN__ ||
+      globalThis.__TAURITAVERN_MAIN_READY__ ||
+      globalThis.__TAURI_RUNNING__ ||
+      globalThis.__TAURI__
+  );
+}
+
+async function waitForTauriTavernReady() {
+  const readyCandidate =
+    globalThis.__TAURITAVERN__?.ready ?? globalThis.__TAURITAVERN_MAIN_READY__;
+  if (readyCandidate && typeof readyCandidate.then === 'function') {
+    try {
+      await Promise.race([
+        readyCandidate,
+        new Promise((resolve) => setTimeout(resolve, 8000)),
+      ]);
+    } catch (err) {
+      console.warn(`[${MODULE_ID}] 等待 TauriTavern 就绪返回告警:`, err);
+    }
+  }
+}
 
 function invalidateRenderedHtmlCache() {
   state.lastLeftRenderedHtml = '';
@@ -107,12 +132,29 @@ async function probeHostModules() {
   if (!state.hostPersonasModule) {
     try {
       state.hostPersonasModule = await import('../../../personas.js');
-    } catch (_e) {}
+    } catch (_e) {
+      try {
+        state.hostPersonasModule = await import('/scripts/personas.js');
+      } catch (_e2) {}
+    }
   }
   if (!state.hostWorldInfoModule) {
     try {
       state.hostWorldInfoModule = await import('../../../world-info.js');
-    } catch (_e) {}
+    } catch (_e) {
+      try {
+        state.hostWorldInfoModule = await import('/scripts/world-info.js');
+      } catch (_e2) {}
+    }
+  }
+  if (!state.hostPopupModule) {
+    try {
+      state.hostPopupModule = await import('../../../popup.js');
+    } catch (_e) {
+      try {
+        state.hostPopupModule = await import('/scripts/popup.js');
+      } catch (_e2) {}
+    }
   }
 }
 
@@ -136,6 +178,95 @@ function escapeAttr(val) {
     .replaceAll("'", '&#39;')
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;');
+}
+
+function hasOpenHostPopupDialog() {
+  if (document.querySelector('dialog[open]:not([closing])')) {
+    return true;
+  }
+  const legacyPopup = document.querySelector('#dialogue_popup');
+  if (legacyPopup && isElementVisible(legacyPopup)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 跨宿主异步文本输入弹窗（适配 TauriTavern Android/iOS/HarmonyOS 原生 WebView 禁用同步 window.prompt 的情况）
+ */
+async function promptUserText(
+  title,
+  defaultValue = '',
+  { subtitle = '', placeholder = '' } = {}
+) {
+  const safeTitle = escapeAttr(title || '');
+  const safeSubtitle = subtitle ? escapeAttr(subtitle) : null;
+  const initVal = String(defaultValue ?? '');
+
+  try {
+    const context = getContext();
+    const PopupClass = context.Popup || state.hostPopupModule?.Popup;
+    if (typeof PopupClass?.show?.input === 'function') {
+      const val = await PopupClass.show.input(safeTitle, safeSubtitle, initVal, {
+        placeholder,
+        rows: 1,
+      });
+      return val === null || val === undefined ? null : String(val);
+    }
+    const callPopupFn =
+      context.callGenericPopup || state.hostPopupModule?.callGenericPopup;
+    const inputType =
+      context.POPUP_TYPE?.INPUT ?? state.hostPopupModule?.POPUP_TYPE?.INPUT ?? 2;
+    if (typeof callPopupFn === 'function') {
+      const html = safeSubtitle ? `<h3>${safeTitle}</h3><div>${safeSubtitle}</div>` : safeTitle;
+      const val = await callPopupFn(html, inputType, initVal, { placeholder, rows: 1 });
+      if (val === false || val === null || val === undefined) return null;
+      return String(val);
+    }
+  } catch (err) {
+    console.warn(`[${MODULE_ID}] Popup.show.input 降级:`, err);
+  }
+
+  if (!isTauriTavernHost() && typeof window.prompt === 'function') {
+    return window.prompt(subtitle ? `${title}\n${subtitle}` : title, initVal);
+  }
+  return null;
+}
+
+/**
+ * 跨宿主异步确认弹窗（适配 TauriTavern 原生 WebView 禁用同步 window.confirm 的情况）
+ */
+async function confirmUserAction(title, message = '') {
+  const safeTitle = escapeAttr(title || '');
+  const safeMessage = message ? escapeAttr(message) : null;
+
+  try {
+    const context = getContext();
+    const PopupClass = context.Popup || state.hostPopupModule?.Popup;
+    if (typeof PopupClass?.show?.confirm === 'function') {
+      const res = await PopupClass.show.confirm(
+        safeTitle,
+        safeMessage
+      );
+      return Boolean(res);
+    }
+    const callPopupFn =
+      context.callGenericPopup || state.hostPopupModule?.callGenericPopup;
+    const confirmType =
+      context.POPUP_TYPE?.CONFIRM ?? state.hostPopupModule?.POPUP_TYPE?.CONFIRM ?? 1;
+    if (typeof callPopupFn === 'function') {
+      const html = safeMessage ? `<h3>${safeTitle}</h3><div>${safeMessage}</div>` : safeTitle;
+      const res = await callPopupFn(html, confirmType);
+      return Boolean(res);
+    }
+  } catch (err) {
+    console.warn(`[${MODULE_ID}] Popup.show.confirm 降级:`, err);
+  }
+
+  if (!isTauriTavernHost() && typeof window.confirm === 'function') {
+    return window.confirm(message ? `${title}\n${message}` : title);
+  }
+  return false;
 }
 
 function getSettings() {
@@ -1648,7 +1779,11 @@ async function clonePersonaVariant(sourcePersona, { customName = '', fromPreset 
   const defaultVariantName = fromPreset
     ? `${sourcePersona.name} (${fromPreset.name})`
     : `${sourcePersona.name} (变体)`;
-  const rawName = customName || window.prompt('输入克隆出的新 User 变体名称：', defaultVariantName);
+  const rawName =
+    customName ||
+    (await promptUserText('输入克隆出的新 User 变体名称', defaultVariantName, {
+      subtitle: '将连同头像、世界书、随身设定与状态快照完整克隆',
+    }));
   if (!rawName || !rawName.trim()) return null;
   const cleanName = rawName.trim();
 
@@ -1762,7 +1897,7 @@ async function clonePersonaVariant(sourcePersona, { customName = '', fromPreset 
 
   // 4. 如果原 User 绑定了角色组（含 Luker dedicated_personas 或标准 connections），同步把新变体也绑入对应角色组
   for (const charName of srcMeta.boundCharacters || []) {
-    bindPersonaToCharacter(newAvatarId, charName);
+    await bindPersonaToCharacter(newAvatarId, charName);
   }
 
   saveSettings();
@@ -1783,7 +1918,10 @@ async function clonePersonaVariant(sourcePersona, { customName = '', fromPreset 
   return newAvatarId;
 }
 
-async function jumpToWorldbookInHost(worldbookName, { fromWardrobeModal = false } = {}) {
+async function jumpToWorldbookInHost(
+  worldbookName,
+  { fromWardrobeModal = false, uid = null } = {}
+) {
   const targetName = String(worldbookName || '').trim();
   if (!targetName) {
     globalThis.toastr?.warning?.('当前未绑定世界书');
@@ -1792,11 +1930,34 @@ async function jumpToWorldbookInHost(worldbookName, { fromWardrobeModal = false 
 
   await probeHostModules();
 
+  const hasEntryUid =
+    uid !== null && uid !== undefined && String(uid).trim() !== '';
   let jumped = false;
+  let openedViaTauriEntryApi = false;
 
-  if (typeof state.hostWorldInfoModule?.openWorldInfoEditor === 'function') {
+  // 1. TauriTavern 官方公开契约：若指定了条目 uid，优先调用 window.__TAURITAVERN__.api.worldInfo.openEntry({ world, uid })
+  if (
+    hasEntryUid &&
+    typeof globalThis.__TAURITAVERN__?.api?.worldInfo?.openEntry === 'function'
+  ) {
     try {
-      state.hostWorldInfoModule.openWorldInfoEditor(targetName);
+      const normalizedUid = Number.isFinite(Number(uid)) ? Number(uid) : String(uid).trim();
+      const res = await globalThis.__TAURITAVERN__.api.worldInfo.openEntry({
+        world: targetName,
+        uid: normalizedUid,
+      });
+      if (res?.opened) {
+        jumped = true;
+        openedViaTauriEntryApi = true;
+      }
+    } catch (err) {
+      console.warn(`[${MODULE_ID}] TauriTavern worldInfo.openEntry 降级:`, err);
+    }
+  }
+
+  if (!jumped && typeof state.hostWorldInfoModule?.openWorldInfoEditor === 'function') {
+    try {
+      await state.hostWorldInfoModule.openWorldInfoEditor(targetName);
       jumped = true;
     } catch (_err) {}
   }
@@ -1846,6 +2007,26 @@ async function jumpToWorldbookInHost(worldbookName, { fromWardrobeModal = false 
   if (!jumped) {
     globalThis.toastr?.warning?.(`未找到世界书「${targetName}」`);
     return false;
+  }
+
+  // 标准 SillyTavern / Luker 下若指定了 uid，在打开世界书抽屉后自动滚动定位到对应条目
+  if (hasEntryUid && !openedViaTauriEntryApi) {
+    const uidStr = String(uid).trim();
+    setTimeout(() => {
+      try {
+        const escapedUid = CSS.escape ? CSS.escape(uidStr) : uidStr.replaceAll('"', '\\"');
+        const entryEl = document.querySelector(
+          `#world_popup_entries_list .world_entry[uid="${escapedUid}"], #world_popup_entries_list [uid="${escapedUid}"]`
+        );
+        if (entryEl instanceof HTMLElement) {
+          entryEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          entryEl.style.outline = '2px solid rgba(255, 215, 110, 0.75)';
+          setTimeout(() => {
+            entryEl.style.outline = '';
+          }, 1800);
+        }
+      } catch (_e) {}
+    }, 220);
   }
 
   if (fromWardrobeModal) {
@@ -2249,6 +2430,9 @@ function renderWorldbookInspectorContent(modal, worldbookName, worldData) {
                             }
                           </div>
                           <span class="st-pw-entry-order" title="插入顺序 (Order)">#${item.order}</span>
+                          <button type="button" class="st-pw-icon-btn st-pw-wb-jump-entry-btn" data-entry-uid="${escapeAttr(item.uid ?? item._key)}" title="在酒馆世界书编辑器中定位此条目">
+                            <i class="fa-solid fa-arrow-up-right-from-square"></i>
+                          </button>
                           <button type="button" class="st-pw-icon-btn st-pw-wb-expand-trigger" data-entry-key="${escapeAttr(item._key)}" title="展开/收起编辑">
                             <i class="fa-solid fa-chevron-${isExpanded ? 'up' : 'down'}"></i>
                           </button>
@@ -2410,6 +2594,18 @@ function renderWorldbookInspectorContent(modal, worldbookName, worldData) {
       });
     });
 
+    modal.querySelectorAll('.st-pw-wb-jump-entry-btn').forEach((btn) => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const entryUid = btn.getAttribute('data-entry-uid');
+        modal.classList.add('st-pw-hidden');
+        await jumpToWorldbookInHost(worldbookName, {
+          fromWardrobeModal: true,
+          uid: entryUid,
+        });
+      });
+    });
+
     modal.querySelectorAll('.st-pw-wb-expand-trigger').forEach((el) => {
       el.addEventListener('click', () => {
         const key = el.getAttribute('data-entry-key');
@@ -2450,7 +2646,7 @@ function renderWorldbookInspectorContent(modal, worldbookName, worldData) {
         const key = btn.getAttribute('data-entry-key');
         if (!key || !worldData.entries?.[key]) return;
         const title = worldData.entries[key].comment || `#${key}`;
-        if (!window.confirm(`确定删除条目「${title}」吗？`)) return;
+        if (!(await confirmUserAction('删除世界书条目', `确定删除条目「${title}」吗？`))) return;
         delete worldData.entries[key];
         expandedKey = null;
         await saveWorldbookData(worldbookName, worldData);
@@ -2476,6 +2672,7 @@ async function evaluateActivePersonaInjections(chatMessages = []) {
   const profile = ensureProfileMeta(activeAvatarId);
   const scanDepth = Math.max(1, Number(settings.scanDepth) || 5);
   const recentText = chatMessages
+    .filter((m) => m && typeof m === 'object' && !m.is_system)
     .slice(-scanDepth)
     .map((m) => String(m?.mes ?? ''))
     .join('\n')
@@ -3510,8 +3707,10 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
   // 新建自定义分组
   modal
     .querySelector('.st-pw-add-group-btn, .st-pw-inline-add-group-btn')
-    ?.addEventListener('click', () => {
-      const newGroup = window.prompt('输入新分组名称：');
+    ?.addEventListener('click', async () => {
+      const newGroup = await promptUserText('新建自定义分组', '', {
+        placeholder: '输入新分组名称…',
+      });
       if (newGroup && newGroup.trim()) {
         const clean = newGroup.trim();
         if (!settings.groups.includes(clean)) {
@@ -3526,11 +3725,11 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
 
   // 重命名自定义分组
   modal.querySelectorAll('.st-pw-rename-group-btn').forEach((btn) => {
-    btn.addEventListener('click', (e) => {
+    btn.addEventListener('click', async (e) => {
       e.stopPropagation();
       const oldName = btn.getAttribute('data-group-name');
       if (!oldName) return;
-      const nextName = window.prompt(`重命名分组「${oldName}」：`, oldName);
+      const nextName = await promptUserText(`重命名分组「${oldName}」`, oldName);
       if (!nextName || !nextName.trim() || nextName.trim() === oldName) return;
       const clean = nextName.trim();
       const idx = settings.groups.indexOf(oldName);
@@ -3548,11 +3747,16 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
 
   // 删除自定义分组
   modal.querySelectorAll('.st-pw-delete-group-btn').forEach((btn) => {
-    btn.addEventListener('click', (e) => {
+    btn.addEventListener('click', async (e) => {
       e.stopPropagation();
       const oldName = btn.getAttribute('data-group-name');
       if (!oldName) return;
-      if (!window.confirm(`确定删除自定义分组「${oldName}」吗？（组内 User 不会被删除）`)) {
+      if (
+        !(await confirmUserAction(
+          `删除自定义分组「${oldName}」`,
+          '组内 User 本身不会被删除，仅恢复为未分组。'
+        ))
+      ) {
         return;
       }
       settings.groups = settings.groups.filter((g) => g !== oldName);
@@ -3618,16 +3822,22 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
   if (!selectedPersona) return;
   const meta = selectedPersona.meta;
 
-  modal.querySelector('#st_pw_detail_group')?.addEventListener('change', (e) => {
-    if (e.target.value === '__new__') {
-      const newGroup = window.prompt('输入新分组名称：');
+  modal.querySelector('#st_pw_detail_group')?.addEventListener('change', async (e) => {
+    const selectEl = e.target;
+    if (selectEl.value === '__new__') {
+      const newGroup = await promptUserText('新建自定义分组', '', {
+        placeholder: '输入新分组名称…',
+      });
       if (newGroup && newGroup.trim()) {
         const clean = newGroup.trim();
         if (!settings.groups.includes(clean)) settings.groups.push(clean);
         meta.group = clean;
+      } else {
+        selectEl.value = meta.group || '';
+        return;
       }
     } else {
-      meta.group = e.target.value;
+      meta.group = selectEl.value;
     }
     saveSettings();
     rerenderPanels();
@@ -3642,23 +3852,27 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
     rerenderPanels();
   });
 
-  modal.querySelector('#st_pw_bind_current_char_btn')?.addEventListener('click', (e) => {
+  modal.querySelector('#st_pw_bind_current_char_btn')?.addEventListener('click', async (e) => {
     const cName = e.currentTarget.getAttribute('data-char');
     if (cName) {
-      bindPersonaToCharacter(selectedPersona.avatarId, cName);
+      await bindPersonaToCharacter(selectedPersona.avatarId, cName);
     }
   });
 
-  modal.querySelector('#st_pw_bind_char_select')?.addEventListener('change', (e) => {
-    let val = e.target.value;
+  modal.querySelector('#st_pw_bind_char_select')?.addEventListener('change', async (e) => {
+    const selectEl = e.target;
+    let val = selectEl.value;
     if (!val) return;
     if (val === '__custom__') {
-      val = window.prompt('输入要绑定的角色卡名称：') || '';
+      val =
+        (await promptUserText('手动输入角色卡名称', '', {
+          placeholder: '输入要绑定的角色卡名称…',
+        })) || '';
     }
     if (val.trim()) {
-      bindPersonaToCharacter(selectedPersona.avatarId, val.trim());
+      await bindPersonaToCharacter(selectedPersona.avatarId, val.trim());
     } else {
-      e.target.value = '';
+      selectEl.value = '';
     }
   });
 
@@ -3820,7 +4034,9 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
   // ==================== 变体克隆 & 状态快照预设事件 ====================
   modal.querySelector('.st-pw-save-preset-btn')?.addEventListener('click', async () => {
     const defaultName = `状态 #${(meta.presets?.length || 0) + 1}`;
-    const name = window.prompt('输入状态快照预设名称（如：日常态 / 战斗态 / IF线）：', defaultName);
+    const name = await promptUserText('保存状态快照预设', defaultName, {
+      subtitle: '例如：日常态 / 战斗态 / IF线',
+    });
     if (!name || !name.trim()) return;
     const snap = await captureCurrentPersonaSnapshot(selectedPersona, name.trim());
     if (!snap) return;
@@ -3877,12 +4093,16 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
   });
 
   modal.querySelectorAll('.st-pw-delete-preset-btn').forEach((btn) => {
-    btn.addEventListener('click', (e) => {
+    btn.addEventListener('click', async (e) => {
       e.stopPropagation();
       const presetId = btn.getAttribute('data-preset-id');
       const preset = meta.presets.find((p) => p.id === presetId);
       if (!preset) return;
-      if (!window.confirm(`确定删除状态快照「${preset.name}」吗？`)) return;
+      if (
+        !(await confirmUserAction('删除状态快照', `确定删除状态快照「${preset.name}」吗？`))
+      ) {
+        return;
+      }
       meta.presets = meta.presets.filter((p) => p.id !== presetId);
       if (meta.activePresetId === presetId) {
         meta.activePresetId = '';
@@ -3909,9 +4129,16 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
   });
 
   modal.querySelectorAll('.st-pw-reset-user-stats-btn').forEach((btn) => {
-    btn.addEventListener('click', (e) => {
+    btn.addEventListener('click', async (e) => {
       e.stopPropagation();
-      if (!window.confirm(`确定清空「${selectedPersona.name}」的使用统计记录吗？`)) return;
+      if (
+        !(await confirmUserAction(
+          '清空使用统计记录',
+          `确定清空「${selectedPersona.name}」的使用统计记录吗？`
+        ))
+      ) {
+        return;
+      }
       meta.usageStats = { chats: {}, extraLiveMs: 0 };
       saveSettings();
       rerenderPanels();
@@ -4866,8 +5093,12 @@ async function mountSettingsPanel() {
     const a = document.createElement('a');
     a.href = url;
     a.download = `st-persona-wardrobe-${new Date().toISOString().slice(0, 10)}.json`;
+    a.style.display = 'none';
+    document.body.appendChild(a);
     a.click();
-    URL.revokeObjectURL(url);
+    a.remove();
+    // 适配 TauriTavern download-bridge：保留 Blob URL 足够时长供异步原生文件落盘，避免立即 revoke 导致下载失败
+    setTimeout(() => URL.revokeObjectURL(url), 15_000);
   });
 
   const importFile = document.querySelector('#st_pw_import_file');
@@ -4899,21 +5130,77 @@ async function mountSettingsPanel() {
   });
 }
 
+async function reloadPersonaAvatarHttpCache(avatarId) {
+  const clean = String(avatarId || '').trim();
+  if (!clean) return;
+  const urls = [`User Avatars/${encodeURIComponent(clean)}`];
+  try {
+    const context = getContext();
+    if (typeof context.getThumbnailUrl === 'function' && !state.personaThumbnailUnsupported) {
+      urls.push(context.getThumbnailUrl('persona', clean));
+    }
+  } catch (_e) {}
+  await Promise.all(
+    urls.map((u) => fetch(u, { cache: 'reload' }).catch(() => {}))
+  );
+}
+
+/**
+ * 适配 TauriTavern (Android / HarmonyOS) 物理与侧滑返回手势 (__TAURITAVERN_HANDLE_BACK__)：
+ * 当本插件全屏弹窗处于打开状态时，侧滑返回优先关闭顶层弹窗，避免穿透关闭底层聊天界面
+ */
+function installTauriTavernBackBridge() {
+  const BACK_KEY = '__TAURITAVERN_HANDLE_BACK__';
+  if (globalThis[BACK_KEY]?._stPwWrapped) return;
+  if (!isTauriTavernHost() && typeof globalThis[BACK_KEY] !== 'function') return;
+
+  const prevHandler =
+    typeof globalThis[BACK_KEY] === 'function' ? globalThis[BACK_KEY] : null;
+
+  const wrappedBackHandler = () => {
+    // 若当前有顶层原生 <dialog open> 弹窗（如输入/确认/头像裁剪框），优先交给宿主关闭顶层 dialog
+    if (hasOpenHostPopupDialog()) {
+      return prevHandler ? Boolean(prevHandler()) : false;
+    }
+    if (closeTopmostWardrobeModal()) {
+      return true;
+    }
+    return prevHandler ? Boolean(prevHandler()) : false;
+  };
+  wrappedBackHandler._stPwWrapped = true;
+  wrappedBackHandler._stPwPrev = prevHandler;
+  globalThis[BACK_KEY] = wrappedBackHandler;
+
+  state.disposers.push(() => {
+    if (globalThis[BACK_KEY] === wrappedBackHandler) {
+      if (prevHandler) {
+        globalThis[BACK_KEY] = prevHandler;
+      } else {
+        delete globalThis[BACK_KEY];
+      }
+    }
+  });
+}
+
 async function initExtension() {
   if (state.initialized) return;
   state.initialized = true;
 
+  await waitForTauriTavernReady();
   await probeHostModules();
   await refreshDiskAvatarSet();
   getSettings();
   await mountSettingsPanel();
   registerSlashCommands();
+  installTauriTavernBackBridge();
   recordCurrentOpenChatStats();
   refreshAllViews();
 
   const onGlobalKeydown = (e) => {
     state.lastUserInteractionAt = Date.now();
     if (e.key === 'Escape') {
+      // 若顶层有原生 <dialog open> 弹窗正在展示，按 Esc 仅关闭顶层 dialog，不连带关闭底下衣柜总管
+      if (hasOpenHostPopupDialog()) return;
       if (closeTopmostWardrobeModal()) {
         e.stopPropagation();
       }
@@ -4981,10 +5268,14 @@ async function initExtension() {
         const now = Date.now();
         if (overwriteName) {
           state.avatarCacheBust.set(overwriteName, now);
+          await reloadPersonaAvatarHttpCache(overwriteName);
         }
         const curActive = getActiveAvatarId();
         if (curActive) {
           state.avatarCacheBust.set(curActive, now);
+          if (curActive !== overwriteName) {
+            await reloadPersonaAvatarHttpCache(curActive);
+          }
         }
         await refreshDiskAvatarSet();
         invalidateRenderedHtmlCache();
@@ -5022,7 +5313,9 @@ async function initExtension() {
       };
 
       const onAppOrSettingsLoaded = async () => {
+        await waitForTauriTavernReady();
         await probeHostModules();
+        installTauriTavernBackBridge();
         await refreshDiskAvatarSet();
         invalidateRenderedHtmlCache();
         recordCurrentOpenChatStats();

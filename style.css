@@ -1175,3 +1175,34 @@
     grid-template-columns: 1fr;
   }
 }
+
+/* TauriTavern (Android / iOS / HarmonyOS) 移动端停靠软键盘弹出、内容视口高度压缩时的自适应保护 */
+@media (max-width: 860px) and (max-height: 560px) {
+  .st-pw-modal-backdrop {
+    padding: 4px;
+  }
+  .st-pw-wardrobe-dialog,
+  .st-pw-wb-dialog {
+    height: calc(100vh - 8px);
+    height: calc(100dvh - 8px);
+  }
+  .st-pw-modal-header {
+    padding: 6px 10px;
+  }
+  .st-pw-workbench {
+    grid-template-rows: minmax(80px, 24%) 1fr;
+  }
+  .st-pw-workbench:has(.st-pw-detail-pane :focus) {
+    grid-template-rows: 0px 1fr;
+  }
+  .st-pw-workbench:has(.st-pw-detail-pane :focus) > .st-pw-sidebar {
+    padding-top: 0;
+    padding-bottom: 0;
+    border-bottom: none;
+    overflow: hidden;
+  }
+  .st-pw-inline-persona-list {
+    max-height: 44vh;
+    max-height: 44dvh;
+  }
+}
