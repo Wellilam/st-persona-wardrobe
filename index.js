@@ -23,6 +23,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   scanDepth: 5,
   groups: [],
   profiles: {},
+  avatarUrlCache: {},
 });
 
 const state = {
@@ -43,6 +44,13 @@ const state = {
   diskAvatarFetched: false,
   personaThumbnailUnsupported: false,
   avatarCacheBust: new Map(),
+  resolvedExternalAvatars: new Map(),
+  whitePlaceholderIds: new Set(),
+  isHarvestingAvatars: false,
+  hasCompletedFullHarvestThisSession: false,
+  harvestTimerId: null,
+  avatarCacheSaveTimer: null,
+  _probeCanvas: null,
   lastLeftRenderedHtml: '',
   lastRightRenderedHtml: '',
   lastModalRenderedHtml: '',
@@ -285,6 +293,9 @@ function getSettings() {
   }
   if (!store.profiles || typeof store.profiles !== 'object') {
     store.profiles = {};
+  }
+  if (!store.avatarUrlCache || typeof store.avatarUrlCache !== 'object') {
+    store.avatarUrlCache = {};
   }
 
   // 自动清理早期版本遗留且没有任何人设使用的空预设分组
@@ -943,6 +954,518 @@ function resolvePersonaDirectAvatarUrl(avatarId) {
   return `User Avatars/${encodeURIComponent(clean)}${bust ? `?t=${bust}` : ''}`;
 }
 
+function extractUrlFromCssBg(bgValue) {
+  const raw = String(bgValue || '').trim();
+  if (!raw || raw === 'none') return '';
+  const m = raw.match(/url\((['"]?)(.*?)\1\)/i);
+  return m?.[2]?.trim() || '';
+}
+
+function isLikelyImageUrl(val) {
+  if (typeof val !== 'string') return false;
+  const s = val.trim();
+  if (!s || s.length > 2_000_000) return false;
+  if (
+    s.startsWith('https://') ||
+    s.startsWith('http://') ||
+    s.startsWith('data:image/') ||
+    s.startsWith('blob:') ||
+    s.startsWith('/user/images/') ||
+    s.startsWith('user/images/') ||
+    s.startsWith('/assets/') ||
+    s.startsWith('assets/')
+  ) {
+    return true;
+  }
+  return /\.(png|webp|jpg|jpeg|gif|avif|svg)(\?.*)?$/i.test(s);
+}
+
+/**
+ * 判断某个 URL 是否属于云头像/图床/IndexedDB Blob/美化脚本改写后的自定义头像地址（而非酒馆默认的本地缩略图或 User Avatars 直链）
+ */
+function isExternalOrCustomAvatarUrl(url, avatarId) {
+  const s = String(url || '').trim();
+  if (!s || s.endsWith('img/ai4.png') || s === 'img/ai4.png') return false;
+  if (s.startsWith('blob:') || s.startsWith('data:image/')) return true;
+
+  const cleanId = String(avatarId || '').trim();
+  const encId = encodeURIComponent(cleanId);
+
+  try {
+    const parsed = new URL(s, globalThis.location?.href || 'http://127.0.0.1/');
+    const sameOrigin =
+      !globalThis.location?.origin ||
+      globalThis.location.origin === 'null' ||
+      parsed.origin === globalThis.location.origin;
+
+    if (!sameOrigin) {
+      return true;
+    }
+
+    const p = parsed.pathname || '';
+    if (p.endsWith('/thumbnail') && parsed.searchParams.get('type') === 'persona') {
+      const f = parsed.searchParams.get('file') || '';
+      return Boolean(cleanId && f && f !== cleanId);
+    }
+    if (p.includes('/User%20Avatars/') || p.includes('/User Avatars/')) {
+      return Boolean(cleanId && !p.endsWith(`/${encId}`) && !p.endsWith(`/${cleanId}`));
+    }
+    return true;
+  } catch (_e) {
+    return (
+      !s.includes('thumbnail?type=persona') &&
+      !s.includes(`User Avatars/${encId}`) &&
+      !s.includes(`User Avatars/${cleanId}`)
+    );
+  }
+}
+
+function isPersistableExternalUrl(url) {
+  const s = String(url || '').trim();
+  if (!s || s.startsWith('blob:')) return false;
+  if (s.startsWith('data:image/')) {
+    return s.length <= 48_000;
+  }
+  return true;
+}
+
+function saveAvatarCacheDebounced() {
+  if (state.avatarCacheSaveTimer) clearTimeout(state.avatarCacheSaveTimer);
+  state.avatarCacheSaveTimer = setTimeout(() => {
+    state.avatarCacheSaveTimer = null;
+    saveSettings();
+  }, 1500);
+}
+
+/**
+ * 记录并原位热替换已捕获的云头像/美化头像地址（不重写列表 innerHTML，绝不产生任何滚动跳动）
+ */
+function recordResolvedExternalAvatar(avatarId, url) {
+  const cleanId = String(avatarId || '').trim();
+  const cleanUrl = String(url || '').trim();
+  if (!cleanId || !cleanUrl) return false;
+
+  const prevMem = state.resolvedExternalAvatars.get(cleanId);
+  state.resolvedExternalAvatars.set(cleanId, cleanUrl);
+  state.whitePlaceholderIds.delete(cleanId);
+
+  try {
+    const settings = getSettings();
+    if (isPersistableExternalUrl(cleanUrl)) {
+      if (settings.avatarUrlCache[cleanId] !== cleanUrl) {
+        settings.avatarUrlCache[cleanId] = cleanUrl;
+        saveAvatarCacheDebounced();
+      }
+    }
+  } catch (_e) {}
+
+  if (prevMem !== cleanUrl) {
+    try {
+      const esc = globalThis.CSS?.escape
+        ? globalThis.CSS.escape(cleanId)
+        : cleanId.replaceAll('"', '\\"');
+      document
+        .querySelectorAll(
+          `#st_pw_inline_left_panel img[data-avatar-id="${esc}"], #st_pw_wardrobe_modal img[data-avatar-id="${esc}"], #st_pw_native_persona_helper img[data-avatar-id="${esc}"]`
+        )
+        .forEach((img) => {
+          if (img.getAttribute('src') !== cleanUrl) {
+            img.dataset.triedExt = '1';
+            img.classList.remove('st-pw-placeholder-pending');
+            img.setAttribute('src', cleanUrl);
+          }
+        });
+    } catch (_e) {}
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 扫描宿主 extension_settings、persona_descriptions 与 localStorage 中可能由第三方图床/云头像/美化脚本保存的头像映射
+ */
+function scanExternalAvatarMappings() {
+  let foundCount = 0;
+  try {
+    const context = getContext();
+    const pu = context.powerUserSettings || globalThis.power_user || {};
+    const personasMap = pu.personas && typeof pu.personas === 'object' ? pu.personas : {};
+    const descMap =
+      pu.persona_descriptions && typeof pu.persona_descriptions === 'object'
+        ? pu.persona_descriptions
+        : {};
+    const knownIds = new Set([
+      ...Object.keys(personasMap),
+      ...Object.keys(descMap),
+      ...(state.diskAvatarSet instanceof Set ? [...state.diskAvatarSet] : []),
+    ]);
+    if (knownIds.size === 0) return 0;
+
+    const extractUrlFromCandidateValue = (val) => {
+      if (isLikelyImageUrl(val)) return val.trim();
+      if (val && typeof val === 'object' && !Array.isArray(val)) {
+        for (const k of [
+          'avatarUrl',
+          'avatar_url',
+          'cloudAvatar',
+          'cloud_avatar',
+          'customAvatar',
+          'custom_avatar',
+          'url',
+          'src',
+          'image',
+          'img',
+          'icon',
+        ]) {
+          if (isLikelyImageUrl(val[k])) return val[k].trim();
+        }
+      }
+      return '';
+    };
+
+    // 1) 检查 persona_descriptions[avatarId] 上的自定义扩展字段
+    for (const id of knownIds) {
+      const d = descMap[id];
+      if (!d || typeof d !== 'object') continue;
+      const hit = extractUrlFromCandidateValue(d);
+      if (hit && isExternalOrCustomAvatarUrl(hit, id)) {
+        if (recordResolvedExternalAvatar(id, hit)) foundCount++;
+      }
+    }
+
+    // 2) 扫描其他扩展的 extension_settings 命名空间（最多向下 3 层查找精确匹配的 avatarId 键）
+    const inspectDict = (obj, depth = 0) => {
+      if (!obj || typeof obj !== 'object' || depth > 3) return;
+      if (Array.isArray(obj)) {
+        if (obj.length > 2000) return;
+        for (const item of obj) {
+          if (!item || typeof item !== 'object') continue;
+          const itemKey = String(
+            item.avatarId || item.avatar || item.id || item.key || item.file || ''
+          ).trim();
+          if (itemKey && knownIds.has(itemKey)) {
+            const u = extractUrlFromCandidateValue(item);
+            if (u && isExternalOrCustomAvatarUrl(u, itemKey)) {
+              if (recordResolvedExternalAvatar(itemKey, u)) foundCount++;
+            }
+          }
+        }
+        return;
+      }
+      const entries = Object.entries(obj);
+      if (entries.length > 3000) return;
+      for (const [k, v] of entries) {
+        if (knownIds.has(k)) {
+          const u = extractUrlFromCandidateValue(v);
+          if (u && isExternalOrCustomAvatarUrl(u, k)) {
+            if (recordResolvedExternalAvatar(k, u)) foundCount++;
+            continue;
+          }
+        }
+        if (v && typeof v === 'object') {
+          inspectDict(v, depth + 1);
+        }
+      }
+    };
+
+    const allExtSettings = context.extensionSettings || {};
+    for (const [extName, extData] of Object.entries(allExtSettings)) {
+      if (extName === MODULE_ID || !extData || typeof extData !== 'object') continue;
+      inspectDict(extData, 0);
+    }
+
+    // 3) 扫描 localStorage 中与 avatar / persona / 图床 相关的轻量 JSON 表
+    if (typeof globalThis.localStorage !== 'undefined') {
+      for (let i = 0; i < globalThis.localStorage.length; i++) {
+        const lsKey = globalThis.localStorage.key(i) || '';
+        if (!/avatar|persona|tuchuang|cloud|img|pic|图床|头像|人设/i.test(lsKey)) continue;
+        if (lsKey.includes(MODULE_ID)) continue;
+        const raw = globalThis.localStorage.getItem(lsKey) || '';
+        if (!raw || raw.length > 2_000_000 || (raw[0] !== '{' && raw[0] !== '[')) continue;
+        try {
+          inspectDict(JSON.parse(raw), 0);
+        } catch (_e) {}
+      }
+    }
+  } catch (_e) {}
+  return foundCount;
+}
+
+/**
+ * 检测已加载的 <img> 是否为 1x1 或全画幅零对比度的纯白/纯色占位图（第三方图床插件常在本地存 1x1 纯白 PNG 作为占位）
+ */
+function checkIsUniformBlankPlaceholder(img) {
+  try {
+    if (!(img instanceof HTMLImageElement) || !img.complete) return false;
+    const nw = img.naturalWidth || 0;
+    const nh = img.naturalHeight || 0;
+    if (nw === 0 || nh === 0) return false;
+    if (nw <= 4 && nh <= 4) return true;
+
+    if (!state._probeCanvas && typeof document.createElement === 'function') {
+      const c = document.createElement('canvas');
+      if (typeof c.getContext === 'function') {
+        c.width = 6;
+        c.height = 6;
+        state._probeCanvas = c;
+      }
+    }
+    const ctx = state._probeCanvas?.getContext?.('2d', { willReadFrequently: true });
+    if (!ctx) return false;
+
+    ctx.clearRect(0, 0, 6, 6);
+    ctx.drawImage(img, 0, 0, 6, 6);
+    const data = ctx.getImageData(0, 0, 6, 6).data;
+    let minR = 255;
+    let maxR = 0;
+    let minG = 255;
+    let maxG = 0;
+    let minB = 255;
+    let maxB = 0;
+    let minA = 255;
+
+    for (let i = 0; i < data.length; i += 4) {
+      const r = data[i];
+      const g = data[i + 1];
+      const b = data[i + 2];
+      const a = data[i + 3];
+      if (r < minR) minR = r;
+      if (r > maxR) maxR = r;
+      if (g < minG) minG = g;
+      if (g > maxG) maxG = g;
+      if (b < minB) minB = b;
+      if (b > maxB) maxB = b;
+      if (a < minA) minA = a;
+    }
+
+    // 全透明占位图
+    if (minA === 0 && maxR === 0 && maxG === 0 && maxB === 0) return true;
+    // 全图 36 个采样区块几乎完全同色且偏亮白/浅灰（如 #FFFFFF 纯白占位图经 Jimp 缩放后的 JPEG）
+    if (
+      minA >= 240 &&
+      minR >= 235 &&
+      minG >= 235 &&
+      minB >= 235 &&
+      maxR - minR <= 6 &&
+      maxG - minG <= 6 &&
+      maxB - minB <= 6
+    ) {
+      return true;
+    }
+    return false;
+  } catch (_e) {
+    // 跨域图床图片读取像素会抛 SecurityError，说明已经是外部真实头像
+    return false;
+  }
+}
+
+/**
+ * 从原生 #user_avatar_block 当前挂载的节点中提取所有已被美化/云头像脚本改写或加载完成的真实头像地址
+ */
+function harvestCurrentNativeDomAvatars() {
+  let harvested = 0;
+  try {
+    const block = document.querySelector('#user_avatar_block');
+    if (!block) return 0;
+
+    const containers = block.querySelectorAll('.avatar-container[data-avatar-id]');
+    containers.forEach((node) => {
+      const avatarId = node.getAttribute('data-avatar-id')?.trim();
+      if (!avatarId) return;
+
+      const avatarBox = node.querySelector('.avatar');
+      const imgs = node.querySelectorAll('img');
+      for (const img of imgs) {
+        const candidates = [
+          img.getAttribute('src'),
+          img.currentSrc,
+          img.dataset?.src,
+          img.dataset?.lazySrc,
+        ];
+        for (const raw of candidates) {
+          const u = String(raw || '').trim();
+          if (u && isExternalOrCustomAvatarUrl(u, avatarId)) {
+            if (recordResolvedExternalAvatar(avatarId, u)) harvested++;
+            return;
+          }
+        }
+        // 若原生节点里的同源地址已重新生成为非纯白真实图像（例如某些插件按需落地真实图片文件）
+        const liveSrc = String(img.currentSrc || img.getAttribute('src') || '').trim();
+        if (
+          liveSrc &&
+          state.whitePlaceholderIds.has(avatarId) &&
+          img.complete &&
+          img.naturalWidth > 4 &&
+          !checkIsUniformBlankPlaceholder(img)
+        ) {
+          state.whitePlaceholderIds.delete(avatarId);
+          state.avatarCacheBust.set(avatarId, Date.now());
+          recordResolvedExternalAvatar(
+            avatarId,
+            `${liveSrc}${liveSrc.includes('?') ? '&' : '?'}t=${Date.now()}`
+          );
+          harvested++;
+          return;
+        }
+      }
+
+      // 兼容通过 inline style background-image 注入头像的美化脚本
+      for (const el of [avatarBox, node]) {
+        if (!el) continue;
+        const bgUrl = extractUrlFromCssBg(el.style?.backgroundImage);
+        if (bgUrl && isExternalOrCustomAvatarUrl(bgUrl, avatarId)) {
+          if (recordResolvedExternalAvatar(avatarId, bgUrl)) harvested++;
+          return;
+        }
+      }
+    });
+  } catch (_e) {}
+  return harvested;
+}
+
+/**
+ * 通用原生人设池全量唤醒采集器：
+ * 当检测到纯白占位图或第三方云头像脚本时，自动在隐式视口内将原生 #user_avatar_block 展开渲染全量条目，
+ * 让任何依赖原生列表（翻页/MutationObserver/IntersectionObserver/is(':visible')）的未知图床/美化脚本一次性吐出全部真实头像！
+ */
+async function runUniversalNativeAvatarHarvest({ manual = false } = {}) {
+  scanExternalAvatarMappings();
+  harvestCurrentNativeDomAvatars();
+
+  if (state.isHarvestingAvatars) return;
+  if (
+    !manual &&
+    state.hasCompletedFullHarvestThisSession &&
+    state.whitePlaceholderIds.size === 0
+  ) {
+    return;
+  }
+
+  state.isHarvestingAvatars = true;
+  state.hasCompletedFullHarvestThisSession = true;
+  const beforeCount = state.resolvedExternalAvatars.size;
+
+  const drawerEl = document.querySelector('#PersonaManagement');
+  const addedHarvestDrawerClass = Boolean(
+    drawerEl && drawerEl.classList.contains('closedDrawer')
+  );
+  if (addedHarvestDrawerClass) {
+    drawerEl.classList.add('st-pw-harvesting-drawer');
+  }
+
+  try {
+    await probeHostModules();
+    const context = getContext();
+    const storage = context.accountStorage || globalThis.localStorage;
+    const PER_PAGE_KEY = 'Personas_PerPage';
+    const prevPerPage = storage?.getItem?.(PER_PAGE_KEY) ?? null;
+
+    if (
+      !state.useRawNativeLeftList &&
+      typeof state.hostPersonasModule?.getUserAvatars === 'function'
+    ) {
+      try {
+        storage?.setItem?.(PER_PAGE_KEY, '1000');
+        await state.hostPersonasModule.getUserAvatars(true, getActiveAvatarId());
+      } catch (err) {
+        console.warn(`[${MODULE_ID}] 唤醒原生 getUserAvatars 采集跳过:`, err);
+      } finally {
+        // 立即恢复存储中的分页偏好（保留 DOM 中已挂载的全量节点供异步云头像脚本替换）
+        if (prevPerPage !== null && prevPerPage !== undefined) {
+          storage?.setItem?.(PER_PAGE_KEY, String(prevPerPage));
+        } else {
+          storage?.removeItem?.(PER_PAGE_KEY);
+        }
+      }
+    }
+
+    for (const waitMs of [120, 450, 1100, 2400]) {
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+      scanExternalAvatarMappings();
+      harvestCurrentNativeDomAvatars();
+    }
+  } finally {
+    if (addedHarvestDrawerClass && drawerEl) {
+      drawerEl.classList.remove('st-pw-harvesting-drawer');
+    }
+    state.isHarvestingAvatars = false;
+  }
+
+  if (manual) {
+    const gained = Math.max(0, state.resolvedExternalAvatars.size - beforeCount);
+    invalidateRenderedHtmlCache();
+    refreshAllViews();
+    globalThis.toastr?.success?.(
+      gained > 0
+        ? `已同步捕获 ${gained} 个云端/美化头像（共缓存 ${state.resolvedExternalAvatars.size} 个）`
+        : '已同步刷新人设与头像列表'
+    );
+  }
+}
+
+function scheduleUniversalAvatarHarvest(delayMs = 220) {
+  if (state.isHarvestingAvatars || state.hasCompletedFullHarvestThisSession) return;
+  if (state.harvestTimerId) return;
+  state.harvestTimerId = setTimeout(() => {
+    state.harvestTimerId = null;
+    runUniversalNativeAvatarHarvest({ manual: false });
+  }, delayMs);
+}
+
+function observeNativeAvatarBlock() {
+  if (typeof MutationObserver === 'undefined') return;
+  const personaDrawer = document.querySelector('#PersonaManagement');
+  if (!personaDrawer) return;
+
+  let debounceId = null;
+  const triggerHarvestPass = () => {
+    if (debounceId) clearTimeout(debounceId);
+    debounceId = setTimeout(() => {
+      debounceId = null;
+      const gained = harvestCurrentNativeDomAvatars();
+      // 若发现原生前 5 条已经被某个云头像插件改写了外链，且本轮会话尚未全量展开同步过，自动把剩余人设也一并同步出来
+      if (gained > 0 && !state.hasCompletedFullHarvestThisSession) {
+        scheduleUniversalAvatarHarvest(180);
+      }
+    }, 80);
+  };
+
+  const observer = new MutationObserver((mutations) => {
+    let drawerOpened = false;
+    let blockMutated = false;
+    const block = document.querySelector('#user_avatar_block');
+
+    for (const m of mutations) {
+      if (m.target === personaDrawer && m.attributeName === 'class') {
+        if (personaDrawer.classList.contains('openDrawer')) {
+          drawerOpened = true;
+        }
+      } else if (block && (m.target === block || block.contains(m.target))) {
+        blockMutated = true;
+      }
+    }
+
+    if (drawerOpened) {
+      syncNativePersonaPanelEnhancement();
+      triggerHarvestPass();
+    } else if (blockMutated) {
+      triggerHarvestPass();
+    }
+  });
+
+  observer.observe(personaDrawer, {
+    attributes: true,
+    attributeFilter: ['class', 'src', 'style', 'data-src', 'data-lazy-src'],
+    childList: true,
+    subtree: true,
+  });
+
+  state.disposers.push(() => {
+    if (debounceId) clearTimeout(debounceId);
+    observer.disconnect();
+  });
+}
+
 function resolvePersonaAvatarUrl(avatarId) {
   const clean = String(avatarId || '').trim();
   if (!clean) return 'img/ai4.png';
@@ -950,14 +1473,40 @@ function resolvePersonaAvatarUrl(avatarId) {
   detectHostPersonaAvatarMode();
   const bust = state.avatarCacheBust.get(clean);
 
-  // 如果酒馆原生列表 DOM 中已有该人设头像节点且由美化/云端插件改写过有效地址，优先复用（除非刚更新过头像需强刷缓存）
+  // 1) 优先使用已捕获的云头像/图床/IndexedDB Blob/美化脚本真实头像（除非用户刚刚手动上传了新本地头像）
   if (!bust) {
+    const memExt = state.resolvedExternalAvatars.get(clean);
+    if (memExt) return memExt;
+
     try {
-      const domImg = document.querySelector(
-        `#user_avatar_block .avatar-container[data-avatar-id="${CSS.escape(clean)}"] img[src]`
+      const escaped = globalThis.CSS?.escape
+        ? globalThis.CSS.escape(clean)
+        : clean.replaceAll('"', '\\"');
+      const domNode = document.querySelector(
+        `#user_avatar_block .avatar-container[data-avatar-id="${escaped}"]`
       );
-      const domSrc = domImg?.getAttribute('src')?.trim();
-      if (domSrc) return domSrc;
+      if (domNode) {
+        const domImg = domNode.querySelector('img[src]');
+        const domSrc = domImg?.getAttribute('src')?.trim() || '';
+        if (domSrc && isExternalOrCustomAvatarUrl(domSrc, clean)) {
+          state.resolvedExternalAvatars.set(clean, domSrc);
+          return domSrc;
+        }
+        const bgUrl = extractUrlFromCssBg(
+          domNode.querySelector('.avatar')?.style?.backgroundImage ||
+            domNode.style?.backgroundImage
+        );
+        if (bgUrl && isExternalOrCustomAvatarUrl(bgUrl, clean)) {
+          state.resolvedExternalAvatars.set(clean, bgUrl);
+          return bgUrl;
+        }
+        if (domSrc) return domSrc;
+      }
+    } catch (_e) {}
+
+    try {
+      const persistedExt = getSettings().avatarUrlCache?.[clean];
+      if (persistedExt) return persistedExt;
     } catch (_e) {}
   }
 
@@ -977,13 +1526,60 @@ function resolvePersonaAvatarUrl(avatarId) {
 }
 
 /**
- * 为面板容器绑定捕获阶段的头像加载失败自动降级链：
- * 1) 若 /thumbnail?type=persona 返回 400/404（旧版 ST 或缩略图生成超时），自动标记并切换全部未加载头像到 User Avatars/<file> 原图直链
- * 2) 若原图直链仍不存在，兜底显示酒馆默认人设剪影 img/ai4.png，绝不空白隐藏
+ * 为面板容器绑定捕获阶段的头像 load + error 自愈链：
+ * 1) load 阶段自动识别 1x1 / 纯白占位图：若检测到图床插件的纯白占位图，立即柔和暗化防刺眼，并自动后台唤醒原生列表抓取真实云头像热替换
+ * 2) error 阶段自动降级：失效缓存外链 -> /thumbnail?type=persona -> User Avatars/<file> 原图直链 -> img/ai4.png
  */
 function bindAvatarErrorFallback(container) {
   if (!container || container.dataset.avatarErrBound === '1') return;
   container.dataset.avatarErrBound = '1';
+
+  container.addEventListener(
+    'load',
+    (e) => {
+      const img = e.target;
+      if (!(img instanceof HTMLImageElement)) return;
+      const avatarId = img.getAttribute('data-avatar-id');
+      if (!avatarId) return;
+
+      const currentSrc = img.getAttribute('src') || '';
+      if (currentSrc.endsWith('img/ai4.png')) {
+        img.classList.remove('st-pw-placeholder-pending');
+        return;
+      }
+
+      if (checkIsUniformBlankPlaceholder(img)) {
+        // 先看是否已采集到该人设的云端/美化真实头像
+        const extUrl =
+          state.resolvedExternalAvatars.get(avatarId) ||
+          getSettings().avatarUrlCache?.[avatarId] ||
+          '';
+        if (extUrl && extUrl !== currentSrc && !img.dataset.triedExt) {
+          img.dataset.triedExt = '1';
+          img.setAttribute('src', extUrl);
+          return;
+        }
+
+        // 若当前是缩略图返回纯白，尝试一次原图直链（排除 Jimp 缩略图损坏的可能）
+        const directSrc =
+          img.getAttribute('data-fallback-src') || resolvePersonaDirectAvatarUrl(avatarId);
+        if (!img.dataset.triedDirect && currentSrc !== directSrc && currentSrc.includes('thumbnail')) {
+          img.dataset.triedDirect = '1';
+          img.setAttribute('src', directSrc);
+          return;
+        }
+
+        // 确认本地文件本身即为纯白占位图：柔和暗化并自动唤醒通用原生采集器拉取云头像
+        img.classList.add('st-pw-placeholder-pending');
+        state.whitePlaceholderIds.add(avatarId);
+        scheduleUniversalAvatarHarvest(150);
+      } else {
+        img.classList.remove('st-pw-placeholder-pending');
+        state.whitePlaceholderIds.delete(avatarId);
+      }
+    },
+    true
+  );
 
   container.addEventListener(
     'error',
@@ -995,6 +1591,17 @@ function bindAvatarErrorFallback(container) {
 
       const currentSrc = img.getAttribute('src') || '';
       const directSrc = img.getAttribute('data-fallback-src') || resolvePersonaDirectAvatarUrl(avatarId);
+
+      // 若持久化的外链图床地址已失效，清除该条外链缓存并重新触发采集或回退本地
+      try {
+        const settings = getSettings();
+        if (settings.avatarUrlCache?.[avatarId] === currentSrc) {
+          delete settings.avatarUrlCache[avatarId];
+          state.resolvedExternalAvatars.delete(avatarId);
+          state.hasCompletedFullHarvestThisSession = false;
+          scheduleUniversalAvatarHarvest(250);
+        }
+      } catch (_e) {}
 
       if (!img.dataset.triedDirect && currentSrc !== directSrc) {
         img.dataset.triedDirect = '1';
@@ -1023,6 +1630,7 @@ function bindAvatarErrorFallback(container) {
 
       if (!img.dataset.triedDefault) {
         img.dataset.triedDefault = '1';
+        img.classList.remove('st-pw-placeholder-pending');
         img.setAttribute('src', 'img/ai4.png');
       }
     },
@@ -2827,9 +3435,13 @@ function renderPersonaRowHtml(p, selectedAvatarId) {
   const usage = getPersonaUsageSummary(p.avatarId);
   const hasUsage = usage.charCount > 0 || usage.chatCount > 0 || usage.durationMs > 0;
   const fallbackAvatarUrl = resolvePersonaDirectAvatarUrl(p.avatarId);
+  const isPendingPlaceholder =
+    state.whitePlaceholderIds.has(p.avatarId) &&
+    !state.resolvedExternalAvatars.has(p.avatarId) &&
+    !getSettings().avatarUrlCache?.[p.avatarId];
   return `
     <div class="st-pw-persona-item ${isSelected ? 'is-selected' : ''} ${p.isActive ? 'is-active-user' : ''}" data-avatar-id="${escapeAttr(p.avatarId)}">
-      <img class="st-pw-item-avatar" src="${escapeAttr(p.avatarUrl)}" data-avatar-id="${escapeAttr(p.avatarId)}" data-fallback-src="${escapeAttr(fallbackAvatarUrl)}" loading="lazy" decoding="async" alt="" />
+      <img class="st-pw-item-avatar ${isPendingPlaceholder ? 'st-pw-placeholder-pending' : ''}" src="${escapeAttr(p.avatarUrl)}" data-avatar-id="${escapeAttr(p.avatarId)}" data-fallback-src="${escapeAttr(fallbackAvatarUrl)}" decoding="async" alt="" />
       <div class="st-pw-item-main">
         <div class="st-pw-item-title-line">
           <span class="st-pw-item-name">${sanitizeHtml(p.name)}</span>
@@ -3563,9 +4175,7 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
 
   modal.querySelector('.st-pw-refresh-host-btn')?.addEventListener('click', async () => {
     await refreshDiskAvatarSet();
-    invalidateRenderedHtmlCache();
-    refreshAllViews();
-    globalThis.toastr?.info?.('已同步头像与人设列表');
+    await runUniversalNativeAvatarHarvest({ manual: true });
   });
 
   modal.querySelector('.st-pw-modal-create-btn')?.addEventListener('click', () => {
@@ -4480,6 +5090,9 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
                 ? `<button type="button" class="menu_button st-pw-mini-btn st-pw-inline-change-avatar-btn" title="更换当前选中 User 的头像">换图</button>`
                 : ''
             }
+            <button type="button" class="menu_button st-pw-mini-btn st-pw-sync-cloud-avatars-btn" title="一键唤醒原生人设池同步图床/云端/美化插件头像">
+              刷图
+            </button>
             <button type="button" class="menu_button st-pw-mini-btn st-pw-toggle-raw-list-btn" title="切换到酒馆原生平铺列表">
               原生列表
             </button>
@@ -4565,9 +5178,19 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
               }
             });
 
-          leftPanel.querySelector('.st-pw-toggle-raw-list-btn')?.addEventListener('click', () => {
+          leftPanel
+            .querySelector('.st-pw-sync-cloud-avatars-btn')
+            ?.addEventListener('click', async () => {
+              await refreshDiskAvatarSet();
+              await runUniversalNativeAvatarHarvest({ manual: true });
+            });
+
+          leftPanel.querySelector('.st-pw-toggle-raw-list-btn')?.addEventListener('click', async () => {
             state.useRawNativeLeftList = true;
             syncNativePersonaPanelEnhancement({ forceRight: true });
+            try {
+              await state.hostPersonasModule?.getUserAvatars?.(true, getActiveAvatarId());
+            } catch (_e) {}
           });
 
           // 使用与主窗口一致的分组树交互绑定
@@ -5190,9 +5813,12 @@ async function initExtension() {
   await probeHostModules();
   await refreshDiskAvatarSet();
   getSettings();
+  scanExternalAvatarMappings();
+  harvestCurrentNativeDomAvatars();
   await mountSettingsPanel();
   registerSlashCommands();
   installTauriTavernBackBridge();
+  observeNativeAvatarBlock();
   recordCurrentOpenChatStats();
   refreshAllViews();
 
@@ -5317,6 +5943,8 @@ async function initExtension() {
         await probeHostModules();
         installTauriTavernBackBridge();
         await refreshDiskAvatarSet();
+        scanExternalAvatarMappings();
+        harvestCurrentNativeDomAvatars();
         invalidateRenderedHtmlCache();
         recordCurrentOpenChatStats();
         refreshAllViews();
@@ -5382,6 +6010,14 @@ export async function onActivate() {
 }
 
 export async function onDisable() {
+  if (state.harvestTimerId) {
+    clearTimeout(state.harvestTimerId);
+    state.harvestTimerId = null;
+  }
+  if (state.avatarCacheSaveTimer) {
+    clearTimeout(state.avatarCacheSaveTimer);
+    state.avatarCacheSaveTimer = null;
+  }
   while (state.disposers.length) {
     const dispose = state.disposers.pop();
     try {
@@ -5389,6 +6025,7 @@ export async function onDisable() {
     } catch (_e) {}
   }
   removeReturnToWardrobePill();
+  document.querySelector('#PersonaManagement')?.classList.remove('st-pw-harvesting-drawer');
   document
     .querySelector('#PersonaManagement .persona_management_left_column')
     ?.classList.remove('st-pw-left-taken');

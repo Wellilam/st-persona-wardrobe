@@ -128,9 +128,51 @@
 }
 
 /* 2. 原生 Persona 栏目 (#PersonaManagement) 原位接管样式 */
-#PersonaManagement .persona_management_left_column.st-pw-left-taken > .flex-container.marginBot10,
-#PersonaManagement .persona_management_left_column.st-pw-left-taken > #user_avatar_block {
+#PersonaManagement .persona_management_left_column.st-pw-left-taken {
+  position: relative;
+}
+
+#PersonaManagement .persona_management_left_column.st-pw-left-taken > .flex-container.marginBot10 {
   display: none !important;
+}
+
+/* 通用云头像/图床/美化扩展兼容：保持 #user_avatar_block 非 display:none 且视口内可观测，
+   让依赖 IntersectionObserver / is(':visible') / MutationObserver 的第三方脚本能静默把纯白占位图替换为真实头像 */
+#PersonaManagement .persona_management_left_column.st-pw-left-taken > #user_avatar_block {
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  overflow: hidden !important;
+  opacity: 0.001 !important;
+  pointer-events: none !important;
+  z-index: -9999 !important;
+}
+
+#PersonaManagement .persona_management_left_column.st-pw-left-taken > #user_avatar_block .avatar-container,
+#PersonaManagement .persona_management_left_column.st-pw-left-taken > #user_avatar_block .avatar,
+#PersonaManagement .persona_management_left_column.st-pw-left-taken > #user_avatar_block .avatar img {
+  width: 8px !important;
+  height: 8px !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  overflow: hidden !important;
+}
+
+#PersonaManagement.closedDrawer.st-pw-harvesting-drawer {
+  display: block !important;
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  overflow: hidden !important;
+  opacity: 0.001 !important;
+  pointer-events: none !important;
+  z-index: -9999 !important;
 }
 
 .st-pw-inline-left-panel {
@@ -831,6 +873,12 @@
   border-radius: 4px;
   object-fit: cover;
   background: rgba(0, 0, 0, 0.3);
+}
+
+.st-pw-item-avatar.st-pw-placeholder-pending,
+.st-pw-detail-avatar.st-pw-placeholder-pending {
+  opacity: 0.16;
+  filter: brightness(0.35);
 }
 
 .st-pw-item-main {
