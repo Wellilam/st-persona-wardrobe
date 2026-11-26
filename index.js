@@ -38,6 +38,9 @@ const state = {
   showStatsDetail: false,
   isScanningHistory: false,
   scanProgressText: '',
+  hasCompletedAutoStatsScan: false,
+  autoStatsScanTimerId: null,
+  cachedHostCharacters: [],
   lastUserInteractionAt: Date.now(),
   useRawNativeLeftList: false,
   diskAvatarSet: null,
@@ -458,17 +461,43 @@ function getPersonaUsageSummary(avatarId) {
   };
 }
 
+const IGNORED_HEADER_USER_NAMES = new Set([
+  '',
+  'unused',
+  'system',
+  'assistant',
+  '{{user}}',
+  '<user>',
+]);
+
 function parseStTimestamp(raw) {
-  if (!raw) return 0;
-  if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+  if (raw === null || raw === undefined || raw === '') return 0;
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
+    return raw < 1e11 ? Math.round(raw * 1000) : raw;
+  }
   const str = String(raw).trim();
   if (!str) return 0;
+
+  if (/^\d{10,13}$/.test(str)) {
+    const num = Number(str);
+    if (Number.isFinite(num) && num > 0) {
+      return num < 1e11 ? num * 1000 : num;
+    }
+  }
+
   const direct = Date.parse(str);
   if (Number.isFinite(direct) && direct > 0) return direct;
 
-  // 兼容酒馆格式 "2026-11-25 @15h 30m 12s 123ms"
+  // 兼容经典酒馆无空格 am/pm 格式，如 "November 26, 2026 1:45pm"
+  const normalizedAmPm = str.replace(/(\d)(am|pm)\b/i, '$1 $2');
+  if (normalizedAmPm !== str) {
+    const parsedAmPm = Date.parse(normalizedAmPm);
+    if (Number.isFinite(parsedAmPm) && parsedAmPm > 0) return parsedAmPm;
+  }
+
+  // 兼容酒馆与 TauriTavern humanizedDateTime 格式 "2026-11-25 @15h 30m 12s 123ms" / "2026-11-25@15h30m12s123ms"
   const m = str.match(
-    /(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s*@\s*(\d{1,2})h\s*(\d{1,2})m\s*(\d{1,2})s/i
+    /(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s*@?\s*(\d{1,2})h\s*(\d{1,2})m(?:\s*(\d{1,2})s)?/i
   );
   if (m) {
     const dt = new Date(
@@ -477,24 +506,106 @@ function parseStTimestamp(raw) {
       Number(m[3]),
       Number(m[4]),
       Number(m[5]),
-      Number(m[6])
+      Number(m[6] || 0)
     );
     return dt.getTime();
   }
+
+  // 兼容中文日期格式 "2026年11月26日 13:45(:12)"
+  const zh = str.match(
+    /(\d{4})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/
+  );
+  if (zh) {
+    const dt = new Date(
+      Number(zh[1]),
+      Number(zh[2]) - 1,
+      Number(zh[3]),
+      Number(zh[4]),
+      Number(zh[5]),
+      Number(zh[6] || 0)
+    );
+    return dt.getTime();
+  }
+
   return 0;
 }
 
+function normalizeAvatarStem(raw) {
+  let s = String(raw || '').trim();
+  if (!s) return '';
+  s = s.replace(/\\/g, '/');
+  const slashIdx = s.lastIndexOf('/');
+  if (slashIdx !== -1) s = s.slice(slashIdx + 1);
+  const qIdx = s.indexOf('?');
+  if (qIdx !== -1) s = s.slice(0, qIdx);
+  const hIdx = s.indexOf('#');
+  if (hIdx !== -1) s = s.slice(0, hIdx);
+  return s.trim();
+}
+
+/**
+ * 从消息的 force_avatar 提取真实的 User 头像文件名：
+ * 兼容：
+ * 1) TauriTavern / 新版 ST: "/thumbnail?type=persona&file=xxx.png"（含 URLSearchParams 的 + 空格编码）
+ * 2) 标准 ST / Luker: "User Avatars/xxx.png" 或 "/User%20Avatars/xxx.png?t=..."
+ * 3) 直接文件名: "xxx.png"
+ */
 function extractAvatarIdFromForceAvatar(forceAvatarRaw) {
-  if (!forceAvatarRaw) return '';
-  let str = String(forceAvatarRaw).trim();
-  if (!str) return '';
+  if (!forceAvatarRaw || typeof forceAvatarRaw === 'boolean') return '';
+  const rawStr = String(forceAvatarRaw).trim();
+  if (!rawStr) return '';
+  const lowerRaw = rawStr.toLowerCase();
+  if (
+    lowerRaw === 'false' ||
+    lowerRaw === 'true' ||
+    lowerRaw === 'null' ||
+    lowerRaw === 'undefined' ||
+    lowerRaw === 'unused'
+  ) {
+    return '';
+  }
+
+  // 1) 优先解析带查询参数的缩略图地址（如 /thumbnail?type=persona&file=My+Persona.png）
+  if (rawStr.includes('?')) {
+    try {
+      const parsed = new URL(
+        rawStr,
+        globalThis.location?.origin && globalThis.location.origin !== 'null'
+          ? globalThis.location.origin
+          : 'http://127.0.0.1/'
+      );
+      const fileParam =
+        parsed.searchParams.get('file') ||
+        parsed.searchParams.get('avatar') ||
+        '';
+      if (fileParam.trim()) {
+        return normalizeAvatarStem(fileParam);
+      }
+    } catch (_e) {}
+  }
+
+  // 2) 常规路径提取（如 User Avatars/xxx.png）
+  let decoded = rawStr;
   try {
-    str = decodeURIComponent(str);
+    decoded = decodeURIComponent(rawStr);
   } catch (_e) {}
-  const idx = str.lastIndexOf('/');
-  const base = idx !== -1 ? str.slice(idx + 1) : str;
-  const qIdx = base.indexOf('?');
-  return (qIdx !== -1 ? base.slice(0, qIdx) : base).trim();
+  const candidate = normalizeAvatarStem(decoded);
+  if (!candidate || candidate.toLowerCase() === 'thumbnail') {
+    return '';
+  }
+  return candidate;
+}
+
+function matchPersonaAvatarId(candidateRaw, personaByAvatar, personaByLowerId, personaByStemLower) {
+  const extracted =
+    extractAvatarIdFromForceAvatar(candidateRaw) || normalizeAvatarStem(candidateRaw);
+  if (!extracted) return '';
+  if (personaByAvatar.has(extracted)) return extracted;
+  const lower = extracted.toLowerCase();
+  if (personaByLowerId.has(lower)) return personaByLowerId.get(lower);
+  const stem = lower.replace(/\.(png|webp|jpg|jpeg|gif|avif)$/i, '');
+  if (stem && personaByStemLower.has(stem)) return personaByStemLower.get(stem);
+  return '';
 }
 
 /**
@@ -508,16 +619,36 @@ function attributeChatMessagesToPersonas({
   messages,
   allPersonas,
   fallbackAvatarId = '',
+  unattributedUserFallbackId = '',
 }) {
   if (!charName || !chatId || !Array.isArray(messages) || messages.length === 0) {
     return false;
   }
 
   const personaByAvatar = new Map(allPersonas.map((p) => [p.avatarId, p]));
+  const personaByLowerId = new Map(
+    allPersonas.map((p) => [p.avatarId.toLowerCase(), p.avatarId])
+  );
+  const personaByStemLower = new Map();
+  for (const p of allPersonas) {
+    const stem = p.avatarId.toLowerCase().replace(/\.(png|webp|jpg|jpeg|gif|avif)$/i, '');
+    if (stem && !personaByStemLower.has(stem)) {
+      personaByStemLower.set(stem, p.avatarId);
+    }
+  }
+
+  const resolveAvatarRef = (ref) =>
+    matchPersonaAvatarId(ref, personaByAvatar, personaByLowerId, personaByStemLower);
+
   const resolveByNameAndChar = (uName) => {
     const clean = String(uName || '').trim().toLowerCase();
-    if (!clean) return null;
-    const candidates = allPersonas.filter((p) => p.name.trim().toLowerCase() === clean);
+    if (!clean || IGNORED_HEADER_USER_NAMES.has(clean)) return null;
+    let candidates = allPersonas.filter((p) => p.name.trim().toLowerCase() === clean);
+    if (candidates.length === 0) {
+      candidates = allPersonas.filter(
+        (p) => p.title && p.title.trim().toLowerCase() === clean
+      );
+    }
     if (candidates.length === 0) return null;
     if (candidates.length === 1) return candidates[0].avatarId;
     // 如果同名有多个 User，优先归属给绑定了该角色卡的那个 User
@@ -527,18 +658,26 @@ function attributeChatMessagesToPersonas({
     return (boundHit || candidates[0]).avatarId;
   };
 
-  // 先看 chat_metadata 或 header 里的显式绑定
+  const validFallbackId = resolveAvatarRef(fallbackAvatarId);
+  const validUnattributedUserFallbackId = resolveAvatarRef(unattributedUserFallbackId);
+
+  // 先看 chat_metadata 或 header 里的显式绑定（过滤 TauriTavern 固定写入的 user_name: "unused"）
   const chatMeta = headerObj?.chat_metadata || {};
   let chatLevelAvatarId = '';
-  const trackedLukerAvatar = String(chatMeta?.luker_last_user_persona?.avatar || '').trim();
-  const lockedChatAvatar = String(chatMeta?.persona || '').trim();
-  if (trackedLukerAvatar && personaByAvatar.has(trackedLukerAvatar)) {
+  const trackedLukerAvatar = resolveAvatarRef(chatMeta?.luker_last_user_persona?.avatar);
+  const lockedChatAvatar = resolveAvatarRef(
+    chatMeta?.persona || chatMeta?.user_avatar || chatMeta?.tainted_persona
+  );
+  if (trackedLukerAvatar) {
     chatLevelAvatarId = trackedLukerAvatar;
-  } else if (lockedChatAvatar && personaByAvatar.has(lockedChatAvatar)) {
+  } else if (lockedChatAvatar) {
     chatLevelAvatarId = lockedChatAvatar;
   } else if (chatMeta?.luker_last_user_persona?.name) {
     chatLevelAvatarId = resolveByNameAndChar(chatMeta.luker_last_user_persona.name) || '';
-  } else if (headerObj?.user_name) {
+  } else if (
+    headerObj?.user_name &&
+    !IGNORED_HEADER_USER_NAMES.has(String(headerObj.user_name).trim().toLowerCase())
+  ) {
     chatLevelAvatarId = resolveByNameAndChar(headerObj.user_name) || '';
   }
 
@@ -554,7 +693,7 @@ function attributeChatMessagesToPersonas({
     if (!msg || typeof msg !== 'object') continue;
     if (msg.is_system) continue;
 
-    const ts = parseStTimestamp(msg.send_date);
+    const ts = parseStTimestamp(msg.send_date ?? msg.timestamp ?? msg.date);
     if (ts > 0) {
       timestamps.push(ts);
       if (ts > lastChatAt) lastChatAt = ts;
@@ -568,15 +707,25 @@ function attributeChatMessagesToPersonas({
 
     if (msg.is_user) {
       totalUserMsgs++;
-      let msgAvatarId = '';
-      const fromForce = extractAvatarIdFromForceAvatar(msg.force_avatar);
-      if (fromForce && personaByAvatar.has(fromForce)) {
-        msgAvatarId = fromForce;
-      } else if (msg.name) {
+      let msgAvatarId =
+        resolveAvatarRef(msg.force_avatar) ||
+        resolveAvatarRef(msg.extra?.persona || msg.persona);
+      if (!msgAvatarId && msg.name) {
         msgAvatarId = resolveByNameAndChar(msg.name) || '';
       }
       if (!msgAvatarId) {
-        msgAvatarId = chatLevelAvatarId || fallbackAvatarId;
+        msgAvatarId = chatLevelAvatarId || validFallbackId;
+      }
+      // 对于真实发生过用户发言的聊天，若该消息为默认 User（如未注册进 power_user.personas 时的 user-default.png）或历史改名消息，兜底归属给默认/当前人设
+      if (!msgAvatarId) {
+        if (
+          String(msg.name || '').trim().toLowerCase() === 'user' &&
+          personaByAvatar.has('user-default.png')
+        ) {
+          msgAvatarId = 'user-default.png';
+        } else if (validUnattributedUserFallbackId) {
+          msgAvatarId = validUnattributedUserFallbackId;
+        }
       }
       if (msgAvatarId && personaByAvatar.has(msgAvatarId)) {
         userHitsCount.set(msgAvatarId, (userHitsCount.get(msgAvatarId) || 0) + 1);
@@ -586,9 +735,9 @@ function attributeChatMessagesToPersonas({
     }
   }
 
-  // 如果该档还没有用户发言（例如只有开场白），则归给 chatLevelAvatarId 或 fallbackAvatarId
+  // 如果该档还没有用户发言（例如只有开场白），仅在显式锁卡/绑卡时归属，不把未聊过的新卡开场白误算进默认人设
   if (userHitsCount.size === 0) {
-    const targetId = chatLevelAvatarId || fallbackAvatarId;
+    const targetId = chatLevelAvatarId || validFallbackId;
     if (targetId && personaByAvatar.has(targetId) && (totalUserMsgs > 0 || totalAiMsgs > 0)) {
       userHitsCount.set(targetId, totalUserMsgs);
     }
@@ -652,32 +801,72 @@ function attributeChatMessagesToPersonas({
   return anyChanged;
 }
 
+function normalizeChatPayloadLines(rawPayload) {
+  if (Array.isArray(rawPayload)) return rawPayload;
+  if (rawPayload && typeof rawPayload === 'object') {
+    if (Array.isArray(rawPayload.messages)) return rawPayload.messages;
+    if (Array.isArray(rawPayload.chat)) return rawPayload.chat;
+  }
+  return [];
+}
+
 /**
- * 实时记录当前打开聊天窗口的使用统计
+ * 实时记录当前打开聊天窗口（单人角色卡 & 群聊）的使用统计
  */
 function recordCurrentOpenChatStats() {
   try {
     const context = getContext();
-    const currentChar = getCurrentCharacter();
-    if (!currentChar?.name) return;
-
-    const rawChars = Array.isArray(context.characters) ? context.characters : [];
-    const rawChar = rawChars[currentChar.index];
-    const chatId = String(
-      context.chatId || rawChar?.chat || ''
-    )
-      .replace(/\.jsonl$/i, '')
-      .trim();
-    if (!chatId) return;
-
     const chatMessages = Array.isArray(context.chat) ? context.chat : [];
     if (chatMessages.length === 0) return;
 
+    let targetName = '';
+    let targetAvatar = '';
+    let chatId = '';
+
+    if (context.groupId) {
+      const hostGroups = Array.isArray(context.groups) ? context.groups : [];
+      const activeGroup = hostGroups.find((g) => String(g?.id) === String(context.groupId));
+      if (!activeGroup) return;
+      const gName = String(activeGroup.name || activeGroup.id || '').trim();
+      if (!gName) return;
+      targetName = `${gName} (群聊)`;
+      targetAvatar = String(activeGroup.avatar_url || `group:${activeGroup.id}`).trim();
+      chatId = String(
+        activeGroup.chat_id ||
+          context.chatId ||
+          (typeof context.getCurrentChatId === 'function' ? context.getCurrentChatId() : '') ||
+          ''
+      )
+        .replace(/\.jsonl$/i, '')
+        .trim();
+    } else {
+      const currentChar = getCurrentCharacter();
+      if (!currentChar?.name) return;
+      const rawChars = Array.isArray(context.characters) ? context.characters : [];
+      const rawChar = rawChars[currentChar.index];
+      targetName = currentChar.name;
+      targetAvatar = currentChar.avatar;
+      chatId = String(
+        context.chatId ||
+          rawChar?.chat ||
+          (typeof context.getCurrentChatId === 'function' ? context.getCurrentChatId() : '') ||
+          ''
+      )
+        .replace(/\.jsonl$/i, '')
+        .trim();
+    }
+
+    if (!chatId) return;
+
     const allPersonas = getHostPersonas();
+    if (allPersonas.length === 0) return;
     const activeId = getActiveAvatarId();
+    const pu = context.powerUserSettings || globalThis.power_user || {};
+    const defaultFallback = activeId || pu.default_persona || allPersonas[0]?.avatarId || '';
+
     const updated = attributeChatMessagesToPersonas({
-      charName: currentChar.name,
-      charAvatar: currentChar.avatar,
+      charName: targetName,
+      charAvatar: targetAvatar,
       chatId,
       headerObj: {
         user_name: context.name1,
@@ -686,9 +875,11 @@ function recordCurrentOpenChatStats() {
       messages: chatMessages,
       allPersonas,
       fallbackAvatarId: activeId,
+      unattributedUserFallbackId: defaultFallback,
     });
 
     if (updated) {
+      invalidateRenderedHtmlCache();
       saveSettings();
     }
   } catch (err) {
@@ -697,41 +888,79 @@ function recordCurrentOpenChatStats() {
 }
 
 /**
- * 一键扫描酒馆内所有角色卡的历史聊天档，回溯每个 User 聊过几个角色卡、几个聊天档、聊了多久
+ * 一键扫描酒馆内所有角色卡与群聊的历史聊天档，回溯每个 User 聊过几个角色卡、几个聊天档、聊了多久
  */
-async function scanAllHistoricalChatsForStats() {
+async function scanAllHistoricalChatsForStats({ silent = false } = {}) {
   if (state.isScanningHistory) return;
   state.isScanningHistory = true;
-  state.scanProgressText = '准备扫描…';
-  refreshAllViews();
+  if (!silent) {
+    state.scanProgressText = '准备扫描…';
+    invalidateRenderedHtmlCache();
+    refreshAllViews();
+  }
 
   try {
+    await refreshDiskAvatarSet();
     const context = getContext();
-    const rawChars = Array.isArray(context.characters) ? context.characters : [];
-    const allPersonas = getHostPersonas();
     const headers =
       typeof context.getRequestHeaders === 'function'
         ? context.getRequestHeaders()
         : { 'Content-Type': 'application/json' };
 
+    let rawChars = Array.isArray(context.characters) ? context.characters : [];
+    if (rawChars.length > 0) {
+      state.cachedHostCharacters = rawChars;
+    } else {
+      try {
+        const allCharsRes = await fetch('/api/characters/all', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({}),
+        });
+        if (allCharsRes.ok) {
+          const fetchedChars = await allCharsRes.json();
+          if (Array.isArray(fetchedChars) && fetchedChars.length > 0) {
+            rawChars = fetchedChars;
+            state.cachedHostCharacters = fetchedChars;
+          }
+        }
+      } catch (_e) {}
+    }
+
+    const hostGroups = Array.isArray(context.groups) ? context.groups : [];
+    const allPersonas = getHostPersonas();
+    const pu = context.powerUserSettings || globalThis.power_user || {};
+    const activeId = getActiveAvatarId();
+    const globalUserMsgFallbackId =
+      pu.default_persona ||
+      activeId ||
+      (allPersonas.length === 1 ? allPersonas[0].avatarId : '');
+
     let scannedChars = 0;
     let scannedChatFiles = 0;
 
+    // 1) 扫描全部单人角色卡聊天档
     for (let i = 0; i < rawChars.length; i++) {
       const rawChar = rawChars[i];
       const charName = String(rawChar?.name || '').trim();
       const charAvatar = String(rawChar?.avatar || '').trim();
       if (!charName || !charAvatar) continue;
 
-      state.scanProgressText = `扫描中 (${i + 1}/${rawChars.length})：${charName}`;
-      syncNativePersonaPanelEnhancement({ forceRight: true });
+      if (!silent) {
+        state.scanProgressText = `扫描中 (${i + 1}/${rawChars.length})：${charName}`;
+        syncNativePersonaPanelEnhancement({ forceRight: true });
+      }
 
       let chatList = [];
       try {
         const listRes = await fetch('/api/characters/chats', {
           method: 'POST',
           headers,
-          body: JSON.stringify({ avatar_url: charAvatar, metadata: true }),
+          body: JSON.stringify({
+            avatar_url: charAvatar,
+            ch_name: charName,
+            metadata: true,
+          }),
         });
         if (listRes.ok) {
           const data = await listRes.json();
@@ -742,7 +971,7 @@ async function scanAllHistoricalChatsForStats() {
       if (!Array.isArray(chatList) || chatList.length === 0) continue;
       let charHadValidChat = false;
 
-      // 如果该角色卡在 Luker 或本插件下只绑定了唯一一个专属 User，可作为该角色卡历史聊天档的默认归属兜底
+      // 如果该角色卡在 Luker、原生连线或本插件下只绑定了唯一一个专属 User，可作为该角色卡历史聊天档的默认归属兜底
       const charDedicatedPersonas = allPersonas.filter((p) =>
         p.meta.boundCharacters.some((c) => c.toLowerCase() === charName.toLowerCase())
       );
@@ -762,10 +991,11 @@ async function scanAllHistoricalChatsForStats() {
               ch_name: charName,
               file_name: fileId,
               avatar_url: charAvatar,
+              allow_not_found: true,
             }),
           });
           if (!chatRes.ok) continue;
-          const lines = await chatRes.json();
+          const lines = normalizeChatPayloadLines(await chatRes.json());
           if (!Array.isArray(lines) || lines.length === 0) continue;
 
           const firstLine = lines[0];
@@ -775,7 +1005,13 @@ async function scanAllHistoricalChatsForStats() {
             !Object.hasOwn(firstLine, 'mes') &&
             (Object.hasOwn(firstLine, 'user_name') || Object.hasOwn(firstLine, 'chat_metadata'));
           const headerObj = hasHeader
-            ? firstLine
+            ? {
+                ...firstLine,
+                chat_metadata: {
+                  ...(chatInfo?.chat_metadata || {}),
+                  ...(firstLine.chat_metadata || {}),
+                },
+              }
             : { chat_metadata: chatInfo?.chat_metadata || {} };
           const msgLines = hasHeader ? lines.slice(1) : lines;
 
@@ -789,6 +1025,7 @@ async function scanAllHistoricalChatsForStats() {
             messages: msgLines,
             allPersonas,
             fallbackAvatarId: charDefaultAvatarId,
+            unattributedUserFallbackId: charDefaultAvatarId || globalUserMsgFallbackId,
           });
           if (hit) {
             scannedChatFiles++;
@@ -802,27 +1039,139 @@ async function scanAllHistoricalChatsForStats() {
       }
     }
 
+    // 2) 扫描全部群聊历史聊天档 (/api/chats/group/get)
+    for (let gIdx = 0; gIdx < hostGroups.length; gIdx++) {
+      const group = hostGroups[gIdx];
+      const rawGroupName = String(group?.name || group?.id || '').trim();
+      if (!rawGroupName) continue;
+      const groupDisplayName = `${rawGroupName} (群聊)`;
+      const groupAvatarKey = String(group?.avatar_url || `group:${group.id}`).trim();
+
+      const groupChatIds = new Set();
+      if (group?.chat_id) {
+        groupChatIds.add(String(group.chat_id).replace(/\.jsonl$/i, '').trim());
+      }
+      if (Array.isArray(group?.chats)) {
+        for (const cid of group.chats) {
+          const cleanCid = String(cid || '').replace(/\.jsonl$/i, '').trim();
+          if (cleanCid) groupChatIds.add(cleanCid);
+        }
+      }
+      if (groupChatIds.size === 0) continue;
+
+      const groupDedicatedPersonas = allPersonas.filter((p) =>
+        p.meta.boundCharacters.some((c) => c.toLowerCase() === rawGroupName.toLowerCase())
+      );
+      const groupDefaultAvatarId =
+        groupDedicatedPersonas.length === 1 ? groupDedicatedPersonas[0].avatarId : '';
+
+      let groupHadValidChat = false;
+      for (const gChatId of groupChatIds) {
+        try {
+          const gRes = await fetch('/api/chats/group/get', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              id: gChatId,
+              allow_not_found: true,
+            }),
+          });
+          if (!gRes.ok) continue;
+          const lines = normalizeChatPayloadLines(await gRes.json());
+          if (!Array.isArray(lines) || lines.length === 0) continue;
+
+          const firstLine = lines[0];
+          const hasHeader =
+            firstLine &&
+            typeof firstLine === 'object' &&
+            !Object.hasOwn(firstLine, 'mes') &&
+            (Object.hasOwn(firstLine, 'user_name') || Object.hasOwn(firstLine, 'chat_metadata'));
+          const headerObj = hasHeader ? firstLine : { chat_metadata: {} };
+          const msgLines = hasHeader ? lines.slice(1) : lines;
+          if (msgLines.length === 0) continue;
+
+          const hit = attributeChatMessagesToPersonas({
+            charName: groupDisplayName,
+            charAvatar: groupAvatarKey,
+            chatId: gChatId,
+            headerObj,
+            messages: msgLines,
+            allPersonas,
+            fallbackAvatarId: groupDefaultAvatarId,
+            unattributedUserFallbackId: groupDefaultAvatarId || globalUserMsgFallbackId,
+          });
+          if (hit) {
+            scannedChatFiles++;
+            groupHadValidChat = true;
+          }
+        } catch (_e) {}
+      }
+
+      if (groupHadValidChat) {
+        scannedChars++;
+      }
+    }
+
+    // 同时补记当前已打开窗口的内存态消息
+    recordCurrentOpenChatStats();
+
+    if (rawChars.length > 0 || hostGroups.length > 0) {
+      const settings = getSettings();
+      settings._autoScannedStatsVersion = 2;
+    }
+
     saveSettings();
-    globalThis.toastr?.success?.(
-      `历史统计回溯完成：共扫描识别 ${scannedChars} 个角色卡、${scannedChatFiles} 个聊天档`
-    );
+    if (!silent) {
+      globalThis.toastr?.success?.(
+        `历史统计回溯完成：共扫描识别 ${scannedChars} 个角色/群聊、${scannedChatFiles} 个聊天档`
+      );
+    }
   } catch (err) {
     console.error(`[${MODULE_ID}] 历史聊天扫描异常:`, err);
-    globalThis.toastr?.error?.(`扫描出错：${err.message}`);
+    if (!silent) {
+      globalThis.toastr?.error?.(`扫描出错：${err.message}`);
+    }
   } finally {
     state.isScanningHistory = false;
     state.scanProgressText = '';
+    invalidateRenderedHtmlCache();
     refreshAllViews();
   }
 }
 
 /**
- * 读取酒馆所有角色卡与群聊实体（用于识别角色下绑定的多个 User 并自动归组）
+ * 首次安装或升级到修复版后，当检测到历史统计尚未完成自动回溯（或所有 User 统计全为空）时，
+ * 自动在后台静默回溯一次全部历史聊天档，无需用户手动点击「扫描历史档」即可直接看到统计数据！
+ */
+function scheduleAutoHistoricalStatsBackfill(delayMs = 500) {
+  if (state.isScanningHistory || state.hasCompletedAutoStatsScan) return;
+  const settings = getSettings();
+  if (settings._autoScannedStatsVersion === 2) {
+    state.hasCompletedAutoStatsScan = true;
+    return;
+  }
+  if (state.autoStatsScanTimerId) return;
+
+  state.autoStatsScanTimerId = setTimeout(async () => {
+    state.autoStatsScanTimerId = null;
+    if (state.isScanningHistory || state.hasCompletedAutoStatsScan) return;
+    try {
+      state.hasCompletedAutoStatsScan = true;
+      await scanAllHistoricalChatsForStats({ silent: true });
+    } catch (_e) {}
+  }, delayMs);
+}
+
+/**
+ * 读取酒馆所有角色卡与群聊实体（兼容 TauriTavern 欢迎页未展开抽屉时 context.characters 懒加载为空数组的情况）
  */
 function getHostCharacters() {
   try {
     const context = getContext();
-    const chars = Array.isArray(context.characters) ? context.characters : [];
+    const chars =
+      Array.isArray(context.characters) && context.characters.length > 0
+        ? context.characters
+        : state.cachedHostCharacters;
     const currentChid =
       context.characterId !== undefined && context.characterId !== null
         ? Number(context.characterId)
@@ -841,7 +1190,7 @@ function getHostCharacters() {
         name: String(c?.name || '').trim(),
         avatar: String(c?.avatar || '').trim(),
         avatarUrl: getThumb(c?.avatar),
-        isCurrent: idx === currentChid,
+        isCurrent: idx === currentChid && Array.isArray(context.characters) && context.characters.length > 0,
       }))
       .filter((c) => c.name);
   } catch (_e) {
@@ -1793,7 +2142,10 @@ function getHostPersonas() {
       ? pu.persona_descriptions
       : {};
 
-  const rawChars = Array.isArray(context?.characters) ? context.characters : [];
+  const rawChars =
+    Array.isArray(context?.characters) && context.characters.length > 0
+      ? context.characters
+      : state.cachedHostCharacters;
   const hostChars = getHostCharacters();
   const charByAvatar = new Map(hostChars.map((c) => [c.avatar, c]));
   const charByNameLower = new Map(hostChars.map((c) => [c.name.toLowerCase(), c]));
@@ -1975,11 +2327,17 @@ function getHostPersonas() {
     for (const diskFile of state.diskAvatarSet) {
       if (!resultMap.has(diskFile)) {
         const descObj = descMap[diskFile] || {};
+        const isDefaultAvatar =
+          diskFile === 'user-default.png' ||
+          (diskFile === activeAvatarId && context?.name1);
+        const fallbackDisplayName = isDefaultAvatar
+          ? String(context?.name1 || 'User')
+          : diskFile.replace(/\.(png|webp|jpg|jpeg|gif)$/i, '');
         resultMap.set(diskFile, {
           avatarId: diskFile,
-          name: String(personasMap[diskFile] || diskFile.replace(/\.(png|webp|jpg|jpeg|gif)$/i, '')),
-          description: String(descObj.description ?? ''),
-          lorebook: String(descObj.lorebook ?? ''),
+          name: String(personasMap[diskFile] || fallbackDisplayName),
+          description: String(descObj.description ?? (diskFile === activeAvatarId ? pu.persona_description ?? '' : '')),
+          lorebook: String(descObj.lorebook ?? (diskFile === activeAvatarId ? pu.persona_description_lorebook ?? '' : '')),
           title: String(descObj.title ?? ''),
           connections: Array.isArray(descObj.connections) ? descObj.connections : [],
           lukerDedicatedChars: [],
@@ -5905,6 +6263,7 @@ async function initExtension() {
   observeNativeAvatarBlock();
   recordCurrentOpenChatStats();
   refreshAllViews();
+  scheduleAutoHistoricalStatsBackfill(450);
 
   const onGlobalKeydown = (e) => {
     state.lastUserInteractionAt = Date.now();
@@ -5935,16 +6294,45 @@ async function initExtension() {
       if (document.hidden) return;
       if (Date.now() - state.lastUserInteractionAt > 120_000) return;
       const context = getContext();
-      const charId = context.characterId;
-      if (charId === undefined || charId === null || Number(charId) < 0) return;
-      const charObj = context.characters?.[charId];
-      if (!charObj?.avatar) return;
       const activeId = getActiveAvatarId();
       if (!activeId) return;
 
+      let entityKey = '';
+      let chatFile = '';
+
+      if (context.groupId) {
+        const hostGroups = Array.isArray(context.groups) ? context.groups : [];
+        const activeGroup = hostGroups.find((g) => String(g?.id) === String(context.groupId));
+        if (!activeGroup) return;
+        entityKey = String(activeGroup.avatar_url || `group:${activeGroup.id}`).trim();
+        chatFile = String(
+          activeGroup.chat_id ||
+            context.chatId ||
+            (typeof context.getCurrentChatId === 'function' ? context.getCurrentChatId() : '') ||
+            'active_group_chat'
+        )
+          .replace(/\.jsonl$/i, '')
+          .trim();
+      } else {
+        const charId = context.characterId;
+        if (charId === undefined || charId === null || Number(charId) < 0) return;
+        const charObj = context.characters?.[charId];
+        if (!charObj?.avatar) return;
+        entityKey = String(charObj.avatar).trim();
+        chatFile = String(
+          charObj.chat ||
+            context.chatId ||
+            (typeof context.getCurrentChatId === 'function' ? context.getCurrentChatId() : '') ||
+            'active_chat'
+        )
+          .replace(/\.jsonl$/i, '')
+          .trim();
+      }
+
+      if (!entityKey || !chatFile) return;
+
       const meta = ensureProfileMeta(activeId);
-      const chatFile = String(charObj.chat || context.chatId || 'active_chat').trim();
-      const chatKey = `${charObj.avatar}::${chatFile}`;
+      const chatKey = `${entityKey}::${chatFile}`;
       if (meta.usageStats.chats[chatKey]) {
         meta.usageStats.chats[chatKey].durationMs =
           (Number(meta.usageStats.chats[chatKey].durationMs) || 0) + 15_000;
@@ -6004,7 +6392,10 @@ async function initExtension() {
       if (e?.target && document.querySelector('#PersonaManagement')?.contains(e.target)) {
         return;
       }
-      setTimeout(() => syncNativePersonaPanelEnhancement(), 30);
+      setTimeout(() => {
+        syncNativePersonaPanelEnhancement();
+        scheduleAutoHistoricalStatsBackfill(120);
+      }, 30);
     };
     personaDrawerToggle.addEventListener('click', onPersonaDrawerClick);
     state.disposers.push(() =>
@@ -6014,8 +6405,9 @@ async function initExtension() {
 
   try {
     const context = getContext();
-    const { eventSource, event_types } = context;
-    if (eventSource && event_types) {
+    const { eventSource } = context;
+    const evtTypes = context.eventTypes || context.event_types;
+    if (eventSource && evtTypes) {
       const subscribe = (evtName, handler) => {
         if (!evtName) return;
         eventSource.on(evtName, handler);
@@ -6032,6 +6424,7 @@ async function initExtension() {
         invalidateRenderedHtmlCache();
         recordCurrentOpenChatStats();
         refreshAllViews();
+        scheduleAutoHistoricalStatsBackfill(350);
       };
 
       const onChatMessageActivity = () => {
@@ -6044,41 +6437,48 @@ async function initExtension() {
         refreshAllViews();
       };
 
-      subscribe(event_types.APP_READY, onAppOrSettingsLoaded);
-      subscribe(event_types.SETTINGS_LOADED_AFTER, onAppOrSettingsLoaded);
-      subscribe(event_types.CHAT_CHANGED, () => {
+      subscribe(evtTypes.APP_READY, onAppOrSettingsLoaded);
+      subscribe(evtTypes.SETTINGS_LOADED_AFTER, onAppOrSettingsLoaded);
+      subscribe(evtTypes.EXTENSION_SETTINGS_LOADED, onAppOrSettingsLoaded);
+      subscribe(evtTypes.CHAT_LOADED, () => {
+        recordCurrentOpenChatStats();
+        refreshAllViews();
+        scheduleAutoHistoricalStatsBackfill(300);
+      });
+      subscribe(evtTypes.CHAT_CHANGED, () => {
         if (state.lastUsageDirty) {
           state.lastUsageDirty = false;
           saveSettings();
         }
         onChatChanged();
+        scheduleAutoHistoricalStatsBackfill(300);
       });
-      subscribe(event_types.MESSAGE_SENT, onChatMessageActivity);
-      subscribe(event_types.MESSAGE_RECEIVED, onChatMessageActivity);
-      subscribe(event_types.GENERATION_ENDED, onChatMessageActivity);
-      subscribe(event_types.SETTINGS_UPDATED, refreshAllViews);
-      subscribe(event_types.WORLDINFO_UPDATED, () => {
+      subscribe(evtTypes.MESSAGE_SENT, onChatMessageActivity);
+      subscribe(evtTypes.MESSAGE_RECEIVED, onChatMessageActivity);
+      subscribe(evtTypes.GENERATION_ENDED, onChatMessageActivity);
+      subscribe(evtTypes.SETTINGS_UPDATED, refreshAllViews);
+      subscribe(evtTypes.WORLDINFO_UPDATED, () => {
         state.worldbookCache.clear();
         refreshAllViews();
       });
-      subscribe(event_types.PERSONA_CHANGED, () => {
+      subscribe(evtTypes.PERSONA_CHANGED, () => {
         recordCurrentOpenChatStats();
         refreshAllViews();
       });
-      subscribe(event_types.PERSONA_CREATED, async () => {
+      subscribe(evtTypes.PERSONA_CREATED, async () => {
         await refreshDiskAvatarSet();
         invalidateRenderedHtmlCache();
         refreshAllViews();
       });
-      subscribe(event_types.PERSONA_UPDATED, () => {
+      subscribe(evtTypes.PERSONA_UPDATED, () => {
         invalidateRenderedHtmlCache();
         refreshAllViews();
       });
-      subscribe(event_types.PERSONA_RENAMED, () => {
+      subscribe(evtTypes.PERSONA_RENAMED, () => {
         invalidateRenderedHtmlCache();
         refreshAllViews();
       });
-      subscribe(event_types.PERSONA_DELETED, async () => {
+      subscribe(evtTypes.PERSONA_DELETED, async () => {
         await refreshDiskAvatarSet();
         invalidateRenderedHtmlCache();
         refreshAllViews();
@@ -6097,6 +6497,10 @@ export async function onDisable() {
   if (state.harvestTimerId) {
     clearTimeout(state.harvestTimerId);
     state.harvestTimerId = null;
+  }
+  if (state.autoStatsScanTimerId) {
+    clearTimeout(state.autoStatsScanTimerId);
+    state.autoStatsScanTimerId = null;
   }
   if (state.avatarCacheSaveTimer) {
     clearTimeout(state.avatarCacheSaveTimer);
