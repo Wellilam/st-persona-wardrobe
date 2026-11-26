@@ -296,6 +296,12 @@ function getSettings() {
   }
   if (!store.avatarUrlCache || typeof store.avatarUrlCache !== 'object') {
     store.avatarUrlCache = {};
+  } else {
+    for (const [k, v] of Object.entries(store.avatarUrlCache)) {
+      if (isTinyPlaceholderDataUri(v)) {
+        delete store.avatarUrlCache[k];
+      }
+    }
   }
 
   // 自动清理早期版本遗留且没有任何人设使用的空预设分组
@@ -958,13 +964,54 @@ function extractUrlFromCssBg(bgValue) {
   const raw = String(bgValue || '').trim();
   if (!raw || raw === 'none') return '';
   const m = raw.match(/url\((['"]?)(.*?)\1\)/i);
-  return m?.[2]?.trim() || '';
+  const extracted = m?.[2]?.trim() || '';
+  return isTinyPlaceholderDataUri(extracted) ? '' : extracted;
+}
+
+/**
+ * 识别并拉黑所有 1x1 懒加载占位 Base64 图（如 bLazy / 懒加载脚本经典的 data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==）
+ */
+function isTinyPlaceholderDataUri(url) {
+  const s = String(url || '').trim();
+  if (!s) return true;
+  if (
+    s.includes('R0lGODlhAQAB') ||
+    s.includes('R0lGODdhAQAB') ||
+    s.includes('iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB')
+  ) {
+    return true;
+  }
+  if (s.startsWith('data:image/') && s.length < 240) {
+    return true;
+  }
+  if (s === 'about:blank') {
+    return true;
+  }
+  return false;
+}
+
+function getRealSrcFromLazyImg(img) {
+  if (!img || typeof img.getAttribute !== 'function') return '';
+  for (const attr of [
+    'data-src',
+    'data-lazy-src',
+    'data-original',
+    'data-url',
+    'data-echo',
+    'data- lazy',
+  ]) {
+    const val = String(img.getAttribute(attr) || '').trim();
+    if (val && !isTinyPlaceholderDataUri(val)) {
+      return val;
+    }
+  }
+  return '';
 }
 
 function isLikelyImageUrl(val) {
   if (typeof val !== 'string') return false;
   const s = val.trim();
-  if (!s || s.length > 2_000_000) return false;
+  if (!s || s.length > 2_000_000 || isTinyPlaceholderDataUri(s)) return false;
   if (
     s.startsWith('https://') ||
     s.startsWith('http://') ||
@@ -981,11 +1028,13 @@ function isLikelyImageUrl(val) {
 }
 
 /**
- * 判断某个 URL 是否属于云头像/图床/IndexedDB Blob/美化脚本改写后的自定义头像地址（而非酒馆默认的本地缩略图或 User Avatars 直链）
+ * 判断某个 URL 是否属于云头像/图床/IndexedDB Blob/美化脚本改写后的自定义头像地址（而非酒馆默认的本地缩略图、直链或 1x1 懒加载占位符）
  */
 function isExternalOrCustomAvatarUrl(url, avatarId) {
   const s = String(url || '').trim();
-  if (!s || s.endsWith('img/ai4.png') || s === 'img/ai4.png') return false;
+  if (!s || isTinyPlaceholderDataUri(s) || s.endsWith('img/ai4.png') || s === 'img/ai4.png') {
+    return false;
+  }
   if (s.startsWith('blob:') || s.startsWith('data:image/')) return true;
 
   const cleanId = String(avatarId || '').trim();
@@ -1022,7 +1071,7 @@ function isExternalOrCustomAvatarUrl(url, avatarId) {
 
 function isPersistableExternalUrl(url) {
   const s = String(url || '').trim();
-  if (!s || s.startsWith('blob:')) return false;
+  if (!s || s.startsWith('blob:') || isTinyPlaceholderDataUri(s)) return false;
   if (s.startsWith('data:image/')) {
     return s.length <= 48_000;
   }
@@ -1043,7 +1092,7 @@ function saveAvatarCacheDebounced() {
 function recordResolvedExternalAvatar(avatarId, url) {
   const cleanId = String(avatarId || '').trim();
   const cleanUrl = String(url || '').trim();
-  if (!cleanId || !cleanUrl) return false;
+  if (!cleanId || !cleanUrl || isTinyPlaceholderDataUri(cleanUrl)) return false;
 
   const prevMem = state.resolvedExternalAvatars.get(cleanId);
   state.resolvedExternalAvatars.set(cleanId, cleanUrl);
@@ -1276,27 +1325,30 @@ function harvestCurrentNativeDomAvatars() {
       const avatarBox = node.querySelector('.avatar');
       const imgs = node.querySelectorAll('img');
       for (const img of imgs) {
+        const lazyAttrUrl = getRealSrcFromLazyImg(img);
         const candidates = [
+          lazyAttrUrl,
           img.getAttribute('src'),
           img.currentSrc,
-          img.dataset?.src,
-          img.dataset?.lazySrc,
         ];
         for (const raw of candidates) {
           const u = String(raw || '').trim();
-          if (u && isExternalOrCustomAvatarUrl(u, avatarId)) {
+          if (!u || isTinyPlaceholderDataUri(u)) continue;
+          if (isExternalOrCustomAvatarUrl(u, avatarId)) {
             if (recordResolvedExternalAvatar(avatarId, u)) harvested++;
             return;
           }
         }
-        // 若原生节点里的同源地址已重新生成为非纯白真实图像（例如某些插件按需落地真实图片文件）
-        const liveSrc = String(img.currentSrc || img.getAttribute('src') || '').trim();
+        // 若原生节点里的同源地址已重新生成为非纯白真实图像（或从 data-src 拿到了真实同源地址）
+        const liveSrc = String(
+          lazyAttrUrl || img.currentSrc || img.getAttribute('src') || ''
+        ).trim();
         if (
           liveSrc &&
+          !isTinyPlaceholderDataUri(liveSrc) &&
           state.whitePlaceholderIds.has(avatarId) &&
-          img.complete &&
-          img.naturalWidth > 4 &&
-          !checkIsUniformBlankPlaceholder(img)
+          (Boolean(lazyAttrUrl) ||
+            (img.complete && img.naturalWidth > 4 && !checkIsUniformBlankPlaceholder(img)))
         ) {
           state.whitePlaceholderIds.delete(avatarId);
           state.avatarCacheBust.set(avatarId, Date.now());
@@ -1473,10 +1525,10 @@ function resolvePersonaAvatarUrl(avatarId) {
   detectHostPersonaAvatarMode();
   const bust = state.avatarCacheBust.get(clean);
 
-  // 1) 优先使用已捕获的云头像/图床/IndexedDB Blob/美化脚本真实头像（除非用户刚刚手动上传了新本地头像）
+  // 1) 优先使用已捕获的云头像/图床/IndexedDB Blob/美化脚本真实头像（绝不采信 R0lGODlhAQAB 等 1x1 懒加载空白占位符！）
   if (!bust) {
     const memExt = state.resolvedExternalAvatars.get(clean);
-    if (memExt) return memExt;
+    if (memExt && !isTinyPlaceholderDataUri(memExt)) return memExt;
 
     try {
       const escaped = globalThis.CSS?.escape
@@ -1486,12 +1538,25 @@ function resolvePersonaAvatarUrl(avatarId) {
         `#user_avatar_block .avatar-container[data-avatar-id="${escaped}"]`
       );
       if (domNode) {
-        const domImg = domNode.querySelector('img[src]');
+        const domImg = domNode.querySelector('img');
+        // 优先提取懒加载脚本暂存在 data-src / data-original / data-lazy-src 上的真实头像地址
+        const lazyRealSrc = getRealSrcFromLazyImg(domImg);
+        if (lazyRealSrc) {
+          if (isExternalOrCustomAvatarUrl(lazyRealSrc, clean)) {
+            state.resolvedExternalAvatars.set(clean, lazyRealSrc);
+          }
+          return lazyRealSrc;
+        }
+
         const domSrc = domImg?.getAttribute('src')?.trim() || '';
-        if (domSrc && isExternalOrCustomAvatarUrl(domSrc, clean)) {
-          state.resolvedExternalAvatars.set(clean, domSrc);
+        // 关键修复：若原生 #user_avatar_block 里的 img.src 是 1x1 懒加载占位 GIF (R0lGODlhAQAB...)，直接忽略它，继续向下走真实缩略图/原图地址！
+        if (domSrc && !isTinyPlaceholderDataUri(domSrc)) {
+          if (isExternalOrCustomAvatarUrl(domSrc, clean)) {
+            state.resolvedExternalAvatars.set(clean, domSrc);
+          }
           return domSrc;
         }
+
         const bgUrl = extractUrlFromCssBg(
           domNode.querySelector('.avatar')?.style?.backgroundImage ||
             domNode.style?.backgroundImage
@@ -1500,13 +1565,12 @@ function resolvePersonaAvatarUrl(avatarId) {
           state.resolvedExternalAvatars.set(clean, bgUrl);
           return bgUrl;
         }
-        if (domSrc) return domSrc;
       }
     } catch (_e) {}
 
     try {
       const persistedExt = getSettings().avatarUrlCache?.[clean];
-      if (persistedExt) return persistedExt;
+      if (persistedExt && !isTinyPlaceholderDataUri(persistedExt)) return persistedExt;
     } catch (_e) {}
   }
 
@@ -1546,6 +1610,26 @@ function bindAvatarErrorFallback(container) {
       if (currentSrc.endsWith('img/ai4.png')) {
         img.classList.remove('st-pw-placeholder-pending');
         return;
+      }
+
+      // 若全局懒加载插件强行把本插件自己的 <img> src 也改写成了 1x1 占位 GIF (R0lGODlhAQAB...)，立即从 data-src 或 data-real-src 夺回真实地址！
+      if (isTinyPlaceholderDataUri(currentSrc)) {
+        const stolenReal =
+          getRealSrcFromLazyImg(img) ||
+          img.getAttribute('data-real-src') ||
+          '';
+        if (
+          stolenReal &&
+          !isTinyPlaceholderDataUri(stolenReal) &&
+          !img.dataset.restoredRealSrc
+        ) {
+          img.dataset.restoredRealSrc = '1';
+          img.classList.remove('b-lazy', 'lazyload');
+          img.classList.add('b-loaded', 'loaded');
+          img.setAttribute('data-loaded', 'true');
+          img.setAttribute('src', stolenReal);
+          return;
+        }
       }
 
       if (checkIsUniformBlankPlaceholder(img)) {
@@ -3441,7 +3525,7 @@ function renderPersonaRowHtml(p, selectedAvatarId) {
     !getSettings().avatarUrlCache?.[p.avatarId];
   return `
     <div class="st-pw-persona-item ${isSelected ? 'is-selected' : ''} ${p.isActive ? 'is-active-user' : ''}" data-avatar-id="${escapeAttr(p.avatarId)}">
-      <img class="st-pw-item-avatar ${isPendingPlaceholder ? 'st-pw-placeholder-pending' : ''}" src="${escapeAttr(p.avatarUrl)}" data-avatar-id="${escapeAttr(p.avatarId)}" data-fallback-src="${escapeAttr(fallbackAvatarUrl)}" decoding="async" alt="" />
+      <img class="st-pw-item-avatar b-loaded loaded ${isPendingPlaceholder ? 'st-pw-placeholder-pending' : ''}" src="${escapeAttr(p.avatarUrl)}" data-real-src="${escapeAttr(p.avatarUrl)}" data-no-lazy="1" data-loaded="true" data-avatar-id="${escapeAttr(p.avatarId)}" data-fallback-src="${escapeAttr(fallbackAvatarUrl)}" decoding="async" alt="" />
       <div class="st-pw-item-main">
         <div class="st-pw-item-title-line">
           <span class="st-pw-item-name">${sanitizeHtml(p.name)}</span>
@@ -3962,7 +4046,7 @@ function renderSelectedPersonaDetail(persona, availableBooks, hostChars, current
   return `
     <div class="st-pw-detail-top">
       <div class="st-pw-detail-user-row">
-        <img class="st-pw-detail-avatar" src="${escapeAttr(persona.avatarUrl)}" data-avatar-id="${escapeAttr(persona.avatarId)}" data-fallback-src="${escapeAttr(resolvePersonaDirectAvatarUrl(persona.avatarId))}" decoding="async" alt="" />
+        <img class="st-pw-detail-avatar b-loaded loaded" src="${escapeAttr(persona.avatarUrl)}" data-real-src="${escapeAttr(persona.avatarUrl)}" data-no-lazy="1" data-loaded="true" data-avatar-id="${escapeAttr(persona.avatarId)}" data-fallback-src="${escapeAttr(resolvePersonaDirectAvatarUrl(persona.avatarId))}" decoding="async" alt="" />
         <div class="st-pw-detail-user-info">
           <div class="st-pw-detail-name-line">
             <strong>${sanitizeHtml(persona.name)}</strong>
