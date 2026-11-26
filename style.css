@@ -320,8 +320,9 @@
 
 .st-pw-modal-header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 9px 12px;
   background: var(--black30a, rgba(0, 0, 0, 0.28));
@@ -330,7 +331,7 @@
 }
 
 .st-pw-header-left {
-  flex: 1;
+  flex: 1 1 160px;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -341,6 +342,7 @@
 .st-pw-modal-title {
   font-size: 0.98rem;
   font-weight: 700;
+  white-space: nowrap;
 }
 
 .st-pw-header-meta {
@@ -355,8 +357,9 @@
 .st-pw-modal-header-actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
-  flex-shrink: 0;
+  max-width: 100%;
 }
 
 /* 5. 世界书条目紧凑列表 (高密度表格行) */
@@ -937,7 +940,8 @@
 
 .st-pw-detail-name-line {
   display: flex;
-  align-items: baseline;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 6px;
 }
