@@ -21,16 +21,25 @@ const DEFAULT_SETTINGS = Object.freeze({
   showWandButton: true,
   autoSwitchOnCharacterChat: true,
   scanDepth: 5,
+  sortBy: 'default', // 'default' | 'recent' | 'duration' | 'chats' | 'fav' | 'name'
+  viewMode: 'standard', // 'standard' | 'compact' | 'grid'
+  collapsedSections: [],
+  collapsedRightBlocks: [],
   groups: [],
   profiles: {},
   avatarUrlCache: {},
 });
+
+const COLLAPSE_CHAR_CHIPS_THRESHOLD = 6;
 
 const state = {
   initialized: false,
   disposers: [],
   activeFilter: 'all', // 'all' | 'global' | 'dedicated' | 'chatted' | 'fav' | 'char:<charKey>' | 'group:<groupName>' | 'ungrouped'
   collapsedSections: new Set(),
+  hydratedCollapsedFromSettings: false,
+  showLeftMoreTools: false,
+  expandedBoundCharsForAvatar: new Set(),
   batchAssignTarget: null, // null | { type: 'character', key: string, name: string } | { type: 'group', name: string }
   searchQuery: '',
   selectedAvatarId: null,
@@ -297,6 +306,24 @@ function getSettings() {
   if (!Array.isArray(store.groups)) {
     store.groups = [];
   }
+  if (!Array.isArray(store.collapsedSections)) {
+    store.collapsedSections = [];
+  }
+  if (!Array.isArray(store.collapsedRightBlocks)) {
+    store.collapsedRightBlocks = [];
+  }
+  if (!['default', 'recent', 'duration', 'chats', 'fav', 'name'].includes(store.sortBy)) {
+    store.sortBy = 'default';
+  }
+  if (!['standard', 'compact', 'grid'].includes(store.viewMode)) {
+    store.viewMode = 'standard';
+  }
+  if (!state.hydratedCollapsedFromSettings) {
+    state.collapsedSections = new Set(
+      store.collapsedSections.map((s) => String(s || '').trim()).filter(Boolean)
+    );
+    state.hydratedCollapsedFromSettings = true;
+  }
   if (!store.profiles || typeof store.profiles !== 'object') {
     store.profiles = {};
   }
@@ -354,6 +381,7 @@ function ensureProfileMeta(avatarId) {
       traits: [],
       presets: [],
       activePresetId: '',
+      lastUsedAt: 0,
       usageStats: {
         chats: {},
         extraLiveMs: 0,
@@ -370,6 +398,7 @@ function ensureProfileMeta(avatarId) {
   if (!Array.isArray(profile.traits)) profile.traits = [];
   if (!Array.isArray(profile.presets)) profile.presets = [];
   if (typeof profile.activePresetId !== 'string') profile.activePresetId = '';
+  if (typeof profile.lastUsedAt !== 'number') profile.lastUsedAt = 0;
   if (!profile.usageStats || typeof profile.usageStats !== 'object') {
     profile.usageStats = { chats: {}, extraLiveMs: 0 };
   }
@@ -462,6 +491,112 @@ function getPersonaUsageSummary(avatarId) {
     lastChatAt,
     byCharacter,
   };
+}
+
+function syncCollapsedSectionsToSettings() {
+  try {
+    const settings = getSettings();
+    settings.collapsedSections = [...state.collapsedSections];
+    saveSettings();
+  } catch (_e) {}
+}
+
+function isRightBlockCollapsed(blockId) {
+  try {
+    const settings = getSettings();
+    return Array.isArray(settings.collapsedRightBlocks) && settings.collapsedRightBlocks.includes(blockId);
+  } catch (_e) {
+    return false;
+  }
+}
+
+function toggleRightBlockCollapsed(blockId) {
+  if (!blockId) return;
+  const settings = getSettings();
+  if (!Array.isArray(settings.collapsedRightBlocks)) {
+    settings.collapsedRightBlocks = [];
+  }
+  const idx = settings.collapsedRightBlocks.indexOf(blockId);
+  if (idx !== -1) {
+    settings.collapsedRightBlocks.splice(idx, 1);
+  } else {
+    settings.collapsedRightBlocks.push(blockId);
+  }
+  saveSettings();
+  invalidateRenderedHtmlCache();
+}
+
+function sortPersonasList(list, sortBy = 'default') {
+  if (!Array.isArray(list) || list.length <= 1 || !sortBy || sortBy === 'default') {
+    return list;
+  }
+  const usageCache = new Map();
+  const getUsage = (p) => {
+    if (!usageCache.has(p.avatarId)) {
+      usageCache.set(p.avatarId, getPersonaUsageSummary(p.avatarId));
+    }
+    return usageCache.get(p.avatarId);
+  };
+
+  return [...list].sort((a, b) => {
+    if (sortBy === 'fav') {
+      const af = Boolean(a.meta?.favorite);
+      const bf = Boolean(b.meta?.favorite);
+      if (af !== bf) return af ? -1 : 1;
+    } else if (sortBy === 'recent') {
+      const au = getUsage(a);
+      const bu = getUsage(b);
+      const at = Math.max(Number(a.meta?.lastUsedAt) || 0, au.lastChatAt || 0, a.isActive ? 1 : 0);
+      const bt = Math.max(Number(b.meta?.lastUsedAt) || 0, bu.lastChatAt || 0, b.isActive ? 1 : 0);
+      if (bt !== at) return bt - at;
+    } else if (sortBy === 'duration') {
+      const au = getUsage(a);
+      const bu = getUsage(b);
+      if (bu.durationMs !== au.durationMs) return bu.durationMs - au.durationMs;
+      if (bu.chatCount !== au.chatCount) return bu.chatCount - au.chatCount;
+    } else if (sortBy === 'chats') {
+      const au = getUsage(a);
+      const bu = getUsage(b);
+      if (bu.chatCount !== au.chatCount) return bu.chatCount - au.chatCount;
+      if (bu.charCount !== au.charCount) return bu.charCount - au.charCount;
+      if (bu.durationMs !== au.durationMs) return bu.durationMs - au.durationMs;
+    } else if (sortBy === 'name') {
+      return String(a.name || '').localeCompare(String(b.name || ''), 'zh-CN', {
+        numeric: true,
+        sensitivity: 'base',
+      });
+    }
+    return 0;
+  });
+}
+
+function moveCustomGroupOrder(groupName, direction) {
+  const clean = String(groupName || '').trim();
+  if (!clean) return;
+  const settings = getSettings();
+  const allNames = [...new Set([...(settings.groups || []).filter(Boolean)])];
+  for (const prof of Object.values(settings.profiles || {})) {
+    const g = String(prof?.group || '').trim();
+    if (g && !allNames.includes(g)) allNames.push(g);
+  }
+  const idx = allNames.indexOf(clean);
+  if (idx === -1) return;
+
+  if (direction === 'top' && idx > 0) {
+    allNames.splice(idx, 1);
+    allNames.unshift(clean);
+  } else if (direction === 'up' && idx > 0) {
+    [allNames[idx - 1], allNames[idx]] = [allNames[idx], allNames[idx - 1]];
+  } else if (direction === 'down' && idx < allNames.length - 1) {
+    [allNames[idx + 1], allNames[idx]] = [allNames[idx], allNames[idx + 1]];
+  } else {
+    return;
+  }
+
+  settings.groups = allNames;
+  invalidateRenderedHtmlCache();
+  saveSettings();
+  refreshAllViews();
 }
 
 const IGNORED_HEADER_USER_NAMES = new Set([
@@ -2718,7 +2853,7 @@ function syncMultiSelectionDomInPlace() {
 
   document
     .querySelectorAll(
-      '.st-pw-multi-group-select, .st-pw-multi-char-select, .st-pw-multi-book-select, .st-pw-multi-fav-on, .st-pw-multi-fav-off, .st-pw-multi-delete, .st-pw-multi-clear'
+      '.st-pw-multi-group-select, .st-pw-multi-char-select, .st-pw-multi-book-select, .st-pw-multi-fav-on, .st-pw-multi-fav-off, .st-pw-multi-export, .st-pw-multi-delete, .st-pw-multi-clear'
     )
     .forEach((ctrl) => {
       ctrl.disabled = !hasAny;
@@ -2755,6 +2890,7 @@ async function executeBatchMoveToGroup(rawTargetGroup) {
   }
   if (finalGroup) {
     state.collapsedSections.delete(`group:${finalGroup}`);
+    syncCollapsedSectionsToSettings();
   }
   // 批量归组后自动清空勾选并保持多选开启，方便紧接着勾选下一批人设归入其他分组！
   state.multiSelectedIds.clear();
@@ -2825,11 +2961,51 @@ async function executeBatchCharacterAction(rawAction) {
   state.hostPersonasModule?.updatePersonaConnectionsAvatarList?.();
   state.hostPersonasModule?.updatePersonaUIStates?.();
   state.collapsedSections.delete(`char:${targetCharName}`);
+  syncCollapsedSectionsToSettings();
   state.multiSelectedIds.clear();
   invalidateRenderedHtmlCache();
   saveSettings();
   refreshAllViews();
   globalThis.toastr?.success?.(`已将 ${ids.length} 个 User 绑定到角色「${targetCharName}」`);
+}
+
+async function clearAllPersonaBoundCharacters(avatarId) {
+  if (!avatarId) return false;
+  const allPersonas = getHostPersonas();
+  const persona = allPersonas.find((p) => p.avatarId === avatarId);
+  const boundList = [...(persona?.meta?.boundCharacters || [])];
+  if (boundList.length === 0) return false;
+
+  if (
+    !(await confirmUserAction(
+      '清空绑定角色卡',
+      `确定清空「${persona?.name || avatarId}」绑定的全部 ${boundList.length} 张角色卡吗？`
+    ))
+  ) {
+    return false;
+  }
+
+  await probeHostModules();
+  for (const cName of boundList) {
+    await unbindPersonaFromCharacter(avatarId, cName, { skipRefresh: true });
+  }
+  const meta = ensureProfileMeta(avatarId);
+  meta.boundCharacters = [];
+  try {
+    const pu = getContext().powerUserSettings || globalThis.power_user;
+    if (Array.isArray(pu?.persona_descriptions?.[avatarId]?.connections)) {
+      pu.persona_descriptions[avatarId].connections = [];
+    }
+  } catch (_e) {}
+
+  state.expandedBoundCharsForAvatar.delete(avatarId);
+  state.hostPersonasModule?.updatePersonaConnectionsAvatarList?.();
+  state.hostPersonasModule?.updatePersonaUIStates?.();
+  invalidateRenderedHtmlCache();
+  saveSettings();
+  refreshAllViews();
+  globalThis.toastr?.success?.(`已清空「${persona?.name || avatarId}」的 ${boundList.length} 个角色绑定`);
+  return true;
 }
 
 async function executeBatchWorldbookAction(rawBook) {
@@ -2953,9 +3129,17 @@ async function switchActivePersona(avatarId) {
   await probeHostModules();
   const personas = getHostPersonas();
   const target = personas.find((p) => p.avatarId === avatarId);
+  const markRecentlyUsed = () => {
+    try {
+      const meta = ensureProfileMeta(avatarId);
+      meta.lastUsedAt = Date.now();
+      saveSettings();
+    } catch (_e) {}
+  };
 
   if (typeof state.hostPersonasModule?.setUserAvatar === 'function') {
     await state.hostPersonasModule.setUserAvatar(avatarId);
+    markRecentlyUsed();
     globalThis.toastr?.success?.(`已切换：${target?.name || avatarId}`);
     refreshAllViews();
     return true;
@@ -2967,6 +3151,7 @@ async function switchActivePersona(avatarId) {
   );
   if (domAvatar) {
     domAvatar.click();
+    markRecentlyUsed();
     globalThis.toastr?.success?.(`已切换：${target?.name || avatarId}`);
     refreshAllViews();
     return true;
@@ -2976,6 +3161,7 @@ async function switchActivePersona(avatarId) {
     const context = getContext();
     if (typeof context.executeSlashCommandsWithOptions === 'function') {
       await context.executeSlashCommandsWithOptions(`/persona-set mode=lookup "${avatarId}"`);
+      markRecentlyUsed();
       globalThis.toastr?.success?.(`已切换：${target?.name || avatarId}`);
       refreshAllViews();
       return true;
@@ -3326,6 +3512,443 @@ async function clonePersonaVariant(sourcePersona, { customName = '', fromPreset 
   refreshAllViews();
   globalThis.toastr?.success?.(`已完整克隆变体「${cleanName}」`);
   return newAvatarId;
+}
+
+function triggerJsonDownload(filename, dataObj) {
+  const payload = typeof dataObj === 'string' ? dataObj : JSON.stringify(dataObj, null, 2);
+  const blob = new Blob([payload], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // 适配 TauriTavern download-bridge：保留 Blob URL 足够时长供异步原生文件落盘
+  setTimeout(() => URL.revokeObjectURL(url), 15_000);
+}
+
+function blobToDataUri(blob) {
+  return new Promise((resolve, reject) => {
+    if (typeof FileReader === 'function') {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(reader.error || new Error('FileReader 读取失败'));
+      reader.readAsDataURL(blob);
+      return;
+    }
+    blob
+      .arrayBuffer()
+      .then((buf) => {
+        const bytes = new Uint8Array(buf);
+        let binary = '';
+        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+        const b64 =
+          typeof btoa === 'function'
+            ? btoa(binary)
+            : globalThis.Buffer?.from(buf).toString('base64') || '';
+        resolve(`data:${blob.type || 'image/png'};base64,${b64}`);
+      })
+      .catch(reject);
+  });
+}
+
+function dataUriToBlob(dataUri) {
+  const raw = String(dataUri || '').trim();
+  const m = raw.match(/^data:([^;,]+)?(;base64)?,(.*)$/s);
+  if (!m) return null;
+  const mime = m[1] || 'image/png';
+  const isBase64 = Boolean(m[2]);
+  const dataPart = m[3] || '';
+  try {
+    if (isBase64) {
+      const binStr =
+        typeof atob === 'function'
+          ? atob(dataPart)
+          : globalThis.Buffer?.from(dataPart, 'base64').toString('binary') || '';
+      const bytes = new Uint8Array(binStr.length);
+      for (let i = 0; i < binStr.length; i++) {
+        bytes[i] = binStr.charCodeAt(i);
+      }
+      return new Blob([bytes], { type: mime });
+    }
+    return new Blob([decodeURIComponent(dataPart)], { type: mime });
+  } catch (_e) {
+    return null;
+  }
+}
+
+async function capturePersonaAvatarForSharePack(persona) {
+  const externalAvatarUrl = /^https?:\/\//i.test(String(persona.avatarUrl || ''))
+    ? String(persona.avatarUrl)
+    : '';
+
+  if (
+    String(persona.avatarUrl || '').startsWith('data:image/') &&
+    !isTinyPlaceholderDataUri(persona.avatarUrl)
+  ) {
+    return { avatarDataUri: persona.avatarUrl, externalAvatarUrl };
+  }
+
+  const candidates = [
+    `/User Avatars/${encodeURIComponent(persona.avatarId)}`,
+    persona.avatarUrl,
+  ].filter(Boolean);
+
+  for (const url of candidates) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) continue;
+      const blob = await res.blob();
+      if (!blob || blob.size <= 68) continue;
+      const dataUri = await blobToDataUri(blob);
+      if (dataUri && !isTinyPlaceholderDataUri(dataUri)) {
+        return { avatarDataUri: dataUri, externalAvatarUrl };
+      }
+    } catch (_e) {}
+  }
+
+  return { avatarDataUri: '', externalAvatarUrl };
+}
+
+/**
+ * 导出单个或多选 User「人设分享包」（含头像图片、原生描述与注入位置、随身设定、状态快照及可选关联世界书）
+ */
+async function exportPersonaSharePack(rawIds) {
+  const targetIds = (Array.isArray(rawIds) ? rawIds : [rawIds])
+    .map((x) => String(x || '').trim())
+    .filter(Boolean);
+  if (targetIds.length === 0) {
+    globalThis.toastr?.warning?.('请先选择要导出的 User 人设');
+    return false;
+  }
+
+  const allPersonas = getHostPersonas();
+  const byId = new Map(allPersonas.map((p) => [p.avatarId, p]));
+  const targets = targetIds.map((id) => byId.get(id)).filter(Boolean);
+  if (targets.length === 0) {
+    globalThis.toastr?.warning?.('未找到要导出的 User 人设');
+    return false;
+  }
+
+  const referencedBooks = new Set();
+  for (const p of targets) {
+    if (p.lorebook) referencedBooks.add(p.lorebook);
+    for (const eb of p.meta?.extraWorldbooks || []) {
+      if (eb?.name) referencedBooks.add(eb.name);
+    }
+    for (const pr of p.meta?.presets || []) {
+      if (pr?.lorebook) referencedBooks.add(pr.lorebook);
+    }
+  }
+
+  let includeWorldbooks = false;
+  if (referencedBooks.size > 0) {
+    const bookPreview = [...referencedBooks].slice(0, 3).join('、');
+    includeWorldbooks = await confirmUserAction(
+      '附带打包关联世界书？',
+      `检测到所选人设关联了 ${referencedBooks.size} 本世界书（${bookPreview}${referencedBooks.size > 3 ? '…' : ''}）。点「确定」将世界书条目一并打包方便好友导入；点「否/取消」仅导出人设与头像。`
+    );
+  }
+
+  const context = getContext();
+  const pu = context.powerUserSettings || globalThis.power_user || {};
+  const exportedPersonas = [];
+
+  for (const p of targets) {
+    let liveDesc = p.description || '';
+    if (p.isActive) {
+      const descEl = document.querySelector('#persona_description');
+      if (descEl && typeof descEl.value === 'string') {
+        liveDesc = descEl.value;
+      }
+    }
+    const rawDescObj = pu.persona_descriptions?.[p.avatarId] || {};
+    const { avatarDataUri, externalAvatarUrl } = await capturePersonaAvatarForSharePack(p);
+
+    exportedPersonas.push({
+      name: p.name,
+      originalAvatarId: p.avatarId,
+      avatarDataUri,
+      externalAvatarUrl,
+      description: liveDesc,
+      lorebook: p.lorebook || '',
+      position: rawDescObj.position ?? 0,
+      depth: rawDescObj.depth ?? 2,
+      role: rawDescObj.role ?? 0,
+      title: rawDescObj.title ?? p.title ?? '',
+      profile: {
+        favorite: Boolean(p.meta?.favorite),
+        group: p.meta?.group || '',
+        tags: [...(p.meta?.tags || [])],
+        note: p.meta?.note || '',
+        extraWorldbooks: structuredClone(p.meta?.extraWorldbooks || []),
+        traits: structuredClone(p.meta?.traits || []),
+        presets: structuredClone(p.meta?.presets || []),
+        activePresetId: p.meta?.activePresetId || '',
+      },
+    });
+  }
+
+  const bundledWorldbooks = {};
+  if (includeWorldbooks) {
+    for (const bName of referencedBooks) {
+      try {
+        const wData = await fetchWorldbookData(bName);
+        if (wData && typeof wData === 'object') {
+          bundledWorldbooks[bName] = wData;
+        }
+      } catch (err) {
+        console.warn(`[${MODULE_ID}] 导出分享包读取世界书「${bName}」跳过:`, err);
+      }
+    }
+  }
+
+  const pack = {
+    format: 'st-persona-wardrobe-share-pack',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    personas: exportedPersonas,
+    bundledWorldbooks,
+  };
+
+  const datePart = new Date().toISOString().slice(0, 10);
+  let filename = `persona-share-pack-${exportedPersonas.length}items-${datePart}.json`;
+  if (exportedPersonas.length === 1) {
+    const safeSingle =
+      String(exportedPersonas[0].name || 'user')
+        .replace(/[\\/:*?"<>|]/g, '_')
+        .trim()
+        .slice(0, 32) || 'user';
+    filename = `persona-share-${safeSingle}.json`;
+  }
+
+  triggerJsonDownload(filename, pack);
+  globalThis.toastr?.success?.(
+    `已导出 ${exportedPersonas.length} 个人设分享包${Object.keys(bundledWorldbooks).length ? `（含 ${Object.keys(bundledWorldbooks).length} 本世界书）` : ''}`
+  );
+  return true;
+}
+
+/**
+ * 导入单人设 / 多选人设分享包（自动上传还原头像、人设描述、随身设定、状态快照，并安全补齐缺失世界书）
+ */
+async function importPersonaSharePackData(parsed) {
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('无效的 JSON 文件内容');
+  }
+
+  // 兼容：若用户误选了整库配置备份文件，自动走配置合并恢复
+  if (!Array.isArray(parsed.personas) && parsed.profiles && typeof parsed.profiles === 'object') {
+    const current = getSettings();
+    if (Array.isArray(parsed.groups)) {
+      current.groups = [...new Set([...current.groups, ...parsed.groups])];
+    }
+    Object.assign(current.profiles, parsed.profiles);
+    invalidateRenderedHtmlCache();
+    saveSettings();
+    refreshAllViews();
+    globalThis.toastr?.success?.('检测到整库配置备份，已合并恢复分组与配置');
+    return [];
+  }
+
+  if (!Array.isArray(parsed.personas) || parsed.personas.length === 0) {
+    throw new Error('分享包中未找到有效的人设数据 (personas)');
+  }
+
+  await probeHostModules();
+  const context = getContext();
+  const pu = context.powerUserSettings || globalThis.power_user;
+  const settings = getSettings();
+
+  // 1. 若分享包附带了世界书，仅在本地尚不存在同名世界书时自动创建补齐（绝不覆盖用户本地已有世界书）
+  let importedBookCount = 0;
+  if (parsed.bundledWorldbooks && typeof parsed.bundledWorldbooks === 'object') {
+    const existingBooks = new Set(getAvailableWorldbooks());
+    for (const [bName, bData] of Object.entries(parsed.bundledWorldbooks)) {
+      const cleanBook = String(bName || '').trim();
+      if (!cleanBook || !bData || typeof bData !== 'object') continue;
+      if (existingBooks.has(cleanBook)) continue;
+      try {
+        await saveWorldbookData(cleanBook, bData);
+        existingBooks.add(cleanBook);
+        importedBookCount++;
+      } catch (err) {
+        console.warn(`[${MODULE_ID}] 导入附带世界书「${cleanBook}」跳过:`, err);
+      }
+    }
+  }
+
+  const createdIds = [];
+  const baseTs = Date.now();
+
+  for (let idx = 0; idx < parsed.personas.length; idx++) {
+    const item = parsed.personas[idx];
+    if (!item || typeof item !== 'object') continue;
+
+    const cleanName = String(item.name || `导入人设_${idx + 1}`).trim() || `导入人设_${idx + 1}`;
+    const asciiSlug = cleanName.replace(/[^a-zA-Z0-9]/g, '').slice(0, 18) || 'persona';
+    const newAvatarId = `${baseTs + idx}-${asciiSlug}.png`;
+
+    let avatarBlob = item.avatarDataUri ? dataUriToBlob(item.avatarDataUri) : null;
+    let uploadedRealImage = Boolean(avatarBlob && avatarBlob.size > 68);
+
+    if (!avatarBlob) {
+      try {
+        const fallbackRes = await fetch('/img/ai4.png');
+        if (fallbackRes.ok) {
+          avatarBlob = await fallbackRes.blob();
+        }
+      } catch (_e) {}
+    }
+
+    if (avatarBlob) {
+      try {
+        const file = new File([avatarBlob], 'avatar.png', {
+          type: avatarBlob.type || 'image/png',
+        });
+        const formData = new FormData();
+        formData.append('avatar', file);
+        formData.append('overwrite_name', newAvatarId);
+
+        const headers =
+          typeof context.getRequestHeaders === 'function'
+            ? { ...context.getRequestHeaders({ omitContentType: true }) }
+            : {};
+        delete headers['Content-Type'];
+        delete headers['content-type'];
+
+        await fetch('/api/avatars/upload', {
+          method: 'POST',
+          headers,
+          cache: 'no-cache',
+          body: formData,
+        });
+      } catch (err) {
+        console.warn(`[${MODULE_ID}] 导入人设头像上传告警 (${cleanName}):`, err);
+      }
+    }
+
+    const desc = String(item.description ?? '');
+    const lorebook = String(item.lorebook ?? '');
+    const pos = Number.isFinite(Number(item.position)) ? Number(item.position) : 0;
+    const depth = Number.isFinite(Number(item.depth)) ? Number(item.depth) : 2;
+    const role = Number.isFinite(Number(item.role)) ? Number(item.role) : 0;
+    const title = String(item.title ?? '');
+
+    if (typeof state.hostPersonasModule?.initPersona === 'function') {
+      try {
+        await state.hostPersonasModule.initPersona(newAvatarId, cleanName, desc, title, {
+          position: pos,
+          depth,
+          role,
+          lorebook,
+        });
+      } catch (_e) {}
+    }
+
+    if (pu) {
+      if (!pu.personas) pu.personas = {};
+      if (!pu.persona_descriptions) pu.persona_descriptions = {};
+      pu.personas[newAvatarId] = cleanName;
+      pu.persona_descriptions[newAvatarId] = {
+        description: desc,
+        position: pos,
+        depth,
+        role,
+        lorebook,
+        title,
+        connections: [],
+      };
+    }
+
+    const prof = item.profile && typeof item.profile === 'object' ? item.profile : {};
+    const groupName = String(prof.group || '').trim();
+    if (groupName) {
+      if (!settings.groups.includes(groupName)) {
+        settings.groups.push(groupName);
+      }
+      state.collapsedSections.delete(`group:${groupName}`);
+    }
+
+    if (!uploadedRealImage && /^https?:\/\//i.test(String(item.externalAvatarUrl || ''))) {
+      settings.avatarUrlCache[newAvatarId] = String(item.externalAvatarUrl);
+    }
+
+    settings.profiles[newAvatarId] = {
+      favorite: Boolean(prof.favorite),
+      group: groupName,
+      tags: Array.isArray(prof.tags) ? prof.tags.map((t) => String(t).trim()).filter(Boolean) : [],
+      boundCharacters: [],
+      note: String(prof.note || ''),
+      extraWorldbooks: Array.isArray(prof.extraWorldbooks)
+        ? structuredClone(prof.extraWorldbooks)
+        : [],
+      traits: Array.isArray(prof.traits) ? structuredClone(prof.traits) : [],
+      presets: Array.isArray(prof.presets) ? structuredClone(prof.presets) : [],
+      activePresetId: String(prof.activePresetId || ''),
+      lastUsedAt: Date.now(),
+      usageStats: {
+        chats: {},
+        extraLiveMs: 0,
+      },
+    };
+
+    if (state.diskAvatarSet instanceof Set) {
+      state.diskAvatarSet.add(newAvatarId);
+    }
+    createdIds.push(newAvatarId);
+  }
+
+  syncCollapsedSectionsToSettings();
+  saveSettings();
+  await refreshDiskAvatarSet();
+
+  const lastId = createdIds[createdIds.length - 1] || '';
+  if (lastId) {
+    try {
+      await state.hostPersonasModule?.getUserAvatars?.(true, getActiveAvatarId() || lastId);
+    } catch (_e) {}
+    state.selectedAvatarId = lastId;
+    if (createdIds.length === 1) {
+      await switchActivePersona(lastId);
+    }
+  }
+
+  invalidateRenderedHtmlCache();
+  refreshAllViews();
+  globalThis.toastr?.success?.(
+    `成功导入 ${createdIds.length} 个人设${importedBookCount ? `（自动补齐 ${importedBookCount} 本世界书）` : ''}`
+  );
+  return createdIds;
+}
+
+function triggerImportPersonaSharePack() {
+  let fileInput = document.querySelector('#st_pw_share_pack_file_input');
+  if (!fileInput) {
+    fileInput = document.createElement('input');
+    fileInput.type = 'file';
+    fileInput.id = 'st_pw_share_pack_file_input';
+    fileInput.accept = '.json,application/json';
+    fileInput.style.display = 'none';
+    fileInput.addEventListener('click', (e) => e.stopPropagation());
+    fileInput.addEventListener('change', async (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const parsed = JSON.parse(text);
+        await importPersonaSharePackData(parsed);
+      } catch (err) {
+        globalThis.toastr?.error?.(`导入分享包失败：${err.message}`);
+      } finally {
+        fileInput.value = '';
+      }
+    });
+    document.body.appendChild(fileInput);
+  }
+  fileInput.click();
 }
 
 async function jumpToWorldbookInHost(
@@ -4285,6 +4908,9 @@ function renderMultiSelectToolbarHtml(settings, hostChars, currentCharName, avai
         <button type="button" class="menu_button st-pw-mini-btn st-pw-multi-fav-off" ${disAttr} title="批量取消收藏">
           <i class="fa-regular fa-star"></i> 取消收藏
         </button>
+        <button type="button" class="menu_button st-pw-mini-btn st-pw-multi-export" ${disAttr} title="将已勾选的多个 User（含头像、描述、随身设定、状态快照）一键打包导出为分享包">
+          <i class="fa-solid fa-file-export"></i> 导出分享包
+        </button>
         <button type="button" class="menu_button st-pw-mini-btn st-pw-multi-delete" ${disAttr} title="批量删除已勾选人设（自动保护当前使用中人设与系统默认人设）">
           <i class="fa-solid fa-trash-can"></i> 删除
         </button>
@@ -4462,15 +5088,29 @@ function renderFilterPillsBarHtml(personas, characterGroups, customGroups, ungro
             </select>
           `
       }
-      ${customGroups
-        .map(
-          (g) => `
-            <button type="button" class="st-pw-filter-pill ${state.activeFilter === g.id ? 'active' : ''}" data-filter="${escapeAttr(g.id)}">
-              ${sanitizeHtml(g.name)} (${g.members.length})
-            </button>
+      ${
+        customGroups.length <= 4
+          ? customGroups
+              .map(
+                (g) => `
+                  <button type="button" class="st-pw-filter-pill ${state.activeFilter === g.id ? 'active' : ''}" data-filter="${escapeAttr(g.id)}">
+                    ${sanitizeHtml(g.name)} (${g.members.length})
+                  </button>
+                `
+              )
+              .join('')
+          : `
+            <select class="text_pole st-pw-char-filter-select st-pw-group-filter-select ${state.activeFilter.startsWith('group:') ? 'is-active-select' : ''}" title="按自定义分组筛选 User">
+              <option value="all">按分组筛选 (${customGroups.length})…</option>
+              ${customGroups
+                .map(
+                  (g) =>
+                    `<option value="${escapeAttr(g.id)}" ${state.activeFilter === g.id ? 'selected' : ''}>${sanitizeHtml(g.name)} (${g.members.length})</option>`
+                )
+                .join('')}
+            </select>
           `
-        )
-        .join('')}
+      }
       ${
         (characterGroups.length > 0 || customGroups.length > 0) && ungroupedMembers.length > 0
           ? `<button type="button" class="st-pw-filter-pill ${state.activeFilter === 'ungrouped' ? 'active' : ''}" data-filter="ungrouped">未分组 (${ungroupedMembers.length})</button>`
@@ -4482,6 +5122,118 @@ function renderFilterPillsBarHtml(personas, characterGroups, customGroups, ungro
         ? `<div class="st-pw-dedup-notice">${sanitizeHtml(dedupParts.join(' · '))}</div>`
         : ''
     }
+  `;
+}
+
+function renderLeftHeaderControlsHtml({
+  mode = 'inline',
+  searchId,
+  charSelectId,
+  targetPersona,
+  hostChars,
+  currentCharName,
+  settings,
+}) {
+  const isInline = mode === 'inline';
+  const createBtnCls = isInline ? 'st-pw-inline-create-btn' : 'st-pw-modal-create-btn';
+  const uploadBtnCls = isInline ? 'st-pw-inline-upload-btn' : 'st-pw-modal-upload-btn';
+  const addGroupBtnCls = isInline ? 'st-pw-inline-add-group-btn' : 'st-pw-add-group-btn';
+  const sortBy = settings.sortBy || 'default';
+  const viewMode = settings.viewMode || 'standard';
+
+  return `
+    <div class="st-pw-inline-left-top">
+      <input type="search" id="${escapeAttr(searchId)}" class="text_pole st-pw-sidebar-search" placeholder="搜索 User、分组、世界书…" value="${escapeAttr(state.searchQuery)}" />
+      <button type="button" class="menu_button st-pw-mini-btn st-pw-toggle-multi-btn ${state.multiSelectMode ? 'is-active-mode' : ''}" title="开启多选模式，批量移入分组、绑卡、绑世界书、导出分享包或删除">
+        <i class="fa-${state.multiSelectMode ? 'solid fa-check-double' : 'regular fa-square-check'}"></i> ${state.multiSelectMode ? `完成${state.multiSelectedIds.size > 0 ? ` (${state.multiSelectedIds.size})` : ''}` : '多选'}
+      </button>
+      <button type="button" class="menu_button st-pw-mini-btn ${createBtnCls}" title="调用原生新建人设">
+        <i class="fa-solid fa-plus"></i> 新建
+      </button>
+      <button type="button" class="menu_button st-pw-mini-btn st-pw-toggle-more-tools-btn ${state.showLeftMoreTools ? 'is-active-mode' : ''}" title="更多操作（导入/导出分享包、上传/更换头像、按角色绑组、收起分组、刷图、原生列表等）">
+        <i class="fa-solid fa-ellipsis"></i>
+      </button>
+    </div>
+
+    ${
+      state.showLeftMoreTools
+        ? `
+          <div class="st-pw-left-more-drawer">
+            <div class="st-pw-left-more-btns">
+              <button type="button" class="menu_button st-pw-mini-btn ${uploadBtnCls}" title="上传头像直接新建人设">
+                <i class="fa-solid fa-image"></i> 头像新建
+              </button>
+              ${
+                targetPersona
+                  ? `
+                    <button type="button" class="menu_button st-pw-mini-btn st-pw-change-avatar-btn" data-avatar-id="${escapeAttr(targetPersona.avatarId)}" title="更换当前选中 User 的头像">
+                      <i class="fa-solid fa-camera-rotate"></i> 换图
+                    </button>
+                    <button type="button" class="menu_button st-pw-mini-btn st-pw-export-persona-btn" data-avatar-id="${escapeAttr(targetPersona.avatarId)}" title="将当前人设连同头像、描述、随身设定与快照导出为分享包">
+                      <i class="fa-solid fa-file-export"></i> 导出当前
+                    </button>
+                  `
+                  : ''
+              }
+              <button type="button" class="menu_button st-pw-mini-btn st-pw-import-share-pack-btn" title="导入单人设或多选人设分享包 (.json)">
+                <i class="fa-solid fa-file-import"></i> 导入分享包
+              </button>
+              <button type="button" class="menu_button st-pw-mini-btn st-pw-collapse-all-folders-btn" title="一键收起所有分组文件夹">
+                <i class="fa-solid fa-compress"></i> 全收起
+              </button>
+              <button type="button" class="menu_button st-pw-mini-btn st-pw-expand-all-folders-btn" title="一键展开所有分组文件夹">
+                <i class="fa-solid fa-expand"></i> 全展开
+              </button>
+              <button type="button" class="menu_button st-pw-mini-btn st-pw-sync-cloud-avatars-btn" title="一键唤醒原生人设池同步图床/云端/美化插件头像">
+                <i class="fa-solid fa-arrows-rotate"></i> 刷图
+              </button>
+              ${
+                isInline
+                  ? `
+                    <button type="button" class="menu_button st-pw-mini-btn st-pw-toggle-raw-list-btn" title="切换到酒馆原生平铺列表">
+                      <i class="fa-solid fa-table-list"></i> 原生列表
+                    </button>
+                  `
+                  : ''
+              }
+            </div>
+            <div class="st-pw-sidebar-create-bar">
+              <select id="${escapeAttr(charSelectId)}" class="text_pole st-pw-flex-select" title="选一个角色卡，把多个 User 绑到它下面自动归为一组">
+                <option value="">+ 按角色绑一组 User…</option>
+                ${
+                  currentCharName
+                    ? `<option value="${escapeAttr(currentCharName)}">当前角色：${sanitizeHtml(currentCharName)}</option>`
+                    : ''
+                }
+                ${hostChars
+                  .filter((c) => c.name !== currentCharName)
+                  .map((c) => `<option value="${escapeAttr(c.name)}">${sanitizeHtml(c.name)}</option>`)
+                  .join('')}
+              </select>
+            </div>
+          </div>
+        `
+        : ''
+    }
+
+    <div class="st-pw-list-prefs-bar">
+      <select class="text_pole st-pw-sort-select" title="选择人设排序方式">
+        <option value="default" ${sortBy === 'default' ? 'selected' : ''}>排序：默认</option>
+        <option value="recent" ${sortBy === 'recent' ? 'selected' : ''}>排序：最近使用</option>
+        <option value="duration" ${sortBy === 'duration' ? 'selected' : ''}>排序：聊天时长</option>
+        <option value="chats" ${sortBy === 'chats' ? 'selected' : ''}>排序：聊天档数</option>
+        <option value="fav" ${sortBy === 'fav' ? 'selected' : ''}>排序：收藏优先</option>
+        <option value="name" ${sortBy === 'name' ? 'selected' : ''}>排序：名称 A-Z</option>
+      </select>
+      <div class="st-pw-view-seg" role="group" aria-label="列表视图切换">
+        <button type="button" class="st-pw-view-seg-btn ${viewMode === 'standard' ? 'active' : ''}" data-view-mode="standard" title="标准双行卡片"><i class="fa-solid fa-bars"></i></button>
+        <button type="button" class="st-pw-view-seg-btn ${viewMode === 'compact' ? 'active' : ''}" data-view-mode="compact" title="紧凑单行列表（适合大量人设）"><i class="fa-solid fa-grip-lines"></i></button>
+        <button type="button" class="st-pw-view-seg-btn ${viewMode === 'grid' ? 'active' : ''}" data-view-mode="grid" title="头像宫格视图"><i class="fa-solid fa-border-all"></i></button>
+      </div>
+      <button type="button" class="menu_button st-pw-mini-btn ${addGroupBtnCls}" title="新建自定义分组">
+        + 新建组
+      </button>
+    </div>
   `;
 }
 
@@ -4568,6 +5320,9 @@ function renderWardrobeModalContent({ force = false } = {}) {
           }
         </div>
         <div class="st-pw-modal-header-actions">
+          <button type="button" class="menu_button st-pw-mini-btn st-pw-import-share-pack-btn" title="导入单人设或多选人设分享包 (.json)">
+            <i class="fa-solid fa-file-import"></i> 导入分享
+          </button>
           <button type="button" class="menu_button st-pw-mini-btn st-pw-scan-history-btn" ${state.isScanningHistory ? 'disabled' : ''}>
             <i class="fa-solid fa-${state.isScanningHistory ? 'spinner fa-spin' : 'chart-simple'}"></i>
             ${state.isScanningHistory ? sanitizeHtml(state.scanProgressText || '扫描中…') : '扫描统计'}
@@ -4580,43 +5335,21 @@ function renderWardrobeModalContent({ force = false } = {}) {
 
       <div class="st-pw-workbench">
         <aside class="st-pw-sidebar">
-          <div class="st-pw-inline-left-top">
-            <input type="search" id="st_pw_search_input" class="text_pole st-pw-sidebar-search" placeholder="搜索 User、角色组、自定义组、世界书…" value="${escapeAttr(state.searchQuery)}" />
-            <button type="button" class="menu_button st-pw-mini-btn st-pw-toggle-multi-btn ${state.multiSelectMode ? 'is-active-mode' : ''}" title="开启多选模式，一次性将多个 User 批量移入分组、绑卡、绑世界书或删除">
-              <i class="fa-${state.multiSelectMode ? 'solid fa-check-double' : 'regular fa-square-check'}"></i> ${state.multiSelectMode ? `完成${state.multiSelectedIds.size > 0 ? ` (${state.multiSelectedIds.size})` : ''}` : '多选'}
-            </button>
-            <button type="button" class="menu_button st-pw-mini-btn st-pw-modal-create-btn" title="调用原生新建人设">
-              <i class="fa-solid fa-plus"></i> 新建
-            </button>
-            <button type="button" class="menu_button st-pw-mini-btn st-pw-modal-upload-btn" title="上传头像新建人设">
-              <i class="fa-solid fa-image"></i> 头像
-            </button>
-          </div>
-
-          <!-- 快捷创建组：按角色建组（把多个 User 绑到同一角色下自动成组） / 新建自定义组 -->
-          <div class="st-pw-sidebar-create-bar">
-            <select id="st_pw_create_char_group_select" class="text_pole st-pw-flex-select" title="选一个角色卡，把多个 User 绑到它下面自动归为一组">
-              <option value="">+ 按角色绑一组 User…</option>
-              ${
-                currentCharName
-                  ? `<option value="${escapeAttr(currentCharName)}">当前角色：${sanitizeHtml(currentCharName)}</option>`
-                  : ''
-              }
-              ${hostChars
-                .filter((c) => c.name !== currentCharName)
-                .map((c) => `<option value="${escapeAttr(c.name)}">${sanitizeHtml(c.name)}</option>`)
-                .join('')}
-            </select>
-            <button type="button" class="menu_button st-pw-mini-btn st-pw-add-group-btn" title="新建自定义分组">
-              + 自定义组
-            </button>
-          </div>
+          ${renderLeftHeaderControlsHtml({
+            mode: 'modal',
+            searchId: 'st_pw_search_input',
+            charSelectId: 'st_pw_create_char_group_select',
+            targetPersona: selectedPersona,
+            hostChars,
+            currentCharName,
+            settings,
+          })}
 
           ${renderFilterPillsBarHtml(personas, characterGroups, customGroups, ungroupedMembers)}
           ${renderMultiSelectToolbarHtml(settings, hostChars, currentCharName, availableBooks)}
 
           <!-- 分组树列表：同一角色下绑的多个 User 自动归在一组，自定义组也自动归在一组 -->
-          <div class="st-pw-persona-list">
+          <div class="st-pw-persona-list is-view-${escapeAttr(settings.viewMode || 'standard')}">
             ${buildGroupedTreeSectionsHtml(
               personas,
               selectedPersona?.avatarId,
@@ -4707,19 +5440,98 @@ function renderBatchChecklistHtml(targetType, targetName, allPersonas) {
   `;
 }
 
+function renderRightBlockToggleHtml(blockId, titleText, summaryText = '') {
+  const collapsed = isRightBlockCollapsed(blockId);
+  return `
+    <button type="button" class="st-pw-right-block-toggle" data-block-id="${escapeAttr(blockId)}" title="点击折叠或展开此栏（自动记住折叠状态）">
+      <i class="fa-solid fa-chevron-${collapsed ? 'right' : 'down'} st-pw-folder-arrow"></i>
+      <span class="st-pw-block-title">${sanitizeHtml(titleText)}</span>
+      ${
+        collapsed && summaryText
+          ? `<span class="st-pw-block-summary-pill">${sanitizeHtml(summaryText)}</span>`
+          : ''
+      }
+    </button>
+  `;
+}
+
+function renderBoundCharacterChipsHtml(persona, unboundHostChars, currentCharName = '') {
+  const rawList = Array.isArray(persona?.meta?.boundCharacters) ? persona.meta.boundCharacters : [];
+  const curLower = String(currentCharName || '').toLowerCase();
+  const sortedBound = [...rawList].sort((a, b) => {
+    const aCur = curLower && a.toLowerCase() === curLower;
+    const bCur = curLower && b.toLowerCase() === curLower;
+    if (aCur !== bCur) return aCur ? -1 : 1;
+    return 0;
+  });
+
+  const totalCount = sortedBound.length;
+  const isExpanded = state.expandedBoundCharsForAvatar.has(persona.avatarId);
+  const shouldCollapse = totalCount > COLLAPSE_CHAR_CHIPS_THRESHOLD && !isExpanded;
+  const visibleChars = shouldCollapse
+    ? sortedBound.slice(0, COLLAPSE_CHAR_CHIPS_THRESHOLD)
+    : sortedBound;
+
+  return `
+    <div class="st-pw-char-chips-row">
+      ${
+        totalCount === 0
+          ? `<span class="st-pw-muted" style="font-size:0.82rem;">未绑定角色</span>`
+          : visibleChars
+              .map(
+                (cName) => `
+                  <span class="st-pw-char-chip">
+                    <span class="st-pw-char-chip-jump" data-char="${escapeAttr(cName)}" title="点击在左侧筛选该角色组下的所有 User">${sanitizeHtml(cName)}</span>
+                    <button type="button" class="st-pw-chip-remove" data-char="${escapeAttr(cName)}" title="移出该角色组">×</button>
+                  </span>
+                `
+              )
+              .join('')
+      }
+      ${
+        totalCount > COLLAPSE_CHAR_CHIPS_THRESHOLD
+          ? `
+            <button type="button" class="menu_button st-pw-mini-btn st-pw-toggle-all-bound-chars" data-avatar-id="${escapeAttr(persona.avatarId)}">
+              ${shouldCollapse ? `展开全部 ${totalCount} 个 ▾` : `收起 (${totalCount}) ▴`}
+            </button>
+          `
+          : ''
+      }
+      ${
+        totalCount >= 2
+          ? `
+            <button type="button" class="menu_button st-pw-mini-btn st-pw-clear-persona-chars-btn" data-avatar-id="${escapeAttr(persona.avatarId)}" title="一键清空此 User 绑定的全部角色卡">
+              清空绑定 (${totalCount})
+            </button>
+          `
+          : ''
+      }
+      <select id="st_pw_bind_char_select" class="text_pole st-pw-char-add-select">
+        <option value="">+ 选择角色卡加入该角色组…</option>
+        ${unboundHostChars
+          .map((c) => `<option value="${escapeAttr(c.name)}">${sanitizeHtml(c.name)}</option>`)
+          .join('')}
+        <option value="__custom__">手动输入角色名…</option>
+      </select>
+    </div>
+  `;
+}
+
 function renderUsageStatsBlockHtml(persona) {
   const stats = getPersonaUsageSummary(persona.avatarId);
+  const collapsed = isRightBlockCollapsed('right:stats');
+  const collapsedSummary = `${stats.charCount}角 · ${stats.chatCount}档 · ${formatDurationShort(stats.durationMs)}`;
   return `
-    <div class="st-pw-block">
+    <div class="st-pw-block ${collapsed ? 'is-block-collapsed' : ''}">
       <div class="st-pw-block-header">
-        <span class="st-pw-block-title">使用足迹统计（聊过角色 · 聊天档 · 累计时长）</span>
+        ${renderRightBlockToggleHtml('right:stats', '使用足迹统计', collapsedSummary)}
         <div class="st-pw-inline-header-btns">
           <button type="button" class="menu_button st-pw-mini-btn st-pw-scan-history-btn" ${state.isScanningHistory ? 'disabled' : ''} title="扫描酒馆内所有角色卡的历史聊天档，自动回溯统计每个 User 聊过的角色卡、档数与时长">
             <i class="fa-solid fa-${state.isScanningHistory ? 'spinner fa-spin' : 'chart-simple'}"></i>
             ${state.isScanningHistory ? sanitizeHtml(state.scanProgressText || '扫描中…') : '扫描历史档'}
           </button>
           ${
-            stats.byCharacter.length > 0
+            !collapsed && stats.byCharacter.length > 0
               ? `
                 <button type="button" class="menu_button st-pw-mini-btn st-pw-toggle-stats-detail-btn">
                   ${state.showStatsDetail ? '收起明细' : '角色明细'}
@@ -4728,7 +5540,7 @@ function renderUsageStatsBlockHtml(persona) {
               : ''
           }
           ${
-            stats.chatCount > 0 || stats.durationMs > 0
+            !collapsed && (stats.chatCount > 0 || stats.durationMs > 0)
               ? `
                 <button type="button" class="menu_button st-pw-mini-btn st-pw-reset-user-stats-btn" title="清空此 User 的使用统计记录">
                   重置
@@ -4739,42 +5551,48 @@ function renderUsageStatsBlockHtml(persona) {
         </div>
       </div>
 
-      <div class="st-pw-stats-metrics-row">
-        <div class="st-pw-stat-cell">
-          <span class="st-pw-stat-label">聊过角色卡</span>
-          <strong class="st-pw-stat-val">${stats.charCount} <small>个</small></strong>
-        </div>
-        <div class="st-pw-stat-cell">
-          <span class="st-pw-stat-label">聊天档数</span>
-          <strong class="st-pw-stat-val">${stats.chatCount} <small>个档</small></strong>
-        </div>
-        <div class="st-pw-stat-cell">
-          <span class="st-pw-stat-label">互动消息</span>
-          <strong class="st-pw-stat-val">${stats.totalMsgs} <small>条</small></strong>
-        </div>
-        <div class="st-pw-stat-cell">
-          <span class="st-pw-stat-label">累计聊天时长</span>
-          <strong class="st-pw-stat-val">${sanitizeHtml(formatDurationHuman(stats.durationMs))}</strong>
-        </div>
-      </div>
-
       ${
-        state.showStatsDetail && stats.byCharacter.length > 0
-          ? `
-            <div class="st-pw-compact-rows">
-              ${stats.byCharacter
-                .map(
-                  (c) => `
-                    <div class="st-pw-compact-row">
-                      <span class="st-pw-row-main-text"><strong>${sanitizeHtml(c.charName)}</strong></span>
-                      <span class="st-pw-muted" style="font-size:0.8rem;">${c.chatCount} 个档 · ${c.userMsgs + c.aiMsgs} 条消息 · ${sanitizeHtml(formatDurationHuman(c.durationMs))}</span>
-                    </div>
-                  `
-                )
-                .join('')}
+        collapsed
+          ? ''
+          : `
+            <div class="st-pw-stats-metrics-row">
+              <div class="st-pw-stat-cell">
+                <span class="st-pw-stat-label">聊过角色卡</span>
+                <strong class="st-pw-stat-val">${stats.charCount} <small>个</small></strong>
+              </div>
+              <div class="st-pw-stat-cell">
+                <span class="st-pw-stat-label">聊天档数</span>
+                <strong class="st-pw-stat-val">${stats.chatCount} <small>个档</small></strong>
+              </div>
+              <div class="st-pw-stat-cell">
+                <span class="st-pw-stat-label">互动消息</span>
+                <strong class="st-pw-stat-val">${stats.totalMsgs} <small>条</small></strong>
+              </div>
+              <div class="st-pw-stat-cell">
+                <span class="st-pw-stat-label">累计聊天时长</span>
+                <strong class="st-pw-stat-val">${sanitizeHtml(formatDurationHuman(stats.durationMs))}</strong>
+              </div>
             </div>
+
+            ${
+              state.showStatsDetail && stats.byCharacter.length > 0
+                ? `
+                  <div class="st-pw-compact-rows">
+                    ${stats.byCharacter
+                      .map(
+                        (c) => `
+                          <div class="st-pw-compact-row">
+                            <span class="st-pw-row-main-text"><strong>${sanitizeHtml(c.charName)}</strong></span>
+                            <span class="st-pw-muted" style="font-size:0.8rem;">${c.chatCount} 个档 · ${c.userMsgs + c.aiMsgs} 条消息 · ${sanitizeHtml(formatDurationHuman(c.durationMs))}</span>
+                          </div>
+                        `
+                      )
+                      .join('')}
+                  </div>
+                `
+                : ''
+            }
           `
-          : ''
       }
     </div>
   `;
@@ -4783,73 +5601,82 @@ function renderUsageStatsBlockHtml(persona) {
 function renderPresetsAndCloneBlockHtml(persona) {
   const meta = persona.meta;
   const presets = Array.isArray(meta.presets) ? meta.presets : [];
+  const collapsed = isRightBlockCollapsed('right:presets');
   return `
-    <div class="st-pw-block">
+    <div class="st-pw-block ${collapsed ? 'is-block-collapsed' : ''}">
       <div class="st-pw-block-header">
-        <span class="st-pw-block-title">变体克隆 & 状态快照预设 (${presets.length})</span>
+        ${renderRightBlockToggleHtml('right:presets', `变体、分享包 & 状态快照 (${presets.length})`, `${presets.length} 套快照`)}
         <div class="st-pw-inline-header-btns">
           <button type="button" class="menu_button st-pw-mini-btn st-pw-save-preset-btn" title="将当前人设描述、主世界书及条目开关、附加书与随身设定保存为一套状态快照">
-            + 存为状态快照
+            + 存快照
           </button>
           <button type="button" class="menu_button st-pw-mini-btn st-pw-clone-variant-btn" title="完整克隆此 User（连带头像、描述、世界书、随身设定、所属角色组/自定义组及快照）">
-            <i class="fa-solid fa-copy"></i> 完整克隆变体
+            <i class="fa-solid fa-copy"></i> 克隆变体
+          </button>
+          <button type="button" class="menu_button st-pw-mini-btn st-pw-export-persona-btn" data-avatar-id="${escapeAttr(persona.avatarId)}" title="导出当前人设分享包（含头像、描述、随身设定、状态快照，可选打包关联世界书）">
+            <i class="fa-solid fa-file-export"></i> 导出分享
+          </button>
+          <button type="button" class="menu_button st-pw-mini-btn st-pw-import-share-pack-btn" title="导入单人设或多选人设分享包 (.json)">
+            <i class="fa-solid fa-file-import"></i> 导入分享
           </button>
         </div>
       </div>
       ${
-        presets.length === 0
-          ? `<div class="st-pw-muted-hint">可保存多套「人设描述 + 主世界书条目开关 + 附加书 + 随身设定」状态快照（如日常态/战斗态/IF线），一键切换或直接派生为新 User。</div>`
-          : `
-            <div class="st-pw-compact-rows">
-              ${presets
-                .map((pr) => {
-                  const isCurrentPreset = meta.activePresetId === pr.id;
-                  const ebCount = Array.isArray(pr.extraWorldbooks)
-                    ? pr.extraWorldbooks.filter((b) => b.enabled).length
-                    : 0;
-                  const trCount = Array.isArray(pr.traits)
-                    ? pr.traits.filter((t) => t.enabled).length
-                    : 0;
-                  const entryCount =
-                    pr.primaryEntryStates && typeof pr.primaryEntryStates === 'object'
-                      ? Object.values(pr.primaryEntryStates).filter((s) => s && !s.disable).length
-                      : null;
-                  const summaryParts = [
-                    pr.lorebook
-                      ? `${pr.lorebook}${entryCount !== null ? `(${entryCount}条开)` : ''}`
-                      : '无主书',
-                  ];
-                  if (ebCount) summaryParts.push(`+${ebCount}书`);
-                  if (trCount) summaryParts.push(`${trCount}设定`);
-                  summaryParts.push(`${String(pr.description || '').length}字`);
+        collapsed
+          ? ''
+          : presets.length === 0
+            ? `<div class="st-pw-muted-hint">可保存多套「人设描述 + 主世界书条目开关 + 附加书 + 随身设定」状态快照（如日常态/战斗态/IF线），也可一键导出人设分享包发给好友。</div>`
+            : `
+              <div class="st-pw-compact-rows">
+                ${presets
+                  .map((pr) => {
+                    const isCurrentPreset = meta.activePresetId === pr.id;
+                    const ebCount = Array.isArray(pr.extraWorldbooks)
+                      ? pr.extraWorldbooks.filter((b) => b.enabled).length
+                      : 0;
+                    const trCount = Array.isArray(pr.traits)
+                      ? pr.traits.filter((t) => t.enabled).length
+                      : 0;
+                    const entryCount =
+                      pr.primaryEntryStates && typeof pr.primaryEntryStates === 'object'
+                        ? Object.values(pr.primaryEntryStates).filter((s) => s && !s.disable).length
+                        : null;
+                    const summaryParts = [
+                      pr.lorebook
+                        ? `${pr.lorebook}${entryCount !== null ? `(${entryCount}条开)` : ''}`
+                        : '无主书',
+                    ];
+                    if (ebCount) summaryParts.push(`+${ebCount}书`);
+                    if (trCount) summaryParts.push(`${trCount}设定`);
+                    summaryParts.push(`${String(pr.description || '').length}字`);
 
-                  return `
-                    <div class="st-pw-compact-row ${isCurrentPreset ? 'is-active-preset' : ''}" data-preset-id="${escapeAttr(pr.id)}">
-                      <span class="st-pw-mode-tag ${isCurrentPreset ? 'is-constant' : 'is-keyword'} st-pw-apply-preset-btn" data-preset-id="${escapeAttr(pr.id)}" title="点击切换到此状态快照">
-                        <span class="st-pw-dot"></span>${isCurrentPreset ? '当前快照' : '快照'}
-                      </span>
-                      <span class="st-pw-row-main-text st-pw-apply-preset-btn" data-preset-id="${escapeAttr(pr.id)}" title="点击切换到此状态快照">
-                        <strong>${sanitizeHtml(pr.name)}</strong>
-                        <small class="st-pw-muted"> · ${sanitizeHtml(summaryParts.join(' · '))}</small>
-                      </span>
-                      <button type="button" class="menu_button st-pw-mini-btn st-pw-apply-preset-btn" data-preset-id="${escapeAttr(pr.id)}" title="一键恢复此快照的描述、世界书条目开关与随身设定">
-                        切换
-                      </button>
-                      <button type="button" class="menu_button st-pw-mini-btn st-pw-overwrite-preset-btn" data-preset-id="${escapeAttr(pr.id)}" title="用当前最新状态覆盖更新此快照">
-                        更新
-                      </button>
-                      <button type="button" class="menu_button st-pw-mini-btn st-pw-preset-to-variant-btn" data-preset-id="${escapeAttr(pr.id)}" title="将此快照直接派生为一个新的独立 User 人设">
-                        派生User
-                      </button>
-                      <button type="button" class="st-pw-icon-btn st-pw-delete-preset-btn" data-preset-id="${escapeAttr(pr.id)}" title="删除此快照">
-                        <i class="fa-solid fa-xmark"></i>
-                      </button>
-                    </div>
-                  `;
-                })
-                .join('')}
-            </div>
-          `
+                    return `
+                      <div class="st-pw-compact-row ${isCurrentPreset ? 'is-active-preset' : ''}" data-preset-id="${escapeAttr(pr.id)}">
+                        <span class="st-pw-mode-tag ${isCurrentPreset ? 'is-constant' : 'is-keyword'} st-pw-apply-preset-btn" data-preset-id="${escapeAttr(pr.id)}" title="点击切换到此状态快照">
+                          <span class="st-pw-dot"></span>${isCurrentPreset ? '当前快照' : '快照'}
+                        </span>
+                        <span class="st-pw-row-main-text st-pw-apply-preset-btn" data-preset-id="${escapeAttr(pr.id)}" title="点击切换到此状态快照">
+                          <strong>${sanitizeHtml(pr.name)}</strong>
+                          <small class="st-pw-muted"> · ${sanitizeHtml(summaryParts.join(' · '))}</small>
+                        </span>
+                        <button type="button" class="menu_button st-pw-mini-btn st-pw-apply-preset-btn" data-preset-id="${escapeAttr(pr.id)}" title="一键恢复此快照的描述、世界书条目开关与随身设定">
+                          切换
+                        </button>
+                        <button type="button" class="menu_button st-pw-mini-btn st-pw-overwrite-preset-btn" data-preset-id="${escapeAttr(pr.id)}" title="用当前最新状态覆盖更新此快照">
+                          更新
+                        </button>
+                        <button type="button" class="menu_button st-pw-mini-btn st-pw-preset-to-variant-btn" data-preset-id="${escapeAttr(pr.id)}" title="将此快照直接派生为一个新的独立 User 人设">
+                          派生User
+                        </button>
+                        <button type="button" class="st-pw-icon-btn st-pw-delete-preset-btn" data-preset-id="${escapeAttr(pr.id)}" title="删除此快照">
+                          <i class="fa-solid fa-xmark"></i>
+                        </button>
+                      </div>
+                    `;
+                  })
+                  .join('')}
+              </div>
+            `
       }
     </div>
   `;
@@ -4873,6 +5700,13 @@ function renderSelectedPersonaDetail(persona, availableBooks, hostChars, current
     (c) => !meta.boundCharacters.some((bc) => bc.toLowerCase() === c.name.toLowerCase())
   );
 
+  const bindingCollapsed = isRightBlockCollapsed('right:binding');
+  const wbCollapsed = isRightBlockCollapsed('right:worldbooks');
+  const traitsCollapsed = isRightBlockCollapsed('right:traits');
+  const descCollapsed = isRightBlockCollapsed('right:desc');
+  const enabledExtraCount = meta.extraWorldbooks.filter((b) => b.enabled).length;
+  const enabledTraitCount = meta.traits.filter((t) => t.enabled).length;
+
   return `
     <div class="st-pw-detail-top">
       <div class="st-pw-detail-user-row">
@@ -4883,6 +5717,9 @@ function renderSelectedPersonaDetail(persona, availableBooks, hostChars, current
             <span class="st-pw-mono-id">${sanitizeHtml(persona.avatarId)}</span>
             <button type="button" class="menu_button st-pw-mini-btn st-pw-change-avatar-btn" data-avatar-id="${escapeAttr(persona.avatarId)}" title="直接上传更换该 User 的头像">
               <i class="fa-solid fa-image"></i> 换头像
+            </button>
+            <button type="button" class="menu_button st-pw-mini-btn st-pw-export-persona-btn" data-avatar-id="${escapeAttr(persona.avatarId)}" title="导出此人设分享包">
+              <i class="fa-solid fa-file-export"></i> 导出分享包
             </button>
           </div>
           <div class="st-pw-detail-meta-inputs">
@@ -4913,165 +5750,179 @@ function renderSelectedPersonaDetail(persona, availableBooks, hostChars, current
     ${renderUsageStatsBlockHtml(persona)}
 
     <!-- 绑定角色卡（绑在同一个角色卡下的多个 User 会自动在左侧归为一组） -->
-    <div class="st-pw-block">
+    <div class="st-pw-block ${bindingCollapsed ? 'is-block-collapsed' : ''}">
       <div class="st-pw-block-header">
-        <span class="st-pw-block-title">绑定角色卡（绑在同一角色下的多个 User 会自动归为一组）</span>
+        ${renderRightBlockToggleHtml('right:binding', '绑定角色卡', `已绑 ${meta.boundCharacters.length} 卡`)}
         ${
           currentCharName && !isCurrentCharBound
             ? `<button type="button" id="st_pw_bind_current_char_btn" class="menu_button st-pw-mini-btn" data-char="${escapeAttr(currentCharName)}">+ 绑到当前角色「${sanitizeHtml(currentCharName)}」</button>`
             : ''
         }
       </div>
-      <div class="st-pw-char-chips-row">
-        ${
-          meta.boundCharacters.length === 0
-            ? `<span class="st-pw-muted" style="font-size:0.82rem;">未绑定角色</span>`
-            : meta.boundCharacters
-                .map(
-                  (cName) => `
-                    <span class="st-pw-char-chip">
-                      <span class="st-pw-char-chip-jump" data-char="${escapeAttr(cName)}" title="点击筛选该角色组下的所有 User">${sanitizeHtml(cName)}</span>
-                      <button type="button" class="st-pw-chip-remove" data-char="${escapeAttr(cName)}" title="移出该角色组">×</button>
-                    </span>
-                  `
-                )
-                .join('')
-        }
-        <select id="st_pw_bind_char_select" class="text_pole st-pw-char-add-select">
-          <option value="">+ 选择角色卡加入该角色组…</option>
-          ${unboundHostChars
-            .map((c) => `<option value="${escapeAttr(c.name)}">${sanitizeHtml(c.name)}</option>`)
-            .join('')}
-          <option value="__custom__">手动输入角色名…</option>
-        </select>
-      </div>
+      ${bindingCollapsed ? '' : renderBoundCharacterChipsHtml(persona, unboundHostChars, currentCharName)}
     </div>
 
     <!-- 变体克隆 & 状态快照预设 -->
     ${renderPresetsAndCloneBlockHtml(persona)}
 
     <!-- 世界书绑定 -->
-    <div class="st-pw-block">
-      <div class="st-pw-block-title">世界书绑定</div>
-      <div class="st-pw-wb-bind-row">
-        <span class="st-pw-field-label">主世界书</span>
-        <select id="st_pw_primary_book_select" class="text_pole st-pw-flex-select">
-          ${bookOptionsHtml}
-        </select>
-        <button type="button" class="menu_button st-pw-act-popup-book" data-book="${escapeAttr(persona.lorebook)}" ${!persona.lorebook ? 'disabled' : ''}>
-          查看条目
-        </button>
-        <button type="button" class="menu_button st-pw-act-jump-book" data-book="${escapeAttr(persona.lorebook)}" ${!persona.lorebook ? 'disabled' : ''}>
-          跳转编辑器
-        </button>
+    <div class="st-pw-block ${wbCollapsed ? 'is-block-collapsed' : ''}">
+      <div class="st-pw-block-header">
+        ${renderRightBlockToggleHtml(
+          'right:worldbooks',
+          '世界书绑定',
+          `${persona.lorebook ? `主:${persona.lorebook}` : '未绑主书'}${enabledExtraCount ? ` · +${enabledExtraCount}书` : ''}`
+        )}
       </div>
-
-      <div class="st-pw-wb-bind-row">
-        <span class="st-pw-field-label">附加书</span>
-        <select id="st_pw_add_extra_book_select" class="text_pole st-pw-flex-select">
-          <option value="">添加额外关联世界书…</option>
-          ${availableBooks
-            .filter((b) => b !== persona.lorebook && !meta.extraWorldbooks.some((eb) => eb.name === b))
-            .map((b) => `<option value="${escapeAttr(b)}">${sanitizeHtml(b)}</option>`)
-            .join('')}
-        </select>
-        <button type="button" id="st_pw_add_extra_book_btn" class="menu_button">添加</button>
-      </div>
-
       ${
-        meta.extraWorldbooks.length > 0
-          ? `
-            <div class="st-pw-compact-rows">
-              ${meta.extraWorldbooks
-                .map(
-                  (eb, idx) => `
-                    <div class="st-pw-compact-row ${eb.enabled ? '' : 'is-disabled'}" data-idx="${idx}">
-                      <input type="checkbox" class="st-pw-toggle-extra-book" data-idx="${idx}" ${eb.enabled ? 'checked' : ''} />
-                      <span class="st-pw-row-main-text">${sanitizeHtml(eb.name)}</span>
-                      <button type="button" class="menu_button st-pw-mini-btn st-pw-act-popup-book" data-book="${escapeAttr(eb.name)}">条目</button>
-                      <button type="button" class="menu_button st-pw-mini-btn st-pw-act-jump-book" data-book="${escapeAttr(eb.name)}">跳转</button>
-                      <button type="button" class="st-pw-icon-btn st-pw-remove-extra-book" data-idx="${idx}" title="移除"><i class="fa-solid fa-xmark"></i></button>
-                    </div>
-                  `
-                )
-                .join('')}
+        wbCollapsed
+          ? ''
+          : `
+            <div class="st-pw-wb-bind-row">
+              <span class="st-pw-field-label">主世界书</span>
+              <select id="st_pw_primary_book_select" class="text_pole st-pw-flex-select">
+                ${bookOptionsHtml}
+              </select>
+              <button type="button" class="menu_button st-pw-act-popup-book" data-book="${escapeAttr(persona.lorebook)}" ${!persona.lorebook ? 'disabled' : ''}>
+                查看条目
+              </button>
+              <button type="button" class="menu_button st-pw-act-jump-book" data-book="${escapeAttr(persona.lorebook)}" ${!persona.lorebook ? 'disabled' : ''}>
+                跳转编辑器
+              </button>
             </div>
+
+            <div class="st-pw-wb-bind-row">
+              <span class="st-pw-field-label">附加书</span>
+              <select id="st_pw_add_extra_book_select" class="text_pole st-pw-flex-select">
+                <option value="">添加额外关联世界书…</option>
+                ${availableBooks
+                  .filter((b) => b !== persona.lorebook && !meta.extraWorldbooks.some((eb) => eb.name === b))
+                  .map((b) => `<option value="${escapeAttr(b)}">${sanitizeHtml(b)}</option>`)
+                  .join('')}
+              </select>
+              <button type="button" id="st_pw_add_extra_book_btn" class="menu_button">添加</button>
+            </div>
+
+            ${
+              meta.extraWorldbooks.length > 0
+                ? `
+                  <div class="st-pw-compact-rows">
+                    ${meta.extraWorldbooks
+                      .map(
+                        (eb, idx) => `
+                          <div class="st-pw-compact-row ${eb.enabled ? '' : 'is-disabled'}" data-idx="${idx}">
+                            <input type="checkbox" class="st-pw-toggle-extra-book" data-idx="${idx}" ${eb.enabled ? 'checked' : ''} />
+                            <span class="st-pw-row-main-text">${sanitizeHtml(eb.name)}</span>
+                            <button type="button" class="menu_button st-pw-mini-btn st-pw-act-popup-book" data-book="${escapeAttr(eb.name)}">条目</button>
+                            <button type="button" class="menu_button st-pw-mini-btn st-pw-act-jump-book" data-book="${escapeAttr(eb.name)}">跳转</button>
+                            <button type="button" class="st-pw-icon-btn st-pw-remove-extra-book" data-idx="${idx}" title="移除"><i class="fa-solid fa-xmark"></i></button>
+                          </div>
+                        `
+                      )
+                      .join('')}
+                  </div>
+                `
+                : ''
+            }
           `
-          : ''
       }
     </div>
 
     <!-- 随身设定 -->
-    <div class="st-pw-block">
+    <div class="st-pw-block ${traitsCollapsed ? 'is-block-collapsed' : ''}">
       <div class="st-pw-block-header">
-        <span class="st-pw-block-title">随身设定 (${meta.traits.filter((t) => t.enabled).length}/${meta.traits.length})</span>
-        <button type="button" id="st_pw_add_trait_btn" class="menu_button st-pw-mini-btn">+ 添加设定</button>
+        ${renderRightBlockToggleHtml(
+          'right:traits',
+          `随身设定 (${enabledTraitCount}/${meta.traits.length})`,
+          `${enabledTraitCount}/${meta.traits.length} 启用`
+        )}
+        ${
+          traitsCollapsed
+            ? ''
+            : `<button type="button" id="st_pw_add_trait_btn" class="menu_button st-pw-mini-btn">+ 添加设定</button>`
+        }
       </div>
       ${
-        meta.traits.length === 0
-          ? `<div class="st-pw-muted-hint">可添加随该 User 独立开关的补充设定片段（支持常驻或关键词触发）。</div>`
-          : `
-            <div class="st-pw-compact-rows">
-              ${meta.traits
-                .map((trait, idx) => {
-                  const isExp = state.expandedTraitIdx === idx;
-                  const isKw = trait.triggerMode === 'keyword';
-                  return `
-                    <div class="st-pw-trait-row ${trait.enabled ? '' : 'is-disabled'}" data-idx="${idx}">
-                      <div class="st-pw-compact-row">
-                        <input type="checkbox" class="st-pw-trait-enable" data-idx="${idx}" ${trait.enabled ? 'checked' : ''} />
-                        <button type="button" class="st-pw-mode-tag ${isKw ? 'is-keyword' : 'is-constant'} st-pw-trait-toggle-mode" data-idx="${idx}" title="点击切换常驻 / 关键词">
-                          <span class="st-pw-dot"></span>${isKw ? '关键词' : '常驻'}
-                        </button>
-                        <span class="st-pw-row-main-text st-pw-trait-expand" data-idx="${idx}">
-                          ${sanitizeHtml(trait.title || `设定 #${idx + 1}`)}
-                          ${isKw && trait.keywords ? `<small class="st-pw-muted"> (${sanitizeHtml(trait.keywords)})</small>` : ''}
-                        </span>
-                        <button type="button" class="st-pw-icon-btn st-pw-trait-expand" data-idx="${idx}">
-                          <i class="fa-solid fa-chevron-${isExp ? 'up' : 'down'}"></i>
-                        </button>
-                        <button type="button" class="st-pw-icon-btn st-pw-trait-delete" data-idx="${idx}" title="删除">
-                          <i class="fa-solid fa-xmark"></i>
-                        </button>
-                      </div>
-                      ${
-                        isExp
-                          ? `
-                            <div class="st-pw-trait-editor">
-                              <div class="st-pw-form-grid">
-                                <input type="text" class="text_pole st-pw-trait-title" data-idx="${idx}" placeholder="标题" value="${escapeAttr(trait.title)}" />
-                                <input type="text" class="text_pole st-pw-trait-keywords" data-idx="${idx}" placeholder="触发关键词（逗号分隔，仅关键词模式生效）" value="${escapeAttr(trait.keywords || '')}" />
+        traitsCollapsed
+          ? ''
+          : meta.traits.length === 0
+            ? `<div class="st-pw-muted-hint">可添加随该 User 独立开关的补充设定片段（支持常驻或关键词触发）。</div>`
+            : `
+              <div class="st-pw-compact-rows">
+                ${meta.traits
+                  .map((trait, idx) => {
+                    const isExp = state.expandedTraitIdx === idx;
+                    const isKw = trait.triggerMode === 'keyword';
+                    return `
+                      <div class="st-pw-trait-row ${trait.enabled ? '' : 'is-disabled'}" data-idx="${idx}">
+                        <div class="st-pw-compact-row">
+                          <input type="checkbox" class="st-pw-trait-enable" data-idx="${idx}" ${trait.enabled ? 'checked' : ''} />
+                          <button type="button" class="st-pw-mode-tag ${isKw ? 'is-keyword' : 'is-constant'} st-pw-trait-toggle-mode" data-idx="${idx}" title="点击切换常驻 / 关键词">
+                            <span class="st-pw-dot"></span>${isKw ? '关键词' : '常驻'}
+                          </button>
+                          <span class="st-pw-row-main-text st-pw-trait-expand" data-idx="${idx}">
+                            ${sanitizeHtml(trait.title || `设定 #${idx + 1}`)}
+                            ${isKw && trait.keywords ? `<small class="st-pw-muted"> (${sanitizeHtml(trait.keywords)})</small>` : ''}
+                          </span>
+                          <button type="button" class="st-pw-icon-btn st-pw-trait-expand" data-idx="${idx}">
+                            <i class="fa-solid fa-chevron-${isExp ? 'up' : 'down'}"></i>
+                          </button>
+                          <button type="button" class="st-pw-icon-btn st-pw-trait-delete" data-idx="${idx}" title="删除">
+                            <i class="fa-solid fa-xmark"></i>
+                          </button>
+                        </div>
+                        ${
+                          isExp
+                            ? `
+                              <div class="st-pw-trait-editor">
+                                <div class="st-pw-form-grid">
+                                  <input type="text" class="text_pole st-pw-trait-title" data-idx="${idx}" placeholder="标题" value="${escapeAttr(trait.title)}" />
+                                  <input type="text" class="text_pole st-pw-trait-keywords" data-idx="${idx}" placeholder="触发关键词（逗号分隔，仅关键词模式生效）" value="${escapeAttr(trait.keywords || '')}" />
+                                </div>
+                                <textarea class="text_pole st-pw-trait-content" data-idx="${idx}" rows="4" placeholder="设定内容…">${sanitizeHtml(trait.content || '')}</textarea>
                               </div>
-                              <textarea class="text_pole st-pw-trait-content" data-idx="${idx}" rows="4" placeholder="设定内容…">${sanitizeHtml(trait.content || '')}</textarea>
-                            </div>
-                          `
-                          : ''
-                      }
-                    </div>
-                  `;
-                })
-                .join('')}
-            </div>
-          `
+                            `
+                            : ''
+                        }
+                      </div>
+                    `;
+                  })
+                  .join('')}
+              </div>
+            `
       }
     </div>
 
     <!-- 人设描述 & 备注 -->
-    <div class="st-pw-block">
+    <div class="st-pw-block ${descCollapsed ? 'is-block-collapsed' : ''}">
       <div class="st-pw-block-header">
-        <span class="st-pw-block-title">人设描述 & 备注</span>
-        <button type="button" id="st_pw_save_base_desc_btn" class="menu_button st-pw-mini-btn">保存描述</button>
+        ${renderRightBlockToggleHtml(
+          'right:desc',
+          '人设描述 & 备注',
+          `描述 ${(persona.description || '').length} 字`
+        )}
+        ${
+          descCollapsed
+            ? ''
+            : `<button type="button" id="st_pw_save_base_desc_btn" class="menu_button st-pw-mini-btn">保存描述</button>`
+        }
       </div>
-      <div class="st-pw-form-grid">
-        <div>
-          <label class="st-pw-sub-label">原生人设描述 (Persona Description)</label>
-          <textarea id="st_pw_base_description" class="text_pole" rows="6" placeholder="发送给 AI 的基础人设描述…">${sanitizeHtml(persona.description)}</textarea>
-        </div>
-        <div>
-          <label class="st-pw-sub-label">私密备注（仅自己可见，不发给 AI）</label>
-          <textarea id="st_pw_private_note" class="text_pole" rows="6" placeholder="备注适用角色卡或剧情线…">${sanitizeHtml(meta.note)}</textarea>
-        </div>
-      </div>
+      ${
+        descCollapsed
+          ? ''
+          : `
+            <div class="st-pw-form-grid">
+              <div>
+                <label class="st-pw-sub-label">原生人设描述 (Persona Description)</label>
+                <textarea id="st_pw_base_description" class="text_pole" rows="6" placeholder="发送给 AI 的基础人设描述…">${sanitizeHtml(persona.description)}</textarea>
+              </div>
+              <div>
+                <label class="st-pw-sub-label">私密备注（仅自己可见，不发给 AI）</label>
+                <textarea id="st_pw_private_note" class="text_pole" rows="6" placeholder="备注适用角色卡或剧情线…">${sanitizeHtml(meta.note)}</textarea>
+              </div>
+            </div>
+          `
+      }
     </div>
   `;
 }
@@ -5098,6 +5949,121 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
 
   modal.querySelector('.st-pw-modal-upload-btn')?.addEventListener('click', async () => {
     await triggerPersonaAvatarUpload({ targetAvatarId: '' });
+  });
+
+  modal.querySelectorAll('.st-pw-toggle-more-tools-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      state.showLeftMoreTools = !state.showLeftMoreTools;
+      invalidateRenderedHtmlCache();
+      rerenderPanels();
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-sort-select').forEach((sel) => {
+    sel.addEventListener('change', (e) => {
+      settings.sortBy = e.target.value || 'default';
+      e.target.blur?.();
+      saveSettings();
+      invalidateRenderedHtmlCache();
+      rerenderPanels();
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-view-seg-btn[data-view-mode]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const nextMode = btn.getAttribute('data-view-mode') || 'standard';
+      if (settings.viewMode === nextMode) return;
+      settings.viewMode = nextMode;
+      saveSettings();
+      invalidateRenderedHtmlCache();
+      rerenderPanels();
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-collapse-all-folders-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const { characterGroups, customGroups } = buildUnifiedPersonaGroups(allPersonas || getHostPersonas());
+      for (const cg of characterGroups) state.collapsedSections.add(cg.id);
+      for (const g of customGroups) state.collapsedSections.add(g.id);
+      state.collapsedSections.add('multi_char_general');
+      state.collapsedSections.add('ungrouped');
+      syncCollapsedSectionsToSettings();
+      invalidateRenderedHtmlCache();
+      rerenderPanels();
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-expand-all-folders-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      state.collapsedSections.clear();
+      syncCollapsedSectionsToSettings();
+      invalidateRenderedHtmlCache();
+      rerenderPanels();
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-sync-cloud-avatars-btn').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await refreshDiskAvatarSet();
+      await runUniversalNativeAvatarHarvest({ manual: true });
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-export-persona-btn').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const targetId = btn.getAttribute('data-avatar-id') || selectedPersona?.avatarId || '';
+      if (targetId) {
+        await exportPersonaSharePack([targetId]);
+      }
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-import-share-pack-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      triggerImportPersonaSharePack();
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-right-block-toggle').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const blockId = btn.getAttribute('data-block-id');
+      if (!blockId) return;
+      toggleRightBlockCollapsed(blockId);
+      rerenderPanels();
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-toggle-all-bound-chars').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const id = btn.getAttribute('data-avatar-id') || selectedPersona?.avatarId || '';
+      if (!id) return;
+      if (state.expandedBoundCharsForAvatar.has(id)) {
+        state.expandedBoundCharsForAvatar.delete(id);
+      } else {
+        state.expandedBoundCharsForAvatar.add(id);
+      }
+      invalidateRenderedHtmlCache();
+      rerenderPanels();
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-clear-persona-chars-btn').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const id = btn.getAttribute('data-avatar-id') || selectedPersona?.avatarId || '';
+      if (id) {
+        await clearAllPersonaBoundCharacters(id);
+      }
+    });
   });
 
   modal.querySelectorAll('.st-pw-change-avatar-btn').forEach((btn) => {
@@ -5142,7 +6108,7 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
     });
   });
 
-  // 折叠/展开分组文件夹
+  // 折叠/展开分组文件夹（自动记忆折叠状态）
   modal.querySelectorAll('.st-pw-folder-toggle').forEach((el) => {
     el.addEventListener('click', () => {
       const secId = el.getAttribute('data-section-id');
@@ -5152,6 +6118,7 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
       } else {
         state.collapsedSections.add(secId);
       }
+      syncCollapsedSectionsToSettings();
       rerenderPanels();
     });
   });
@@ -5167,6 +6134,7 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
       }
       state.batchAssignTarget = { type: 'character', name: charName };
       state.collapsedSections.delete(`char:${charName}`);
+      syncCollapsedSectionsToSettings();
       rerenderPanels();
     });
 
@@ -5251,9 +6219,22 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
         }
         state.batchAssignTarget = { type: 'group', name: clean };
         state.collapsedSections.delete(`group:${clean}`);
+        syncCollapsedSectionsToSettings();
         rerenderPanels();
       }
     });
+
+  // 自定义分组排序（置顶 / 上移 / 下移）
+  modal.querySelectorAll('.st-pw-move-group-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const gName = btn.getAttribute('data-group-name');
+      const dir = btn.getAttribute('data-move-dir');
+      if (gName && dir) {
+        moveCustomGroupOrder(gName, e.shiftKey && dir === 'up' ? 'top' : dir);
+      }
+    });
+  });
 
   // 重命名自定义分组
   modal.querySelectorAll('.st-pw-rename-group-btn').forEach((btn) => {
@@ -5431,6 +6412,16 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       executeBatchFavorite(false);
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-multi-export').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const ids = getValidMultiSelectedIds();
+      if (ids.length > 0) {
+        await exportPersonaSharePack(ids);
+      }
     });
   });
 
@@ -5924,32 +6915,46 @@ async function openActivePromptPreviewModal() {
  * - 右栏 (.persona_management_right_column)：在保留原生改名/换头像/复制/删除/描述/位置/连接的前提下，原位嵌入「分组与角色绑定、主/附加世界书（下拉+查看条目+跳转编辑器）、随身设定、生效预览与私密备注」
  */
 function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroups, customGroups, ungroupedMembers, q) {
+  const sortBy = getSettings().sortBy || 'default';
+
   // 单项模式筛选：收藏 / 全局人设 / 卡内专属 / 已聊过
   if (state.activeFilter === 'fav') {
-    const favList = personas.filter((p) => p.meta.favorite && matchesSearch(p, q));
+    const favList = sortPersonasList(
+      personas.filter((p) => p.meta.favorite && matchesSearch(p, q)),
+      sortBy
+    );
     return favList.length
-      ? favList.map((p) => renderPersonaRowHtml(p, selectedAvatarId)).join('')
+      ? `<div class="st-pw-flat-list-body">${favList.map((p) => renderPersonaRowHtml(p, selectedAvatarId)).join('')}</div>`
       : `<div class="st-pw-empty-state">暂无收藏的 User</div>`;
   }
   if (state.activeFilter === 'global') {
-    const globalList = personas.filter((p) => !p.isLukerCharacterOnly && matchesSearch(p, q));
+    const globalList = sortPersonasList(
+      personas.filter((p) => !p.isLukerCharacterOnly && matchesSearch(p, q)),
+      sortBy
+    );
     return globalList.length
-      ? globalList.map((p) => renderPersonaRowHtml(p, selectedAvatarId)).join('')
+      ? `<div class="st-pw-flat-list-body">${globalList.map((p) => renderPersonaRowHtml(p, selectedAvatarId)).join('')}</div>`
       : `<div class="st-pw-empty-state">无匹配的全局人设</div>`;
   }
   if (state.activeFilter === 'dedicated') {
-    const dedList = personas.filter((p) => p.isLukerCharacterOnly && matchesSearch(p, q));
+    const dedList = sortPersonasList(
+      personas.filter((p) => p.isLukerCharacterOnly && matchesSearch(p, q)),
+      sortBy
+    );
     return dedList.length
-      ? dedList.map((p) => renderPersonaRowHtml(p, selectedAvatarId)).join('')
+      ? `<div class="st-pw-flat-list-body">${dedList.map((p) => renderPersonaRowHtml(p, selectedAvatarId)).join('')}</div>`
       : `<div class="st-pw-empty-state">无匹配的卡内专属人设</div>`;
   }
   if (state.activeFilter === 'chatted') {
-    const chattedList = personas.filter((p) => {
-      const u = getPersonaUsageSummary(p.avatarId);
-      return (u.chatCount > 0 || u.durationMs > 0) && matchesSearch(p, q);
-    });
+    const chattedList = sortPersonasList(
+      personas.filter((p) => {
+        const u = getPersonaUsageSummary(p.avatarId);
+        return (u.chatCount > 0 || u.durationMs > 0) && matchesSearch(p, q);
+      }),
+      sortBy
+    );
     return chattedList.length
-      ? chattedList.map((p) => renderPersonaRowHtml(p, selectedAvatarId)).join('')
+      ? `<div class="st-pw-flat-list-body">${chattedList.map((p) => renderPersonaRowHtml(p, selectedAvatarId)).join('')}</div>`
       : `<div class="st-pw-empty-state">暂无有聊天记录的 User，可点右侧「扫描历史档」回溯</div>`;
   }
 
@@ -5986,7 +6991,10 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
       continue;
     }
 
-    const visibleMembers = cg.members.filter((p) => matchesSearch(p, q));
+    const visibleMembers = sortPersonasList(
+      cg.members.filter((p) => matchesSearch(p, q)),
+      sortBy
+    );
     if (q && visibleMembers.length === 0) continue;
     const isCollapsed = state.collapsedSections.has(cg.id);
 
@@ -6031,8 +7039,9 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
 
   // 1.5) 绑定了 >= 3 个单人角色卡的通用人设聚合组（只展示 1 次，不再重复刷出几十个单人卡片组）
   if (state.activeFilter === 'all' && generalMultiBoundMap.size > 0) {
-    const generalMembers = [...generalMultiBoundMap.values()].filter(
-      (p) => !p.meta.group && matchesSearch(p, q)
+    const generalMembers = sortPersonasList(
+      [...generalMultiBoundMap.values()].filter((p) => !p.meta.group && matchesSearch(p, q)),
+      sortBy
     );
     if (generalMembers.length > 0) {
       const isCollapsed = state.collapsedSections.has('multi_char_general');
@@ -6063,15 +7072,20 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
     }
   }
 
-  // 2) 用户自定义分组
-  for (const grp of customGroups) {
+  // 2) 用户自定义分组（支持置顶 / 上移 / 下移排序）
+  for (let grpIdx = 0; grpIdx < customGroups.length; grpIdx++) {
+    const grp = customGroups[grpIdx];
     if (state.activeFilter !== 'all' && state.activeFilter !== grp.id) continue;
-    const visibleMembers = grp.members.filter((p) => matchesSearch(p, q));
+    const visibleMembers = sortPersonasList(
+      grp.members.filter((p) => matchesSearch(p, q)),
+      sortBy
+    );
     if (q && visibleMembers.length === 0) continue;
     const isCollapsed = state.collapsedSections.has(grp.id);
     const isBatchOpen =
       state.batchAssignTarget?.type === 'group' &&
       state.batchAssignTarget?.name === grp.name;
+    const showReorder = state.activeFilter === 'all' && customGroups.length > 1;
 
     sections.push(`
       <div class="st-pw-folder-section" data-section-id="${escapeAttr(grp.id)}">
@@ -6086,6 +7100,21 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
             ${
               state.multiSelectMode && !isCollapsed && visibleMembers.length > 0
                 ? `<button type="button" class="st-pw-link-btn st-pw-multi-select-section" title="全选或取消本组所有可见人设">全选本组</button>`
+                : ''
+            }
+            ${
+              showReorder && grpIdx > 1
+                ? `<button type="button" class="st-pw-icon-btn st-pw-move-group-btn" data-group-name="${escapeAttr(grp.name)}" data-move-dir="top" title="置顶此分组"><i class="fa-solid fa-angles-up"></i></button>`
+                : ''
+            }
+            ${
+              showReorder && grpIdx > 0
+                ? `<button type="button" class="st-pw-icon-btn st-pw-move-group-btn" data-group-name="${escapeAttr(grp.name)}" data-move-dir="up" title="上移分组"><i class="fa-solid fa-arrow-up"></i></button>`
+                : ''
+            }
+            ${
+              showReorder && grpIdx < customGroups.length - 1
+                ? `<button type="button" class="st-pw-icon-btn st-pw-move-group-btn" data-group-name="${escapeAttr(grp.name)}" data-move-dir="down" title="下移分组"><i class="fa-solid fa-arrow-down"></i></button>`
                 : ''
             }
             <button type="button" class="st-pw-icon-btn st-pw-open-batch-group" data-group-name="${escapeAttr(grp.name)}" title="批量勾选移入此分组的 User">
@@ -6115,10 +7144,13 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
 
   // 3) 未分组 User
   if (state.activeFilter === 'all' || state.activeFilter === 'ungrouped') {
-    const visibleUngrouped = ungroupedMembers.filter((p) => matchesSearch(p, q));
+    const visibleUngrouped = sortPersonasList(
+      ungroupedMembers.filter((p) => matchesSearch(p, q)),
+      sortBy
+    );
     if (characterGroups.length === 0 && customGroups.length === 0) {
       return visibleUngrouped.length
-        ? visibleUngrouped.map((p) => renderPersonaRowHtml(p, selectedAvatarId)).join('')
+        ? `<div class="st-pw-flat-list-body">${visibleUngrouped.map((p) => renderPersonaRowHtml(p, selectedAvatarId)).join('')}</div>`
         : `<div class="st-pw-empty-state">无匹配人设</div>`;
     }
     if (visibleUngrouped.length > 0 || state.activeFilter === 'ungrouped') {
@@ -6247,52 +7279,20 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
         const searchCursorPos = wasSearchFocused ? document.activeElement.selectionStart : null;
 
         const nextLeftHtml = `
-          <div class="st-pw-inline-left-top">
-            <input type="search" id="st_pw_inline_search_input" class="text_pole st-pw-sidebar-search" placeholder="搜索 User、角色组、自定义组、世界书…" value="${escapeAttr(state.searchQuery)}" />
-            <button type="button" class="menu_button st-pw-mini-btn st-pw-toggle-multi-btn ${state.multiSelectMode ? 'is-active-mode' : ''}" title="开启多选模式，一次性将多个 User 批量移入分组、绑卡、绑世界书或删除">
-              <i class="fa-${state.multiSelectMode ? 'solid fa-check-double' : 'regular fa-square-check'}"></i> ${state.multiSelectMode ? `完成${state.multiSelectedIds.size > 0 ? ` (${state.multiSelectedIds.size})` : ''}` : '多选'}
-            </button>
-            <button type="button" class="menu_button st-pw-mini-btn st-pw-inline-create-btn" title="调用原生新建人设">
-              <i class="fa-solid fa-plus"></i> 新建
-            </button>
-            <button type="button" class="menu_button st-pw-mini-btn st-pw-inline-upload-btn" title="上传头像新建人设">
-              <i class="fa-solid fa-image"></i> 头像
-            </button>
-            ${
-              targetPersona
-                ? `<button type="button" class="menu_button st-pw-mini-btn st-pw-inline-change-avatar-btn" title="更换当前选中 User 的头像">换图</button>`
-                : ''
-            }
-            <button type="button" class="menu_button st-pw-mini-btn st-pw-sync-cloud-avatars-btn" title="一键唤醒原生人设池同步图床/云端/美化插件头像">
-              刷图
-            </button>
-            <button type="button" class="menu_button st-pw-mini-btn st-pw-toggle-raw-list-btn" title="切换到酒馆原生平铺列表">
-              原生列表
-            </button>
-          </div>
-
-          <div class="st-pw-sidebar-create-bar">
-            <select id="st_pw_inline_char_group_select" class="text_pole st-pw-flex-select" title="选一个角色卡，把多个 User 绑到它下面自动归为一组">
-              <option value="">+ 按角色绑一组 User…</option>
-              ${
-                currentCharName
-                  ? `<option value="${escapeAttr(currentCharName)}">当前角色：${sanitizeHtml(currentCharName)}</option>`
-                  : ''
-              }
-              ${hostChars
-                .filter((c) => c.name !== currentCharName)
-                .map((c) => `<option value="${escapeAttr(c.name)}">${sanitizeHtml(c.name)}</option>`)
-                .join('')}
-            </select>
-            <button type="button" class="menu_button st-pw-mini-btn st-pw-inline-add-group-btn" title="新建自定义分组">
-              + 自定义组
-            </button>
-          </div>
+          ${renderLeftHeaderControlsHtml({
+            mode: 'inline',
+            searchId: 'st_pw_inline_search_input',
+            charSelectId: 'st_pw_inline_char_group_select',
+            targetPersona,
+            hostChars,
+            currentCharName,
+            settings,
+          })}
 
           ${renderFilterPillsBarHtml(personas, characterGroups, customGroups, ungroupedMembers)}
           ${renderMultiSelectToolbarHtml(settings, hostChars, currentCharName, availableBooks)}
 
-          <div class="st-pw-persona-list st-pw-inline-persona-list">
+          <div class="st-pw-persona-list st-pw-inline-persona-list is-view-${escapeAttr(settings.viewMode || 'standard')}">
             ${buildGroupedTreeSectionsHtml(
               personas,
               targetPersona?.avatarId,
@@ -6343,21 +7343,6 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
           leftPanel.querySelector('.st-pw-inline-upload-btn')?.addEventListener('click', async () => {
             await triggerPersonaAvatarUpload({ targetAvatarId: '' });
           });
-
-          leftPanel
-            .querySelector('.st-pw-inline-change-avatar-btn')
-            ?.addEventListener('click', async () => {
-              if (targetPersona?.avatarId) {
-                await triggerPersonaAvatarUpload({ targetAvatarId: targetPersona.avatarId });
-              }
-            });
-
-          leftPanel
-            .querySelector('.st-pw-sync-cloud-avatars-btn')
-            ?.addEventListener('click', async () => {
-              await refreshDiskAvatarSet();
-              await runUniversalNativeAvatarHarvest({ manual: true });
-            });
 
           leftPanel.querySelector('.st-pw-toggle-raw-list-btn')?.addEventListener('click', async () => {
             state.useRawNativeLeftList = true;
@@ -6463,18 +7448,24 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
   const unboundHostChars = hostChars.filter(
     (c) => !meta.boundCharacters.some((bc) => bc.toLowerCase() === c.name.toLowerCase())
   );
+  const bindingCollapsed = isRightBlockCollapsed('right:binding');
+  const wbCollapsed = isRightBlockCollapsed('right:worldbooks');
+  const traitsCollapsed = isRightBlockCollapsed('right:traits');
+  const enabledExtraCount = meta.extraWorldbooks.filter((b) => b.enabled).length;
+  const enabledTraitCount = meta.traits.filter((t) => t.enabled).length;
+  const bindingSummary = `${meta.group ? `组:${meta.group}` : '未分组'} · 绑${meta.boundCharacters.length}卡`;
 
   const nextRightHtml = `
     <!-- 0. 使用足迹统计（聊过几个角色卡 · 几个聊天档 · 聊了多久） -->
     ${renderUsageStatsBlockHtml(targetPersona)}
 
     <!-- 1. 分组、标签与角色分组绑定 -->
-    <div class="st-pw-block">
+    <div class="st-pw-block ${bindingCollapsed ? 'is-block-collapsed' : ''}">
       <div class="st-pw-block-header">
-        <span class="st-pw-block-title">分组与绑定角色卡（同角色绑多个 User 自动在左侧归为一组）</span>
+        ${renderRightBlockToggleHtml('right:binding', '分组与绑定角色卡', bindingSummary)}
         <div class="st-pw-inline-header-btns">
           ${
-            currentCharName && !isCurrentCharBound
+            !bindingCollapsed && currentCharName && !isCurrentCharBound
               ? `<button type="button" id="st_pw_bind_current_char_btn" class="menu_button st-pw-mini-btn" data-char="${escapeAttr(currentCharName)}">+ 绑到当前角色「${sanitizeHtml(currentCharName)}」</button>`
               : ''
           }
@@ -6483,161 +7474,171 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
         </div>
       </div>
 
-      <div class="st-pw-detail-meta-inputs">
-        <select id="st_pw_detail_group" class="text_pole" title="所属自定义分组">
-          <option value="">自定义分组：无</option>
-          ${settings.groups
-            .map(
-              (g) =>
-                `<option value="${escapeAttr(g)}" ${meta.group === g ? 'selected' : ''}>分组：${sanitizeHtml(g)}</option>`
-            )
-            .join('')}
-          <option value="__new__">+ 新建自定义分组…</option>
-        </select>
-        <input type="text" id="st_pw_detail_tags" class="text_pole" placeholder="标签 (逗号分隔)" value="${escapeAttr(meta.tags.join(', '))}" />
-      </div>
+      ${
+        bindingCollapsed
+          ? ''
+          : `
+            <div class="st-pw-detail-meta-inputs">
+              <select id="st_pw_detail_group" class="text_pole" title="所属自定义分组">
+                <option value="">自定义分组：无</option>
+                ${settings.groups
+                  .map(
+                    (g) =>
+                      `<option value="${escapeAttr(g)}" ${meta.group === g ? 'selected' : ''}>分组：${sanitizeHtml(g)}</option>`
+                  )
+                  .join('')}
+                <option value="__new__">+ 新建自定义分组…</option>
+              </select>
+              <input type="text" id="st_pw_detail_tags" class="text_pole" placeholder="标签 (逗号分隔)" value="${escapeAttr(meta.tags.join(', '))}" />
+            </div>
 
-      <div class="st-pw-char-chips-row">
-        ${
-          meta.boundCharacters.length === 0
-            ? `<span class="st-pw-muted" style="font-size:0.82rem;">未绑定角色组</span>`
-            : meta.boundCharacters
-                .map(
-                  (cName) => `
-                    <span class="st-pw-char-chip">
-                      <span class="st-pw-char-chip-jump" data-char="${escapeAttr(cName)}" title="点击在左侧筛选该角色组下的所有 User">${sanitizeHtml(cName)}</span>
-                      <button type="button" class="st-pw-chip-remove" data-char="${escapeAttr(cName)}" title="移出该角色组">×</button>
-                    </span>
-                  `
-                )
-                .join('')
-        }
-        <select id="st_pw_bind_char_select" class="text_pole st-pw-char-add-select">
-          <option value="">+ 选择角色卡加入该角色组…</option>
-          ${unboundHostChars
-            .map((c) => `<option value="${escapeAttr(c.name)}">${sanitizeHtml(c.name)}</option>`)
-            .join('')}
-          <option value="__custom__">手动输入角色名…</option>
-        </select>
-      </div>
+            ${renderBoundCharacterChipsHtml(targetPersona, unboundHostChars, currentCharName)}
+          `
+      }
     </div>
 
     <!-- 1.5 变体克隆 & 状态快照预设 -->
     ${renderPresetsAndCloneBlockHtml(targetPersona)}
 
     <!-- 2. 世界书绑定（主世界书 + 附加世界书） -->
-    <div class="st-pw-block">
-      <div class="st-pw-block-title">世界书绑定</div>
-      <div class="st-pw-wb-bind-row">
-        <span class="st-pw-field-label">主世界书</span>
-        <select id="st_pw_primary_book_select" class="text_pole st-pw-flex-select">
-          <option value="">— 未绑定 —</option>
-          ${availableBooks
-            .map(
-              (b) =>
-                `<option value="${escapeAttr(b)}" ${currentBook === b ? 'selected' : ''}>${sanitizeHtml(b)}</option>`
-            )
-            .join('')}
-        </select>
-        <button type="button" class="menu_button st-pw-mini-btn st-pw-act-popup-book" data-book="${escapeAttr(currentBook)}" ${!currentBook ? 'disabled' : ''}>
-          查看条目
-        </button>
-        <button type="button" class="menu_button st-pw-mini-btn st-pw-act-jump-book" data-book="${escapeAttr(currentBook)}" ${!currentBook ? 'disabled' : ''}>
-          跳转编辑器
-        </button>
+    <div class="st-pw-block ${wbCollapsed ? 'is-block-collapsed' : ''}">
+      <div class="st-pw-block-header">
+        ${renderRightBlockToggleHtml(
+          'right:worldbooks',
+          '世界书绑定',
+          `${currentBook ? `主:${currentBook}` : '未绑主书'}${enabledExtraCount ? ` · +${enabledExtraCount}书` : ''}`
+        )}
       </div>
-
-      <div class="st-pw-wb-bind-row">
-        <span class="st-pw-field-label">附加书</span>
-        <select id="st_pw_add_extra_book_select" class="text_pole st-pw-flex-select">
-          <option value="">添加额外关联世界书…</option>
-          ${availableBooks
-            .filter((b) => b !== currentBook && !meta.extraWorldbooks.some((eb) => eb.name === b))
-            .map((b) => `<option value="${escapeAttr(b)}">${sanitizeHtml(b)}</option>`)
-            .join('')}
-        </select>
-        <button type="button" id="st_pw_add_extra_book_btn" class="menu_button st-pw-mini-btn">添加</button>
-      </div>
-
       ${
-        meta.extraWorldbooks.length > 0
-          ? `
-            <div class="st-pw-compact-rows">
-              ${meta.extraWorldbooks
-                .map(
-                  (eb, idx) => `
-                    <div class="st-pw-compact-row ${eb.enabled ? '' : 'is-disabled'}" data-idx="${idx}">
-                      <input type="checkbox" class="st-pw-toggle-extra-book" data-idx="${idx}" ${eb.enabled ? 'checked' : ''} />
-                      <span class="st-pw-row-main-text">${sanitizeHtml(eb.name)}</span>
-                      <button type="button" class="menu_button st-pw-mini-btn st-pw-act-popup-book" data-book="${escapeAttr(eb.name)}">条目</button>
-                      <button type="button" class="menu_button st-pw-mini-btn st-pw-act-jump-book" data-book="${escapeAttr(eb.name)}">跳转</button>
-                      <button type="button" class="st-pw-icon-btn st-pw-remove-extra-book" data-idx="${idx}" title="移除"><i class="fa-solid fa-xmark"></i></button>
-                    </div>
-                  `
-                )
-                .join('')}
+        wbCollapsed
+          ? ''
+          : `
+            <div class="st-pw-wb-bind-row">
+              <span class="st-pw-field-label">主世界书</span>
+              <select id="st_pw_primary_book_select" class="text_pole st-pw-flex-select">
+                <option value="">— 未绑定 —</option>
+                ${availableBooks
+                  .map(
+                    (b) =>
+                      `<option value="${escapeAttr(b)}" ${currentBook === b ? 'selected' : ''}>${sanitizeHtml(b)}</option>`
+                  )
+                  .join('')}
+              </select>
+              <button type="button" class="menu_button st-pw-mini-btn st-pw-act-popup-book" data-book="${escapeAttr(currentBook)}" ${!currentBook ? 'disabled' : ''}>
+                查看条目
+              </button>
+              <button type="button" class="menu_button st-pw-mini-btn st-pw-act-jump-book" data-book="${escapeAttr(currentBook)}" ${!currentBook ? 'disabled' : ''}>
+                跳转编辑器
+              </button>
             </div>
+
+            <div class="st-pw-wb-bind-row">
+              <span class="st-pw-field-label">附加书</span>
+              <select id="st_pw_add_extra_book_select" class="text_pole st-pw-flex-select">
+                <option value="">添加额外关联世界书…</option>
+                ${availableBooks
+                  .filter((b) => b !== currentBook && !meta.extraWorldbooks.some((eb) => eb.name === b))
+                  .map((b) => `<option value="${escapeAttr(b)}">${sanitizeHtml(b)}</option>`)
+                  .join('')}
+              </select>
+              <button type="button" id="st_pw_add_extra_book_btn" class="menu_button st-pw-mini-btn">添加</button>
+            </div>
+
+            ${
+              meta.extraWorldbooks.length > 0
+                ? `
+                  <div class="st-pw-compact-rows">
+                    ${meta.extraWorldbooks
+                      .map(
+                        (eb, idx) => `
+                          <div class="st-pw-compact-row ${eb.enabled ? '' : 'is-disabled'}" data-idx="${idx}">
+                            <input type="checkbox" class="st-pw-toggle-extra-book" data-idx="${idx}" ${eb.enabled ? 'checked' : ''} />
+                            <span class="st-pw-row-main-text">${sanitizeHtml(eb.name)}</span>
+                            <button type="button" class="menu_button st-pw-mini-btn st-pw-act-popup-book" data-book="${escapeAttr(eb.name)}">条目</button>
+                            <button type="button" class="menu_button st-pw-mini-btn st-pw-act-jump-book" data-book="${escapeAttr(eb.name)}">跳转</button>
+                            <button type="button" class="st-pw-icon-btn st-pw-remove-extra-book" data-idx="${idx}" title="移除"><i class="fa-solid fa-xmark"></i></button>
+                          </div>
+                        `
+                      )
+                      .join('')}
+                  </div>
+                `
+                : ''
+            }
           `
-          : ''
       }
     </div>
 
     <!-- 3. 随身设定 & 私密备注 -->
-    <div class="st-pw-block">
+    <div class="st-pw-block ${traitsCollapsed ? 'is-block-collapsed' : ''}">
       <div class="st-pw-block-header">
-        <span class="st-pw-block-title">随身设定 (${meta.traits.filter((t) => t.enabled).length}/${meta.traits.length})</span>
-        <button type="button" id="st_pw_add_trait_btn" class="menu_button st-pw-mini-btn">+ 添加设定</button>
+        ${renderRightBlockToggleHtml(
+          'right:traits',
+          `随身设定 (${enabledTraitCount}/${meta.traits.length})`,
+          `${enabledTraitCount}/${meta.traits.length} 启用${meta.note ? ' · 有备注' : ''}`
+        )}
+        ${
+          traitsCollapsed
+            ? ''
+            : `<button type="button" id="st_pw_add_trait_btn" class="menu_button st-pw-mini-btn">+ 添加设定</button>`
+        }
       </div>
       ${
-        meta.traits.length === 0
-          ? `<div class="st-pw-muted-hint">可添加随该 User 独立开关的补充设定片段（支持常驻或关键词触发）。</div>`
+        traitsCollapsed
+          ? ''
           : `
-            <div class="st-pw-compact-rows">
-              ${meta.traits
-                .map((trait, idx) => {
-                  const isExp = state.expandedTraitIdx === idx;
-                  const isKw = trait.triggerMode === 'keyword';
-                  return `
-                    <div class="st-pw-trait-row ${trait.enabled ? '' : 'is-disabled'}" data-idx="${idx}">
-                      <div class="st-pw-compact-row">
-                        <input type="checkbox" class="st-pw-trait-enable" data-idx="${idx}" ${trait.enabled ? 'checked' : ''} />
-                        <button type="button" class="st-pw-mode-tag ${isKw ? 'is-keyword' : 'is-constant'} st-pw-trait-toggle-mode" data-idx="${idx}" title="点击切换常驻 / 关键词">
-                          <span class="st-pw-dot"></span>${isKw ? '关键词' : '常驻'}
-                        </button>
-                        <span class="st-pw-row-main-text st-pw-trait-expand" data-idx="${idx}">
-                          ${sanitizeHtml(trait.title || `设定 #${idx + 1}`)}
-                          ${isKw && trait.keywords ? `<small class="st-pw-muted"> (${sanitizeHtml(trait.keywords)})</small>` : ''}
-                        </span>
-                        <button type="button" class="st-pw-icon-btn st-pw-trait-expand" data-idx="${idx}">
-                          <i class="fa-solid fa-chevron-${isExp ? 'up' : 'down'}"></i>
-                        </button>
-                        <button type="button" class="st-pw-icon-btn st-pw-trait-delete" data-idx="${idx}" title="删除">
-                          <i class="fa-solid fa-xmark"></i>
-                        </button>
-                      </div>
-                      ${
-                        isExp
-                          ? `
-                            <div class="st-pw-trait-editor">
-                              <div class="st-pw-form-grid">
-                                <input type="text" class="text_pole st-pw-trait-title" data-idx="${idx}" placeholder="标题" value="${escapeAttr(trait.title)}" />
-                                <input type="text" class="text_pole st-pw-trait-keywords" data-idx="${idx}" placeholder="触发关键词（逗号分隔，仅关键词模式生效）" value="${escapeAttr(trait.keywords || '')}" />
-                              </div>
-                              <textarea class="text_pole st-pw-trait-content" data-idx="${idx}" rows="4" placeholder="设定内容…">${sanitizeHtml(trait.content || '')}</textarea>
+            ${
+              meta.traits.length === 0
+                ? `<div class="st-pw-muted-hint">可添加随该 User 独立开关的补充设定片段（支持常驻或关键词触发）。</div>`
+                : `
+                  <div class="st-pw-compact-rows">
+                    ${meta.traits
+                      .map((trait, idx) => {
+                        const isExp = state.expandedTraitIdx === idx;
+                        const isKw = trait.triggerMode === 'keyword';
+                        return `
+                          <div class="st-pw-trait-row ${trait.enabled ? '' : 'is-disabled'}" data-idx="${idx}">
+                            <div class="st-pw-compact-row">
+                              <input type="checkbox" class="st-pw-trait-enable" data-idx="${idx}" ${trait.enabled ? 'checked' : ''} />
+                              <button type="button" class="st-pw-mode-tag ${isKw ? 'is-keyword' : 'is-constant'} st-pw-trait-toggle-mode" data-idx="${idx}" title="点击切换常驻 / 关键词">
+                                <span class="st-pw-dot"></span>${isKw ? '关键词' : '常驻'}
+                              </button>
+                              <span class="st-pw-row-main-text st-pw-trait-expand" data-idx="${idx}">
+                                ${sanitizeHtml(trait.title || `设定 #${idx + 1}`)}
+                                ${isKw && trait.keywords ? `<small class="st-pw-muted"> (${sanitizeHtml(trait.keywords)})</small>` : ''}
+                              </span>
+                              <button type="button" class="st-pw-icon-btn st-pw-trait-expand" data-idx="${idx}">
+                                <i class="fa-solid fa-chevron-${isExp ? 'up' : 'down'}"></i>
+                              </button>
+                              <button type="button" class="st-pw-icon-btn st-pw-trait-delete" data-idx="${idx}" title="删除">
+                                <i class="fa-solid fa-xmark"></i>
+                              </button>
                             </div>
-                          `
-                          : ''
-                      }
-                    </div>
-                  `;
-                })
-                .join('')}
+                            ${
+                              isExp
+                                ? `
+                                  <div class="st-pw-trait-editor">
+                                    <div class="st-pw-form-grid">
+                                      <input type="text" class="text_pole st-pw-trait-title" data-idx="${idx}" placeholder="标题" value="${escapeAttr(trait.title)}" />
+                                      <input type="text" class="text_pole st-pw-trait-keywords" data-idx="${idx}" placeholder="触发关键词（逗号分隔，仅关键词模式生效）" value="${escapeAttr(trait.keywords || '')}" />
+                                    </div>
+                                    <textarea class="text_pole st-pw-trait-content" data-idx="${idx}" rows="4" placeholder="设定内容…">${sanitizeHtml(trait.content || '')}</textarea>
+                                  </div>
+                                `
+                                : ''
+                            }
+                          </div>
+                        `;
+                      })
+                      .join('')}
+                  </div>
+                `
+            }
+            <div class="st-pw-inline-note-row">
+              <input type="text" id="st_pw_private_note" class="text_pole" placeholder="私密备注（仅自己可见，不发给 AI）…" value="${escapeAttr(meta.note)}" />
             </div>
           `
       }
-      <div class="st-pw-inline-note-row">
-        <input type="text" id="st_pw_private_note" class="text_pole" placeholder="私密备注（仅自己可见，不发给 AI）…" value="${escapeAttr(meta.note)}" />
-      </div>
     </div>
   `;
 
@@ -6885,18 +7886,10 @@ async function mountSettingsPanel() {
   });
 
   document.querySelector('#st_pw_export_btn')?.addEventListener('click', () => {
-    const payload = JSON.stringify(getSettings(), null, 2);
-    const blob = new Blob([payload], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `st-persona-wardrobe-${new Date().toISOString().slice(0, 10)}.json`;
-    a.style.display = 'none';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    // 适配 TauriTavern download-bridge：保留 Blob URL 足够时长供异步原生文件落盘，避免立即 revoke 导致下载失败
-    setTimeout(() => URL.revokeObjectURL(url), 15_000);
+    triggerJsonDownload(
+      `st-persona-wardrobe-${new Date().toISOString().slice(0, 10)}.json`,
+      getSettings()
+    );
   });
 
   const importFile = document.querySelector('#st_pw_import_file');
@@ -6909,14 +7902,19 @@ async function mountSettingsPanel() {
     try {
       const text = await file.text();
       const parsed = JSON.parse(text);
+      if (parsed && Array.isArray(parsed.personas)) {
+        await importPersonaSharePackData(parsed);
+        return;
+      }
       if (!parsed || typeof parsed !== 'object' || typeof parsed.profiles !== 'object') {
-        throw new Error('缺少 profiles 字段');
+        throw new Error('缺少 profiles 或 personas 字段');
       }
       const current = getSettings();
       if (Array.isArray(parsed.groups)) {
         current.groups = [...new Set([...current.groups, ...parsed.groups])];
       }
       Object.assign(current.profiles, parsed.profiles);
+      invalidateRenderedHtmlCache();
       saveSettings();
       refreshAllViews();
       globalThis.toastr?.success?.('配置已导入');
@@ -6998,7 +7996,7 @@ async function initExtension() {
   if (state.initialized) return;
   state.initialized = true;
 
-  ensureStylesheetCacheBusted('1.2.0');
+  ensureStylesheetCacheBusted('1.3.0');
   await waitForTauriTavernReady();
   await probeHostModules();
   await refreshDiskAvatarSet();
@@ -7273,6 +8271,7 @@ export async function onDisable() {
   document.querySelector('#st_pw_topbar_btn')?.remove();
   document.querySelector('#st_pw_wand_btn')?.remove();
   document.querySelector('#st_persona_wardrobe_settings')?.remove();
+  document.querySelector('#st_pw_share_pack_file_input')?.remove();
   state.worldbookCache.clear();
   state.initialized = false;
 }
