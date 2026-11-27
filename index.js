@@ -361,6 +361,15 @@ function getSettings() {
     store._migratedHideRedundantTopbar = true;
   }
 
+  // 默认将「其他角色绑定」总文件夹收起，避免多个历史角色绑定组在列表顶部刷屏
+  if (!store._defaultCollapsedOtherCharsArchive) {
+    if (!store.collapsedSections.includes('other_chars_archive')) {
+      store.collapsedSections.push('other_chars_archive');
+    }
+    state.collapsedSections.add('other_chars_archive');
+    store._defaultCollapsedOtherCharsArchive = true;
+  }
+
   return store;
 }
 
@@ -373,11 +382,125 @@ function saveSettings() {
   }
 }
 
+/**
+ * 规范化自定义分组路径（支持两级「大类/子组」，自动清理首尾多余斜杠与空格，超过两级自动合并子名防止过深缩进）
+ */
+function normalizeSingleGroupPath(raw) {
+  const str = String(raw ?? '').trim();
+  if (!str) return '';
+  const parts = str
+    .split('/')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (parts.length === 0) return '';
+  if (parts.length === 1) return parts[0];
+  return `${parts[0]}/${parts.slice(1).join('·')}`;
+}
+
+function splitGroupPath(groupName) {
+  const norm = normalizeSingleGroupPath(groupName);
+  const slashIdx = norm.indexOf('/');
+  if (slashIdx > 0 && slashIdx < norm.length - 1) {
+    return {
+      fullName: norm,
+      parent: norm.slice(0, slashIdx),
+      child: norm.slice(slashIdx + 1),
+      isSubgroup: true,
+    };
+  }
+  return {
+    fullName: norm,
+    parent: norm,
+    child: '',
+    isSubgroup: false,
+  };
+}
+
+/**
+ * 将平铺的 customGroups 构建为最多两级（一级大类/独立组 -> 二级子分组）的展示树
+ */
+function buildCustomGroupHierarchy(customGroups) {
+  const parentSubCount = new Map();
+  for (const grp of customGroups) {
+    const sp = splitGroupPath(grp.name);
+    if (sp.isSubgroup) {
+      parentSubCount.set(sp.parent, (parentSubCount.get(sp.parent) || 0) + 1);
+    }
+  }
+
+  const nodes = [];
+  const parentNodeMap = new Map();
+
+  for (const grp of customGroups) {
+    const sp = splitGroupPath(grp.name);
+    const hasSubgroups = (parentSubCount.get(sp.parent) || 0) > 0;
+
+    if (!sp.isSubgroup && !hasSubgroups) {
+      nodes.push({
+        kind: 'leaf',
+        key: grp.name,
+        sectionId: grp.id,
+        group: grp,
+        uniqueCount: grp.members.length,
+      });
+      continue;
+    }
+
+    let pNode = parentNodeMap.get(sp.parent);
+    if (!pNode) {
+      pNode = {
+        kind: 'parent',
+        key: sp.parent,
+        parentName: sp.parent,
+        sectionId: `gparent:${sp.parent}`,
+        directGroup: null,
+        children: [],
+        uniqueMemberIds: new Set(),
+        uniqueCount: 0,
+      };
+      parentNodeMap.set(sp.parent, pNode);
+      nodes.push(pNode);
+    }
+
+    for (const m of grp.members) {
+      pNode.uniqueMemberIds.add(m.avatarId);
+    }
+    pNode.uniqueCount = pNode.uniqueMemberIds.size;
+
+    if (!sp.isSubgroup) {
+      pNode.directGroup = grp;
+    } else {
+      pNode.children.push({
+        childName: sp.child,
+        group: grp,
+      });
+    }
+  }
+
+  return nodes;
+}
+
+function getExistingParentCategoryNames(settings) {
+  const out = [];
+  const seen = new Set();
+  const pushParent = (g) => {
+    const sp = splitGroupPath(g);
+    if (!sp.parent || seen.has(sp.parent)) return;
+    seen.add(sp.parent);
+    out.push(sp.parent);
+  };
+  for (const g of settings?.groups || []) pushParent(g);
+  for (const prof of Object.values(settings?.profiles || {})) {
+    for (const g of getProfileGroups(prof)) pushParent(g);
+  }
+  return out;
+}
+
 function normalizeGroupList(rawGroups, legacyGroup = '') {
   const out = [];
   const seen = new Set();
   const pushOne = (val) => {
-    const clean = String(val ?? '').trim();
+    const clean = normalizeSingleGroupPath(val);
     if (!clean || seen.has(clean)) return;
     seen.add(clean);
     out.push(clean);
@@ -651,31 +774,104 @@ function sortPersonasList(list, sortBy = 'default') {
   });
 }
 
-function moveCustomGroupOrder(groupName, direction) {
-  const clean = String(groupName || '').trim();
-  if (!clean) return;
-  const settings = getSettings();
-  const allNames = [...new Set([...(settings.groups || []).filter(Boolean)])];
+function getAllOrderedGroupNames(settings) {
+  const allNames = [
+    ...new Set((settings.groups || []).map((g) => normalizeSingleGroupPath(g)).filter(Boolean)),
+  ];
   for (const prof of Object.values(settings.profiles || {})) {
     for (const g of getProfileGroups(prof)) {
       if (g && !allNames.includes(g)) allNames.push(g);
     }
   }
-  const idx = allNames.indexOf(clean);
+  return allNames;
+}
+
+function moveCustomGroupOrder(groupName, direction) {
+  const clean = normalizeSingleGroupPath(groupName);
+  if (!clean) return;
+  const settings = getSettings();
+  const allNames = getAllOrderedGroupNames(settings);
+  const sp = splitGroupPath(clean);
+
+  // 若为二级子组（如「古风/仙侠」），在同一上级大类内部调整子组顺序
+  if (sp.isSubgroup) {
+    const siblingIndices = [];
+    for (let i = 0; i < allNames.length; i++) {
+      const itemSp = splitGroupPath(allNames[i]);
+      if (itemSp.isSubgroup && itemSp.parent === sp.parent) {
+        siblingIndices.push(i);
+      }
+    }
+    const posInSiblings = siblingIndices.findIndex((idx) => allNames[idx] === clean);
+    if (posInSiblings === -1) return;
+
+    const siblingNames = siblingIndices.map((idx) => allNames[idx]);
+    if (direction === 'top' && posInSiblings > 0) {
+      siblingNames.splice(posInSiblings, 1);
+      siblingNames.unshift(clean);
+    } else if (direction === 'up' && posInSiblings > 0) {
+      [siblingNames[posInSiblings - 1], siblingNames[posInSiblings]] = [
+        siblingNames[posInSiblings],
+        siblingNames[posInSiblings - 1],
+      ];
+    } else if (direction === 'down' && posInSiblings < siblingNames.length - 1) {
+      [siblingNames[posInSiblings + 1], siblingNames[posInSiblings]] = [
+        siblingNames[posInSiblings],
+        siblingNames[posInSiblings + 1],
+      ];
+    } else {
+      return;
+    }
+    siblingIndices.forEach((origIdx, k) => {
+      allNames[origIdx] = siblingNames[k];
+    });
+    settings.groups = allNames;
+    invalidateRenderedHtmlCache();
+    saveSettings();
+    refreshAllViews();
+    return;
+  }
+
+  moveTopLevelGroupBlockOrder(clean, direction);
+}
+
+/**
+ * 整体移动某个一级分组或一级大类块（将该大类及其下所有子组作为整体置顶/上移/下移）
+ */
+function moveTopLevelGroupBlockOrder(topKey, direction) {
+  const cleanKey = String(topKey || '').trim();
+  if (!cleanKey) return;
+  const settings = getSettings();
+  const allNames = getAllOrderedGroupNames(settings);
+
+  const blocks = [];
+  const blockMap = new Map();
+  for (const name of allNames) {
+    const rootKey = splitGroupPath(name).parent;
+    let blk = blockMap.get(rootKey);
+    if (!blk) {
+      blk = { key: rootKey, items: [] };
+      blockMap.set(rootKey, blk);
+      blocks.push(blk);
+    }
+    blk.items.push(name);
+  }
+
+  const idx = blocks.findIndex((b) => b.key === cleanKey);
   if (idx === -1) return;
 
   if (direction === 'top' && idx > 0) {
-    allNames.splice(idx, 1);
-    allNames.unshift(clean);
+    const [moved] = blocks.splice(idx, 1);
+    blocks.unshift(moved);
   } else if (direction === 'up' && idx > 0) {
-    [allNames[idx - 1], allNames[idx]] = [allNames[idx], allNames[idx - 1]];
-  } else if (direction === 'down' && idx < allNames.length - 1) {
-    [allNames[idx + 1], allNames[idx]] = [allNames[idx], allNames[idx + 1]];
+    [blocks[idx - 1], blocks[idx]] = [blocks[idx], blocks[idx - 1]];
+  } else if (direction === 'down' && idx < blocks.length - 1) {
+    [blocks[idx + 1], blocks[idx]] = [blocks[idx], blocks[idx + 1]];
   } else {
     return;
   }
 
-  settings.groups = allNames;
+  settings.groups = blocks.flatMap((b) => b.items);
   invalidateRenderedHtmlCache();
   saveSettings();
   refreshAllViews();
@@ -5200,29 +5396,48 @@ function renderFilterPillsBarHtml(personas, characterGroups, customGroups, ungro
             </select>
           `
       }
-      ${
-        customGroups.length <= 4
-          ? customGroups
-              .map(
-                (g) => `
-                  <button type="button" class="st-pw-filter-pill ${state.activeFilter === g.id ? 'active' : ''}" data-filter="${escapeAttr(g.id)}">
-                    ${sanitizeHtml(g.name)} (${g.members.length})
+      ${(() => {
+        const groupNodes = buildCustomGroupHierarchy(customGroups);
+        const isGroupFilterActive =
+          state.activeFilter.startsWith('group:') || state.activeFilter.startsWith('gparent:');
+        if (groupNodes.length <= 3 && customGroups.length <= 4) {
+          return groupNodes
+            .map((node) =>
+              node.kind === 'parent'
+                ? `
+                  <button type="button" class="st-pw-filter-pill ${state.activeFilter === node.sectionId ? 'active' : ''}" data-filter="${escapeAttr(node.sectionId)}" title="筛选大类「${escapeAttr(node.parentName)}」及其全部子分组">
+                    <i class="fa-regular fa-folder-open"></i> ${sanitizeHtml(node.parentName)} (${node.uniqueCount})
                   </button>
                 `
-              )
-              .join('')
-          : `
-            <select class="text_pole st-pw-char-filter-select st-pw-group-filter-select ${state.activeFilter.startsWith('group:') ? 'is-active-select' : ''}" title="按自定义分组筛选 User">
-              <option value="all">按分组筛选 (${customGroups.length})…</option>
-              ${customGroups
-                .map(
-                  (g) =>
-                    `<option value="${escapeAttr(g.id)}" ${state.activeFilter === g.id ? 'selected' : ''}>${sanitizeHtml(g.name)} (${g.members.length})</option>`
-                )
-                .join('')}
-            </select>
-          `
-      }
+                : `
+                  <button type="button" class="st-pw-filter-pill ${state.activeFilter === node.group.id ? 'active' : ''}" data-filter="${escapeAttr(node.group.id)}">
+                    ${sanitizeHtml(node.group.name)} (${node.group.members.length})
+                  </button>
+                `
+            )
+            .join('');
+        }
+        return `
+          <select class="text_pole st-pw-char-filter-select st-pw-group-filter-select ${isGroupFilterActive ? 'is-active-select' : ''}" title="按自定义大类或子分组筛选 User">
+            <option value="all">按分组筛选 (${customGroups.length})…</option>
+            ${groupNodes
+              .map((node) => {
+                if (node.kind === 'leaf') {
+                  return `<option value="${escapeAttr(node.group.id)}" ${state.activeFilter === node.group.id ? 'selected' : ''}>📁 ${sanitizeHtml(node.group.name)} (${node.group.members.length})</option>`;
+                }
+                const parentOpt = `<option value="${escapeAttr(node.sectionId)}" ${state.activeFilter === node.sectionId ? 'selected' : ''}>📁 ${sanitizeHtml(node.parentName)} · 全部 (${node.uniqueCount})</option>`;
+                const childOpts = node.children
+                  .map(
+                    (ch) =>
+                      `<option value="${escapeAttr(ch.group.id)}" ${state.activeFilter === ch.group.id ? 'selected' : ''}>　├ 📂 ${sanitizeHtml(ch.childName)} (${ch.group.members.length})</option>`
+                  )
+                  .join('');
+                return parentOpt + childOpts;
+              })
+              .join('')}
+          </select>
+        `;
+      })()}
       ${
         (characterGroups.length > 0 || customGroups.length > 0) && ungroupedMembers.length > 0
           ? `<button type="button" class="st-pw-filter-pill ${state.activeFilter === 'ungrouped' ? 'active' : ''}" data-filter="ungrouped">未分组 (${ungroupedMembers.length})</button>`
@@ -5342,7 +5557,10 @@ function renderLeftHeaderControlsHtml({
         <button type="button" class="st-pw-view-seg-btn ${viewMode === 'compact' ? 'active' : ''}" data-view-mode="compact" title="紧凑单行列表（适合大量人设）"><i class="fa-solid fa-grip-lines"></i></button>
         <button type="button" class="st-pw-view-seg-btn ${viewMode === 'grid' ? 'active' : ''}" data-view-mode="grid" title="头像宫格视图"><i class="fa-solid fa-border-all"></i></button>
       </div>
-      <button type="button" class="menu_button st-pw-mini-btn ${addGroupBtnCls}" title="新建自定义分组">
+      <button type="button" class="menu_button st-pw-mini-btn st-pw-quick-fold-toggle-btn" title="一键全部收起 / 展开所有分组文件夹">
+        <i class="fa-solid fa-angles-up"></i> 收展
+      </button>
+      <button type="button" class="menu_button st-pw-mini-btn ${addGroupBtnCls}" title="新建自定义分组（支持大类/子分组两级结构）">
         + 新建组
       </button>
     </div>
@@ -5398,6 +5616,12 @@ function renderWardrobeModalContent({ force = false } = {}) {
     !customGroups.some((g) => g.id === state.activeFilter)
   ) {
     state.activeFilter = 'all';
+  }
+  if (state.activeFilter.startsWith('gparent:')) {
+    const pTarget = state.activeFilter.slice('gparent:'.length);
+    if (!customGroups.some((g) => splitGroupPath(g.name).parent === pTarget)) {
+      state.activeFilter = 'all';
+    }
   }
 
   const q = state.searchQuery.trim().toLowerCase();
@@ -5600,12 +5824,18 @@ function renderCustomGroupChipsHtml(persona, settings) {
 function openGroupMemberPickerModal({
   mode = 'create_group', // 'create_group' | 'edit_group' | 'edit_character'
   targetName = '',
+  presetParent = '',
   preselectedIds = [],
   onSaved = null,
 } = {}) {
   const settings = getSettings();
   const personas = sortPersonasList(getHostPersonas(), settings.sortBy || 'default');
   const cleanTarget = String(targetName || '').trim();
+  const cleanPresetParent = String(presetParent || '').split('/')[0].trim();
+  const existingParents = getExistingParentCategoryNames(settings);
+  if (cleanPresetParent && !existingParents.includes(cleanPresetParent)) {
+    existingParents.unshift(cleanPresetParent);
+  }
 
   const initialChecked = new Set(preselectedIds.filter(Boolean));
   if (mode === 'edit_group' && cleanTarget) {
@@ -5666,8 +5896,20 @@ function openGroupMemberPickerModal({
           isCreate
             ? `
               <div class="st-pw-gp-name-wrap">
-                <label class="st-pw-gp-field-label" for="st_pw_gp_group_name">新分组名称</label>
-                <input type="text" id="st_pw_gp_group_name" class="text_pole st-pw-gp-name-input" placeholder="输入分组名称（如：古风、现代、无限流）…" autocomplete="off" />
+                <div class="st-pw-gp-parent-row">
+                  <select id="st_pw_gp_parent_select" class="text_pole st-pw-gp-parent-select" title="可选：选择上级大类文件夹形成两级嵌套">
+                    <option value="">上级大类：无（直接作为一级分组）</option>
+                    ${existingParents
+                      .map(
+                        (pName) =>
+                          `<option value="${escapeAttr(pName)}" ${cleanPresetParent === pName ? 'selected' : ''}>📁 归入大类：${sanitizeHtml(pName)}</option>`
+                      )
+                      .join('')}
+                    <option value="__custom_parent__">+ 新建上级大类…</option>
+                  </select>
+                  <input type="text" id="st_pw_gp_custom_parent" class="text_pole st-pw-gp-custom-parent st-pw-hidden" placeholder="输入新大类名称（如：古风）…" autocomplete="off" />
+                </div>
+                <input type="text" id="st_pw_gp_group_name" class="text_pole st-pw-gp-name-input" placeholder="${cleanPresetParent ? `在「${escapeAttr(cleanPresetParent)}」下输入子分组名称…` : '输入组名（也可直接写 大类/子组，如：古风/仙侠）…'}" autocomplete="off" />
                 <div class="st-pw-gp-name-err st-pw-hidden">请先填写分组名称</div>
               </div>
             `
@@ -5717,11 +5959,26 @@ function openGroupMemberPickerModal({
   `;
 
   const listEl = modal.querySelector('.st-pw-gp-list');
+  const parentSelect = modal.querySelector('#st_pw_gp_parent_select');
+  const customParentInput = modal.querySelector('#st_pw_gp_custom_parent');
   const nameInput = modal.querySelector('#st_pw_gp_group_name');
   const nameErrEl = modal.querySelector('.st-pw-gp-name-err');
   const searchInput = modal.querySelector('#st_pw_gp_search');
   const searchClearBtn = modal.querySelector('.st-pw-gp-search-clear');
   const confirmBtn = modal.querySelector('.st-pw-gp-confirm-btn');
+
+  parentSelect?.addEventListener('change', () => {
+    const isCustom = parentSelect.value === '__custom_parent__';
+    customParentInput?.classList.toggle('st-pw-hidden', !isCustom);
+    if (isCustom) {
+      customParentInput?.focus();
+    } else if (nameInput) {
+      nameInput.placeholder = parentSelect.value
+        ? `在「${parentSelect.value}」下输入子分组名称…`
+        : '输入组名（也可直接写 大类/子组，如：古风/仙侠）…';
+      nameInput.focus();
+    }
+  });
 
   function getFilteredPersonas() {
     const q = searchQuery.trim().toLowerCase();
@@ -5971,21 +6228,40 @@ function openGroupMemberPickerModal({
 
   confirmBtn?.addEventListener('click', async () => {
     if (isCreate) {
-      const rawName = String(nameInput?.value || '').trim();
-      if (!rawName) {
+      const rawChildOrFull = String(nameInput?.value || '').trim();
+      if (!rawChildOrFull) {
         nameErrEl?.classList.remove('st-pw-hidden');
         nameInput?.classList.add('st-pw-input-invalid');
         nameInput?.focus();
-        globalThis.toastr?.warning?.('请先输入新分组名称');
+        globalThis.toastr?.warning?.('请先输入分组名称');
         return;
       }
+      let chosenParent = '';
+      if (parentSelect) {
+        if (parentSelect.value === '__custom_parent__') {
+          chosenParent = String(customParentInput?.value || '').replaceAll('/', '·').trim();
+        } else {
+          chosenParent = String(parentSelect.value || '').trim();
+        }
+      }
+      const combinedRaw =
+        chosenParent && !rawChildOrFull.includes('/')
+          ? `${chosenParent}/${rawChildOrFull}`
+          : rawChildOrFull;
+      const rawName = normalizeSingleGroupPath(combinedRaw);
+      if (!rawName) return;
+
       if (!settings.groups.includes(rawName)) {
         settings.groups.push(rawName);
       }
       for (const id of checkedSet) {
         addProfileToGroup(ensureProfileMeta(id), rawName);
       }
+      const spNew = splitGroupPath(rawName);
       state.batchAssignTarget = null;
+      if (spNew.isSubgroup) {
+        state.collapsedSections.delete(`gparent:${spNew.parent}`);
+      }
       state.collapsedSections.delete(`group:${rawName}`);
       syncCollapsedSectionsToSettings();
       invalidateRenderedHtmlCache();
@@ -6591,14 +6867,51 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
     });
   });
 
+  const collectAllCollapsibleSectionIds = () => {
+    const { characterGroups, customGroups } = buildUnifiedPersonaGroups(
+      allPersonas || getHostPersonas()
+    );
+    const hierarchy = buildCustomGroupHierarchy(customGroups);
+    const ids = [];
+    for (const cg of characterGroups) ids.push(cg.id);
+    for (const g of customGroups) ids.push(g.id);
+    for (const node of hierarchy) {
+      if (node.kind === 'parent') ids.push(node.sectionId);
+    }
+    ids.push('other_chars_archive', 'multi_char_general', 'ungrouped');
+    return ids;
+  };
+
+  modal.querySelectorAll('.st-pw-quick-fold-toggle-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const { customGroups } = buildUnifiedPersonaGroups(allPersonas || getHostPersonas());
+      const hierarchy = buildCustomGroupHierarchy(customGroups);
+      const topIds = [
+        ...hierarchy.map((n) => n.sectionId),
+        'ungrouped',
+      ];
+      const hasExpandedTop = topIds.some((id) => !state.collapsedSections.has(id));
+      if (hasExpandedTop) {
+        for (const id of collectAllCollapsibleSectionIds()) {
+          state.collapsedSections.add(id);
+        }
+      } else {
+        state.collapsedSections.clear();
+        state.collapsedSections.add('other_chars_archive');
+      }
+      syncCollapsedSectionsToSettings();
+      invalidateRenderedHtmlCache();
+      rerenderPanels();
+    });
+  });
+
   modal.querySelectorAll('.st-pw-collapse-all-folders-btn').forEach((btn) => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
-      const { characterGroups, customGroups } = buildUnifiedPersonaGroups(allPersonas || getHostPersonas());
-      for (const cg of characterGroups) state.collapsedSections.add(cg.id);
-      for (const g of customGroups) state.collapsedSections.add(g.id);
-      state.collapsedSections.add('multi_char_general');
-      state.collapsedSections.add('ungrouped');
+      for (const id of collectAllCollapsibleSectionIds()) {
+        state.collapsedSections.add(id);
+      }
       syncCollapsedSectionsToSettings();
       invalidateRenderedHtmlCache();
       rerenderPanels();
@@ -6815,6 +7128,104 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
       });
     });
 
+  // 在某个一级大类下快捷新建子分组
+  modal.querySelectorAll('.st-pw-add-subgroup-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const parentName = btn.getAttribute('data-parent-name') || '';
+      openGroupMemberPickerModal({
+        mode: 'create_group',
+        presetParent: parentName,
+      });
+    });
+  });
+
+  // 一级大类块整体排序（置顶 / 上移 / 下移）
+  modal.querySelectorAll('.st-pw-move-parent-group-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const pName = btn.getAttribute('data-parent-name');
+      const dir = btn.getAttribute('data-move-dir');
+      if (pName && dir) {
+        moveTopLevelGroupBlockOrder(pName, e.shiftKey && dir === 'up' ? 'top' : dir);
+      }
+    });
+  });
+
+  // 重命名一级大类（同步更新该大类及旗下所有子分组路径）
+  modal.querySelectorAll('.st-pw-rename-parent-group-btn').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const oldParent = btn.getAttribute('data-parent-name');
+      if (!oldParent) return;
+      const entered = await promptUserText(`重命名上级大类「${oldParent}」`, oldParent);
+      if (!entered || !entered.trim()) return;
+      const newParent = entered.replaceAll('/', '·').trim();
+      if (!newParent || newParent === oldParent) return;
+
+      const rewriteGroup = (g) => {
+        const sp = splitGroupPath(g);
+        if (sp.parent !== oldParent) return g;
+        return sp.isSubgroup ? `${newParent}/${sp.child}` : newParent;
+      };
+      settings.groups = [...new Set((settings.groups || []).map(rewriteGroup).filter(Boolean))];
+      for (const prof of Object.values(settings.profiles)) {
+        if (!prof) continue;
+        const curGroups = getProfileGroups(prof);
+        if (curGroups.some((g) => splitGroupPath(g).parent === oldParent)) {
+          setProfileGroups(prof, curGroups.map(rewriteGroup));
+        }
+      }
+      if (state.activeFilter === `gparent:${oldParent}`) {
+        state.activeFilter = `gparent:${newParent}`;
+      } else if (state.activeFilter.startsWith(`group:${oldParent}/`)) {
+        state.activeFilter = `group:${newParent}/${state.activeFilter.slice(`group:${oldParent}/`.length)}`;
+      }
+      invalidateRenderedHtmlCache();
+      saveSettings();
+      rerenderPanels();
+    });
+  });
+
+  // 删除一级大类（移除该大类及其所有子分组，不删除 User 本身且不影响其他大类）
+  modal.querySelectorAll('.st-pw-delete-parent-group-btn').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const oldParent = btn.getAttribute('data-parent-name');
+      if (!oldParent) return;
+      if (
+        !(await confirmUserAction(
+          `删除大类文件夹「${oldParent}」`,
+          `将移除「${oldParent}」及其下属全部子分组，组内 User 本身不会被删除（所属的其他分组不受影响）。`
+        ))
+      ) {
+        return;
+      }
+      const belongsToParent = (g) => splitGroupPath(g).parent === oldParent;
+      settings.groups = (settings.groups || []).filter((g) => !belongsToParent(g));
+      for (const prof of Object.values(settings.profiles)) {
+        if (!prof) continue;
+        const curGroups = getProfileGroups(prof);
+        if (curGroups.some(belongsToParent)) {
+          setProfileGroups(
+            prof,
+            curGroups.filter((g) => !belongsToParent(g))
+          );
+        }
+      }
+      if (
+        state.activeFilter === `gparent:${oldParent}` ||
+        state.activeFilter === `group:${oldParent}` ||
+        state.activeFilter.startsWith(`group:${oldParent}/`)
+      ) {
+        state.activeFilter = 'all';
+      }
+      invalidateRenderedHtmlCache();
+      saveSettings();
+      rerenderPanels();
+    });
+  });
+
   // 自定义分组排序（置顶 / 上移 / 下移）
   modal.querySelectorAll('.st-pw-move-group-btn').forEach((btn) => {
     btn.addEventListener('click', (e) => {
@@ -6827,19 +7238,24 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
     });
   });
 
-  // 重命名自定义分组（完整同步所有 User 的多分组列表）
+  // 重命名自定义分组（支持改名或加上「大类/子组」迁入/迁出大类，完整同步所有 User 多分组列表）
   modal.querySelectorAll('.st-pw-rename-group-btn').forEach((btn) => {
     btn.addEventListener('click', async (e) => {
       e.stopPropagation();
       const oldName = btn.getAttribute('data-group-name');
       if (!oldName) return;
-      const nextName = await promptUserText(`重命名分组「${oldName}」`, oldName);
-      if (!nextName || !nextName.trim() || nextName.trim() === oldName) return;
-      const clean = nextName.trim();
+      const nextName = await promptUserText(`重命名分组「${oldName}」`, oldName, {
+        subtitle: '支持填写「大类/子组」直接归入或调整上级大类',
+      });
+      if (!nextName || !nextName.trim()) return;
+      const clean = normalizeSingleGroupPath(nextName);
+      if (!clean || clean === oldName) return;
       const idx = settings.groups.indexOf(oldName);
       if (idx !== -1) {
         settings.groups[idx] = clean;
         settings.groups = [...new Set(settings.groups)];
+      } else if (!settings.groups.includes(clean)) {
+        settings.groups.push(clean);
       }
       for (const prof of Object.values(settings.profiles)) {
         if (!prof) continue;
@@ -6854,6 +7270,11 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
       if (state.activeFilter === `group:${oldName}`) {
         state.activeFilter = `group:${clean}`;
       }
+      const spClean = splitGroupPath(clean);
+      if (spClean.isSubgroup) {
+        state.collapsedSections.delete(`gparent:${spClean.parent}`);
+      }
+      syncCollapsedSectionsToSettings();
       invalidateRenderedHtmlCache();
       saveSettings();
       rerenderPanels();
@@ -7605,35 +8026,19 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
   }
   const generalMultiBoundMap = new Map();
 
-  // 1) 自动角色分组（绑在同一角色下的多个 User 自动归为一组）
-  for (const cg of characterGroups) {
-    if (state.activeFilter !== 'all' && state.activeFilter !== cg.id) continue;
-
+  const renderCharFolderSection = (cg, { isNested = false } = {}) => {
     const isBatchOpen =
       state.batchAssignTarget?.type === 'character' &&
       state.batchAssignTarget?.name.toLowerCase() === cg.name.toLowerCase();
-
-    if (
-      state.activeFilter === 'all' &&
-      !cg.isCurrentChar &&
-      !isBatchOpen &&
-      cg.members.length === 1 &&
-      (soloCharCountByAvatar.get(cg.members[0].avatarId) || 0) >= 3
-    ) {
-      const p = cg.members[0];
-      generalMultiBoundMap.set(p.avatarId, p);
-      continue;
-    }
-
     const visibleMembers = sortPersonasList(
       cg.members.filter((p) => matchesSearch(p, q)),
       sortBy
     );
-    if (q && visibleMembers.length === 0) continue;
-    const isCollapsed = state.collapsedSections.has(cg.id);
+    if (q && visibleMembers.length === 0) return '';
+    const isCollapsed = !q && state.collapsedSections.has(cg.id);
 
-    sections.push(`
-      <div class="st-pw-folder-section" data-section-id="${escapeAttr(cg.id)}">
+    return `
+      <div class="st-pw-folder-section ${isNested ? 'st-pw-subfolder-section' : ''}" data-section-id="${escapeAttr(cg.id)}">
         <div class="st-pw-folder-header">
           <div class="st-pw-folder-title-wrap st-pw-folder-toggle" data-section-id="${escapeAttr(cg.id)}">
             <i class="fa-solid fa-chevron-${isCollapsed ? 'right' : 'down'} st-pw-folder-arrow"></i>
@@ -7668,10 +8073,49 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
             : ''
         }
       </div>
-    `);
+    `;
+  };
+
+  // 1) 自动角色分组：
+  //    - 当前正在聊的角色：单独置顶直出，方便一秒切换本卡人设；
+  //    - 其他所有历史角色绑定组：在「全部」视图下统一收纳进默认折叠的「其他角色绑定」总文件夹，彻底解决多卡绑定刷满顶部的痛点！
+  const otherCharSubHtmls = [];
+  const otherCharUniqueIds = new Set();
+  let otherCharGroupCount = 0;
+
+  for (const cg of characterGroups) {
+    if (state.activeFilter !== 'all' && state.activeFilter !== cg.id) continue;
+
+    // 若用户专门筛选了某一个角色，或它是当前正在聊天的角色，直接在顶层展示
+    if (state.activeFilter === cg.id || cg.isCurrentChar) {
+      const html = renderCharFolderSection(cg, { isNested: false });
+      if (html) sections.push(html);
+      continue;
+    }
+
+    const isBatchOpen =
+      state.batchAssignTarget?.type === 'character' &&
+      state.batchAssignTarget?.name.toLowerCase() === cg.name.toLowerCase();
+
+    if (
+      !isBatchOpen &&
+      cg.members.length === 1 &&
+      (soloCharCountByAvatar.get(cg.members[0].avatarId) || 0) >= 3
+    ) {
+      const p = cg.members[0];
+      generalMultiBoundMap.set(p.avatarId, p);
+      continue;
+    }
+
+    const subHtml = renderCharFolderSection(cg, { isNested: true });
+    if (subHtml) {
+      otherCharSubHtmls.push(subHtml);
+      otherCharGroupCount++;
+      for (const m of cg.members) otherCharUniqueIds.add(m.avatarId);
+    }
   }
 
-  // 1.5) 绑定了 >= 3 个单人角色卡的通用人设聚合组（只展示 1 次，不再重复刷出几十个单人卡片组）
+  // 绑定了 >= 3 个单人角色卡的通用人设聚合组，也一并归入「其他角色绑定」内部
   if (state.activeFilter === 'all' && generalMultiBoundMap.size > 0) {
     const generalMembers = sortPersonasList(
       [...generalMultiBoundMap.values()].filter(
@@ -7680,24 +8124,26 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
       sortBy
     );
     if (generalMembers.length > 0) {
-      const isCollapsed = state.collapsedSections.has('multi_char_general');
-      sections.push(`
-        <div class="st-pw-folder-section" data-section-id="multi_char_general">
+      const isGenCollapsed = !q && state.collapsedSections.has('multi_char_general');
+      for (const m of generalMembers) otherCharUniqueIds.add(m.avatarId);
+      otherCharGroupCount++;
+      otherCharSubHtmls.push(`
+        <div class="st-pw-folder-section st-pw-subfolder-section" data-section-id="multi_char_general">
           <div class="st-pw-folder-header">
             <div class="st-pw-folder-title-wrap st-pw-folder-toggle" data-section-id="multi_char_general">
-              <i class="fa-solid fa-chevron-${isCollapsed ? 'right' : 'down'} st-pw-folder-arrow"></i>
+              <i class="fa-solid fa-chevron-${isGenCollapsed ? 'right' : 'down'} st-pw-folder-arrow"></i>
               <i class="fa-solid fa-users-gear st-pw-folder-icon"></i>
               <span class="st-pw-folder-name">多角色通用绑定</span>
               <span class="st-pw-folder-count">${generalMembers.length}</span>
             </div>
             ${
-              state.multiSelectMode && !isCollapsed && generalMembers.length > 0
+              state.multiSelectMode && !isGenCollapsed && generalMembers.length > 0
                 ? `<div class="st-pw-folder-actions"><button type="button" class="st-pw-link-btn st-pw-multi-select-section">全选本组</button></div>`
                 : ''
             }
           </div>
           ${
-            !isCollapsed
+            !isGenCollapsed
               ? `<div class="st-pw-folder-body">${generalMembers
                   .map((p) => renderPersonaRowHtml(p, selectedAvatarId))
                   .join('')}</div>`
@@ -7708,28 +8154,50 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
     }
   }
 
-  // 2) 用户自定义分组（支持置顶 / 上移 / 下移排序）
-  for (let grpIdx = 0; grpIdx < customGroups.length; grpIdx++) {
-    const grp = customGroups[grpIdx];
-    if (state.activeFilter !== 'all' && state.activeFilter !== grp.id) continue;
+  if (state.activeFilter === 'all' && otherCharSubHtmls.length > 0) {
+    const isArchiveCollapsed = !q && state.collapsedSections.has('other_chars_archive');
+    sections.push(`
+      <div class="st-pw-folder-section st-pw-parent-folder-section st-pw-char-archive-section" data-section-id="other_chars_archive">
+        <div class="st-pw-folder-header">
+          <div class="st-pw-folder-title-wrap st-pw-folder-toggle" data-section-id="other_chars_archive">
+            <i class="fa-solid fa-chevron-${isArchiveCollapsed ? 'right' : 'down'} st-pw-folder-arrow"></i>
+            <i class="fa-solid fa-masks-theater st-pw-folder-icon"></i>
+            <span class="st-pw-folder-name">其他角色绑定</span>
+            <span class="st-pw-folder-count">${otherCharUniqueIds.size}</span>
+            <span class="st-pw-tiny-tag">${otherCharGroupCount}组</span>
+          </div>
+        </div>
+        ${
+          !isArchiveCollapsed
+            ? `<div class="st-pw-subfolders-wrap">${otherCharSubHtmls.join('')}</div>`
+            : ''
+        }
+      </div>
+    `);
+  }
+
+  // 2) 用户自定义分组：支持一级独立组 & 「一级大类 -> 二级子组」两级嵌套树
+  const renderCustomLeafFolder = (
+    grp,
+    { displayTitle = grp.name, isSubfolder = false, idx = 0, total = 1, allowReorder = false } = {}
+  ) => {
     const visibleMembers = sortPersonasList(
       grp.members.filter((p) => matchesSearch(p, q)),
       sortBy
     );
-    if (q && visibleMembers.length === 0) continue;
-    const isCollapsed = state.collapsedSections.has(grp.id);
+    if (q && visibleMembers.length === 0) return '';
+    const isCollapsed = !q && state.collapsedSections.has(grp.id);
     const isBatchOpen =
       state.batchAssignTarget?.type === 'group' &&
       state.batchAssignTarget?.name === grp.name;
-    const showReorder = state.activeFilter === 'all' && customGroups.length > 1;
 
-    sections.push(`
-      <div class="st-pw-folder-section" data-section-id="${escapeAttr(grp.id)}">
+    return `
+      <div class="st-pw-folder-section ${isSubfolder ? 'st-pw-subfolder-section' : ''}" data-section-id="${escapeAttr(grp.id)}">
         <div class="st-pw-folder-header">
           <div class="st-pw-folder-title-wrap st-pw-folder-toggle" data-section-id="${escapeAttr(grp.id)}">
             <i class="fa-solid fa-chevron-${isCollapsed ? 'right' : 'down'} st-pw-folder-arrow"></i>
-            <i class="fa-regular fa-folder st-pw-folder-icon"></i>
-            <span class="st-pw-folder-name">${sanitizeHtml(grp.name)}</span>
+            <i class="fa-${isSubfolder ? 'solid fa-folder-tree' : 'regular fa-folder'} st-pw-folder-icon"></i>
+            <span class="st-pw-folder-name">${sanitizeHtml(displayTitle)}</span>
             <span class="st-pw-folder-count">${grp.members.length}</span>
           </div>
           <div class="st-pw-folder-actions">
@@ -7739,24 +8207,24 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
                 : ''
             }
             ${
-              showReorder && grpIdx > 1
+              allowReorder && idx > 1
                 ? `<button type="button" class="st-pw-icon-btn st-pw-move-group-btn" data-group-name="${escapeAttr(grp.name)}" data-move-dir="top" title="置顶此分组"><i class="fa-solid fa-angles-up"></i></button>`
                 : ''
             }
             ${
-              showReorder && grpIdx > 0
+              allowReorder && idx > 0
                 ? `<button type="button" class="st-pw-icon-btn st-pw-move-group-btn" data-group-name="${escapeAttr(grp.name)}" data-move-dir="up" title="上移分组"><i class="fa-solid fa-arrow-up"></i></button>`
                 : ''
             }
             ${
-              showReorder && grpIdx < customGroups.length - 1
+              allowReorder && idx < total - 1
                 ? `<button type="button" class="st-pw-icon-btn st-pw-move-group-btn" data-group-name="${escapeAttr(grp.name)}" data-move-dir="down" title="下移分组"><i class="fa-solid fa-arrow-down"></i></button>`
                 : ''
             }
             <button type="button" class="st-pw-icon-btn st-pw-open-batch-group" data-group-name="${escapeAttr(grp.name)}" title="批量勾选移入此分组的 User">
               <i class="fa-solid fa-user-plus"></i>
             </button>
-            <button type="button" class="st-pw-icon-btn st-pw-rename-group-btn" data-group-name="${escapeAttr(grp.name)}" title="重命名分组">
+            <button type="button" class="st-pw-icon-btn st-pw-rename-group-btn" data-group-name="${escapeAttr(grp.name)}" title="重命名分组（可填 大类/子组 调整层级）">
               <i class="fa-solid fa-pen"></i>
             </button>
             <button type="button" class="st-pw-icon-btn st-pw-delete-group-btn" data-group-name="${escapeAttr(grp.name)}" title="删除分组">
@@ -7779,7 +8247,129 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
             : ''
         }
       </div>
-    `);
+    `;
+  };
+
+  if (state.activeFilter.startsWith('group:')) {
+    const targetGrp = customGroups.find((g) => g.id === state.activeFilter);
+    if (targetGrp) {
+      const html = renderCustomLeafFolder(targetGrp, {
+        displayTitle: targetGrp.name,
+        isSubfolder: false,
+        allowReorder: false,
+      });
+      if (html) sections.push(html);
+    }
+  } else if (state.activeFilter === 'all' || state.activeFilter.startsWith('gparent:')) {
+    const hierarchy = buildCustomGroupHierarchy(customGroups);
+    const showTopReorder = state.activeFilter === 'all' && hierarchy.length > 1;
+
+    for (let topIdx = 0; topIdx < hierarchy.length; topIdx++) {
+      const node = hierarchy[topIdx];
+      if (state.activeFilter.startsWith('gparent:') && state.activeFilter !== node.sectionId) {
+        continue;
+      }
+
+      if (node.kind === 'leaf') {
+        const leafHtml = renderCustomLeafFolder(node.group, {
+          displayTitle: node.group.name,
+          isSubfolder: false,
+          idx: topIdx,
+          total: hierarchy.length,
+          allowReorder: showTopReorder,
+        });
+        if (leafHtml) sections.push(leafHtml);
+        continue;
+      }
+
+      // 一级大类节点（包含子分组，及可选的直接归属成员）
+      const directVisible = node.directGroup
+        ? sortPersonasList(
+            node.directGroup.members.filter((p) => matchesSearch(p, q)),
+            sortBy
+          )
+        : [];
+      const childHtmls = [];
+      const allowChildReorder = node.children.length > 1;
+      for (let cIdx = 0; cIdx < node.children.length; cIdx++) {
+        const ch = node.children[cIdx];
+        const chHtml = renderCustomLeafFolder(ch.group, {
+          displayTitle: ch.childName,
+          isSubfolder: true,
+          idx: cIdx,
+          total: node.children.length,
+          allowReorder: allowChildReorder,
+        });
+        if (chHtml) childHtmls.push(chHtml);
+      }
+
+      if (q && directVisible.length === 0 && childHtmls.length === 0) {
+        continue;
+      }
+
+      const isParentCollapsed =
+        !q &&
+        state.activeFilter !== node.sectionId &&
+        state.collapsedSections.has(node.sectionId);
+
+      sections.push(`
+        <div class="st-pw-folder-section st-pw-parent-folder-section" data-section-id="${escapeAttr(node.sectionId)}">
+          <div class="st-pw-folder-header st-pw-parent-folder-header">
+            <div class="st-pw-folder-title-wrap st-pw-folder-toggle" data-section-id="${escapeAttr(node.sectionId)}">
+              <i class="fa-solid fa-chevron-${isParentCollapsed ? 'right' : 'down'} st-pw-folder-arrow"></i>
+              <i class="fa-regular fa-folder${isParentCollapsed ? '' : '-open'} st-pw-folder-icon"></i>
+              <span class="st-pw-folder-name">${sanitizeHtml(node.parentName)}</span>
+              <span class="st-pw-folder-count">${node.uniqueCount}</span>
+              <span class="st-pw-tiny-tag">${node.children.length}子组</span>
+            </div>
+            <div class="st-pw-folder-actions">
+              ${
+                showTopReorder && topIdx > 1
+                  ? `<button type="button" class="st-pw-icon-btn st-pw-move-parent-group-btn" data-parent-name="${escapeAttr(node.parentName)}" data-move-dir="top" title="置顶此大类"><i class="fa-solid fa-angles-up"></i></button>`
+                  : ''
+              }
+              ${
+                showTopReorder && topIdx > 0
+                  ? `<button type="button" class="st-pw-icon-btn st-pw-move-parent-group-btn" data-parent-name="${escapeAttr(node.parentName)}" data-move-dir="up" title="上移大类"><i class="fa-solid fa-arrow-up"></i></button>`
+                  : ''
+              }
+              ${
+                showTopReorder && topIdx < hierarchy.length - 1
+                  ? `<button type="button" class="st-pw-icon-btn st-pw-move-parent-group-btn" data-parent-name="${escapeAttr(node.parentName)}" data-move-dir="down" title="下移大类"><i class="fa-solid fa-arrow-down"></i></button>`
+                  : ''
+              }
+              <button type="button" class="st-pw-icon-btn st-pw-add-subgroup-btn" data-parent-name="${escapeAttr(node.parentName)}" title="在「${escapeAttr(node.parentName)}」下新建子分组">
+                <i class="fa-solid fa-folder-plus"></i>
+              </button>
+              <button type="button" class="st-pw-icon-btn st-pw-rename-parent-group-btn" data-parent-name="${escapeAttr(node.parentName)}" title="重命名大类「${escapeAttr(node.parentName)}」">
+                <i class="fa-solid fa-pen"></i>
+              </button>
+              <button type="button" class="st-pw-icon-btn st-pw-delete-parent-group-btn" data-parent-name="${escapeAttr(node.parentName)}" title="删除大类「${escapeAttr(node.parentName)}」及其子分组">
+                <i class="fa-solid fa-trash-can"></i>
+              </button>
+            </div>
+          </div>
+          ${
+            !isParentCollapsed
+              ? `
+                ${
+                  directVisible.length > 0
+                    ? `<div class="st-pw-folder-body">${directVisible
+                        .map((p) =>
+                          renderPersonaRowHtml(p, selectedAvatarId, {
+                            currentGroupName: node.parentName,
+                          })
+                        )
+                        .join('')}</div>`
+                    : ''
+                }
+                <div class="st-pw-subfolders-wrap">${childHtmls.join('')}</div>
+              `
+              : ''
+          }
+        </div>
+      `);
+    }
   }
 
   // 3) 未分组 User
@@ -7858,6 +8448,12 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
     !customGroups.some((g) => g.id === state.activeFilter)
   ) {
     state.activeFilter = 'all';
+  }
+  if (state.activeFilter.startsWith('gparent:')) {
+    const pTarget = state.activeFilter.slice('gparent:'.length);
+    if (!customGroups.some((g) => splitGroupPath(g.name).parent === pTarget)) {
+      state.activeFilter = 'all';
+    }
   }
 
   const targetPersona =
@@ -8529,10 +9125,17 @@ function mountWardrobePickerWidget(
     const viewMode = settings.viewMode || 'standard';
     const q = searchQuery.trim().toLowerCase();
 
+    const groupNodes = buildCustomGroupHierarchy(customGroups);
     if (activeTab === 'char_bound' && boundSet.size === 0) {
       activeTab = 'all';
     }
     if (activeTab.startsWith('group:') && !customGroups.some((g) => g.id === activeTab)) {
+      activeTab = boundSet.size > 0 ? 'char_bound' : 'all';
+    }
+    if (
+      activeTab.startsWith('gparent:') &&
+      !groupNodes.some((n) => n.kind === 'parent' && n.sectionId === activeTab)
+    ) {
       activeTab = boundSet.size > 0 ? 'char_bound' : 'all';
     }
 
@@ -8586,6 +9189,19 @@ function mountWardrobePickerWidget(
       listBodyHtml = chatList.length
         ? `<div class="st-pw-flat-list-body">${chatList.map(renderCard).join('')}</div>`
         : `<div class="st-pw-empty-state">暂无有聊天记录的 User</div>`;
+    } else if (activeTab.startsWith('gparent:')) {
+      const pTarget = activeTab.slice('gparent:'.length);
+      const pList = sortPersonasList(
+        personas.filter(
+          (p) =>
+            getProfileGroups(p.meta).some((g) => splitGroupPath(g).parent === pTarget) &&
+            matchesSearch(p, q)
+        ),
+        sortBy
+      );
+      listBodyHtml = pList.length
+        ? `<div class="st-pw-flat-list-body">${pList.map(renderCard).join('')}</div>`
+        : `<div class="st-pw-empty-state">该大类下无匹配 User</div>`;
     } else if (activeTab.startsWith('group:')) {
       const grp = customGroups.find((g) => g.id === activeTab);
       const grpList = sortPersonasList(
@@ -8596,7 +9212,7 @@ function mountWardrobePickerWidget(
         ? `<div class="st-pw-flat-list-body">${grpList.map(renderCard).join('')}</div>`
         : `<div class="st-pw-empty-state">该分组下无匹配 User</div>`;
     } else {
-      // activeTab === 'all'：若存在自定义分组且未搜索，按自定义分组折叠树展示，体验与主衣柜一致
+      // activeTab === 'all'：若存在自定义分组且未搜索，按两级自定义分组折叠树展示，体验与主衣柜一致
       if (!q && customGroups.length > 0) {
         const secs = [];
         if (boundSet.size > 0 && curCharName) {
@@ -8620,23 +9236,75 @@ function mountWardrobePickerWidget(
             </div>
           `);
         }
-        for (const grp of customGroups) {
-          const isCol = localCollapsed.has(grp.id);
-          const gMembers = sortPersonasList(grp.members, sortBy);
-          if (gMembers.length === 0) continue;
-          secs.push(`
-            <div class="st-pw-folder-section" data-section-id="${escapeAttr(grp.id)}">
-              <div class="st-pw-folder-header">
-                <div class="st-pw-folder-title-wrap st-pw-picker-folder-toggle" data-section-id="${escapeAttr(grp.id)}">
-                  <i class="fa-solid fa-chevron-${isCol ? 'right' : 'down'} st-pw-folder-arrow"></i>
-                  <i class="fa-regular fa-folder st-pw-folder-icon"></i>
-                  <span class="st-pw-folder-name">${sanitizeHtml(grp.name)}</span>
-                  <span class="st-pw-folder-count">${gMembers.length}</span>
+        for (const node of groupNodes) {
+          if (node.kind === 'leaf') {
+            const grp = node.group;
+            const isCol = localCollapsed.has(grp.id);
+            const gMembers = sortPersonasList(grp.members, sortBy);
+            if (gMembers.length === 0) continue;
+            secs.push(`
+              <div class="st-pw-folder-section" data-section-id="${escapeAttr(grp.id)}">
+                <div class="st-pw-folder-header">
+                  <div class="st-pw-folder-title-wrap st-pw-picker-folder-toggle" data-section-id="${escapeAttr(grp.id)}">
+                    <i class="fa-solid fa-chevron-${isCol ? 'right' : 'down'} st-pw-folder-arrow"></i>
+                    <i class="fa-regular fa-folder st-pw-folder-icon"></i>
+                    <span class="st-pw-folder-name">${sanitizeHtml(grp.name)}</span>
+                    <span class="st-pw-folder-count">${gMembers.length}</span>
+                  </div>
                 </div>
+                ${isCol ? '' : `<div class="st-pw-folder-body">${gMembers.map(renderCard).join('')}</div>`}
               </div>
-              ${isCol ? '' : `<div class="st-pw-folder-body">${gMembers.map(renderCard).join('')}</div>`}
-            </div>
-          `);
+            `);
+          } else {
+            if (node.uniqueCount === 0) continue;
+            const isParentCol = localCollapsed.has(node.sectionId);
+            const directMembers = node.directGroup
+              ? sortPersonasList(node.directGroup.members, sortBy)
+              : [];
+            const childSecs = node.children
+              .map((ch) => {
+                const cMembers = sortPersonasList(ch.group.members, sortBy);
+                if (cMembers.length === 0) return '';
+                const isChildCol = localCollapsed.has(ch.group.id);
+                return `
+                  <div class="st-pw-folder-section st-pw-subfolder-section" data-section-id="${escapeAttr(ch.group.id)}">
+                    <div class="st-pw-folder-header">
+                      <div class="st-pw-folder-title-wrap st-pw-picker-folder-toggle" data-section-id="${escapeAttr(ch.group.id)}">
+                        <i class="fa-solid fa-chevron-${isChildCol ? 'right' : 'down'} st-pw-folder-arrow"></i>
+                        <i class="fa-solid fa-folder-tree st-pw-folder-icon"></i>
+                        <span class="st-pw-folder-name">${sanitizeHtml(ch.childName)}</span>
+                        <span class="st-pw-folder-count">${cMembers.length}</span>
+                      </div>
+                    </div>
+                    ${isChildCol ? '' : `<div class="st-pw-folder-body">${cMembers.map(renderCard).join('')}</div>`}
+                  </div>
+                `;
+              })
+              .filter(Boolean)
+              .join('');
+
+            secs.push(`
+              <div class="st-pw-folder-section st-pw-parent-folder-section" data-section-id="${escapeAttr(node.sectionId)}">
+                <div class="st-pw-folder-header st-pw-parent-folder-header">
+                  <div class="st-pw-folder-title-wrap st-pw-picker-folder-toggle" data-section-id="${escapeAttr(node.sectionId)}">
+                    <i class="fa-solid fa-chevron-${isParentCol ? 'right' : 'down'} st-pw-folder-arrow"></i>
+                    <i class="fa-regular fa-folder${isParentCol ? '' : '-open'} st-pw-folder-icon"></i>
+                    <span class="st-pw-folder-name">${sanitizeHtml(node.parentName)}</span>
+                    <span class="st-pw-folder-count">${node.uniqueCount}</span>
+                    <span class="st-pw-tiny-tag">${node.children.length}子组</span>
+                  </div>
+                </div>
+                ${
+                  isParentCol
+                    ? ''
+                    : `
+                      ${directMembers.length ? `<div class="st-pw-folder-body">${directMembers.map(renderCard).join('')}</div>` : ''}
+                      <div class="st-pw-subfolders-wrap">${childSecs}</div>
+                    `
+                }
+              </div>
+            `);
+          }
         }
         const restList = sortPersonasList(
           personas.filter((p) => getProfileGroups(p.meta).length === 0 && !boundSet.has(p.avatarId)),
@@ -8736,24 +9404,39 @@ function mountWardrobePickerWidget(
               : ''
           }
           ${
-            customGroups.length <= 4
-              ? customGroups
-                  .map(
-                    (g) => `
-                      <button type="button" class="st-pw-filter-pill ${activeTab === g.id ? 'active' : ''}" data-picker-tab="${escapeAttr(g.id)}">
-                        ${sanitizeHtml(g.name)} (${g.members.length})
-                      </button>
-                    `
+            groupNodes.length <= 3 && customGroups.length <= 4
+              ? groupNodes
+                  .map((node) =>
+                    node.kind === 'parent'
+                      ? `
+                        <button type="button" class="st-pw-filter-pill ${activeTab === node.sectionId ? 'active' : ''}" data-picker-tab="${escapeAttr(node.sectionId)}">
+                          <i class="fa-regular fa-folder-open"></i> ${sanitizeHtml(node.parentName)} (${node.uniqueCount})
+                        </button>
+                      `
+                      : `
+                        <button type="button" class="st-pw-filter-pill ${activeTab === node.group.id ? 'active' : ''}" data-picker-tab="${escapeAttr(node.group.id)}">
+                          ${sanitizeHtml(node.group.name)} (${node.group.members.length})
+                        </button>
+                      `
                   )
                   .join('')
               : `
-                <select class="text_pole st-pw-char-filter-select st-pw-picker-group-select ${activeTab.startsWith('group:') ? 'is-active-select' : ''}">
+                <select class="text_pole st-pw-char-filter-select st-pw-picker-group-select ${activeTab.startsWith('group:') || activeTab.startsWith('gparent:') ? 'is-active-select' : ''}">
                   <option value="all">按分组筛选 (${customGroups.length})…</option>
-                  ${customGroups
-                    .map(
-                      (g) =>
-                        `<option value="${escapeAttr(g.id)}" ${activeTab === g.id ? 'selected' : ''}>${sanitizeHtml(g.name)} (${g.members.length})</option>`
-                    )
+                  ${groupNodes
+                    .map((node) => {
+                      if (node.kind === 'leaf') {
+                        return `<option value="${escapeAttr(node.group.id)}" ${activeTab === node.group.id ? 'selected' : ''}>📁 ${sanitizeHtml(node.group.name)} (${node.group.members.length})</option>`;
+                      }
+                      const pOpt = `<option value="${escapeAttr(node.sectionId)}" ${activeTab === node.sectionId ? 'selected' : ''}>📁 ${sanitizeHtml(node.parentName)} · 全部 (${node.uniqueCount})</option>`;
+                      const cOpts = node.children
+                        .map(
+                          (ch) =>
+                            `<option value="${escapeAttr(ch.group.id)}" ${activeTab === ch.group.id ? 'selected' : ''}>　├ 📂 ${sanitizeHtml(ch.childName)} (${ch.group.members.length})</option>`
+                        )
+                        .join('');
+                      return pOpt + cOpts;
+                    })
                     .join('')}
                 </select>
               `

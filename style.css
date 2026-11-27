@@ -1959,7 +1959,28 @@ dialog.popup.st-pw-newchat-expanded-dialog {
 .st-pw-gp-name-wrap {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
+}
+
+.st-pw-gp-parent-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.st-pw-gp-parent-select {
+  flex: 1 1 180px;
+  min-width: 0;
+  padding: 5px 8px !important;
+  font-size: 0.85rem !important;
+}
+
+.st-pw-gp-custom-parent {
+  flex: 1 1 140px;
+  min-width: 0;
+  padding: 5px 9px !important;
+  font-size: 0.86rem !important;
 }
 
 .st-pw-gp-field-label {
@@ -2139,6 +2160,34 @@ dialog.popup.st-pw-newchat-expanded-dialog {
 
 .st-pw-group-chip-jump:hover {
   text-decoration: underline;
+}
+
+/* ==================== 两级嵌套分组树 & 其他角色绑定折叠总夹 ==================== */
+.st-pw-parent-folder-section > .st-pw-parent-folder-header {
+  background: var(--white10a, rgba(255, 255, 255, 0.05));
+}
+
+.st-pw-char-archive-section {
+  border-style: dashed;
+}
+
+.st-pw-subfolders-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 4px 5px 6px 8px;
+  padding-left: 7px;
+  border-left: 2px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.16));
+}
+
+.st-pw-subfolder-section {
+  margin: 0 !important;
+  background: var(--black30a, rgba(0, 0, 0, 0.18));
+}
+
+.st-pw-subfolder-section > .st-pw-folder-header {
+  padding: 5px 7px;
+  font-size: 0.86rem;
 }
 
 @media (max-width: 860px) {
