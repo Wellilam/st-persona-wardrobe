@@ -10,6 +10,8 @@
 .st-pw-inline-right-workbench .menu_button,
 .st-pw-wardrobe-dialog .menu_button,
 .st-pw-wb-dialog .menu_button,
+.st-pw-chat-picker-host .menu_button,
+.st-pw-newchat-inline-box .menu_button,
 .st-pw-return-pill.menu_button {
   width: auto !important;
   min-width: max-content !important;
@@ -46,10 +48,14 @@
 .st-pw-inline-right-workbench select,
 .st-pw-wardrobe-dialog select,
 .st-pw-wb-dialog select,
+.st-pw-chat-picker-host select,
+.st-pw-newchat-inline-box select,
 .st-pw-inline-left-panel input.text_pole,
 .st-pw-inline-right-workbench input.text_pole,
 .st-pw-wardrobe-dialog input.text_pole,
-.st-pw-wb-dialog input.text_pole {
+.st-pw-wb-dialog input.text_pole,
+.st-pw-chat-picker-host input.text_pole,
+.st-pw-newchat-inline-box input.text_pole {
   margin: 0 !important;
 }
 
@@ -1641,4 +1647,279 @@
     max-height: 44vh;
     max-height: 44dvh;
   }
+}
+
+/* 8. 接管酒馆原生「进入新聊天选人设 / 角色连接人设」弹窗 &「开始新聊天？」内嵌预选栏 */
+dialog.popup.st-pw-chat-picker-dialog {
+  width: min(650px, calc(100vw - 16px)) !important;
+  width: min(650px, calc(100dvw - 16px)) !important;
+  max-width: calc(100vw - 16px) !important;
+  max-width: calc(100dvw - 16px) !important;
+  padding: 8px 12px 10px !important;
+  text-align: left !important;
+}
+
+dialog.popup.st-pw-chat-picker-dialog > .popup-body > .popup-controls {
+  display: none !important;
+}
+
+dialog.popup.st-pw-chat-picker-dialog > .popup-body > .popup-content {
+  margin-top: 2px !important;
+  padding: 0 !important;
+  overflow: hidden !important;
+  display: flex !important;
+  flex-direction: column !important;
+}
+
+dialog.popup.st-pw-newchat-expanded-dialog {
+  width: min(640px, calc(100vw - 16px)) !important;
+  width: min(640px, calc(100dvw - 16px)) !important;
+  max-width: calc(100vw - 16px) !important;
+  max-width: calc(100dvw - 16px) !important;
+}
+
+.st-pw-standalone-picker-dialog {
+  width: min(650px, 100%);
+  height: auto;
+  max-height: min(720px, calc(100dvh - 20px));
+  padding: 12px;
+}
+
+.st-pw-chat-picker-host,
+.st-pw-newchat-inline-box {
+  text-align: left;
+  color: var(--SmartThemeBodyColor, #e5e5e5);
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.st-pw-picker-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 78vh;
+  max-height: 78dvh;
+  min-height: 0;
+}
+
+.st-pw-picker-wrap.is-compact-embed {
+  max-height: 54vh;
+  max-height: 54dvh;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.14));
+}
+
+.st-pw-picker-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.12));
+}
+
+.st-pw-picker-title-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.st-pw-picker-char-avatar {
+  width: 38px;
+  height: 38px;
+  border-radius: 6px;
+  object-fit: cover;
+  flex-shrink: 0;
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.2));
+}
+
+.st-pw-picker-icon {
+  font-size: 1.25rem;
+  opacity: 0.8;
+}
+
+.st-pw-picker-titles {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.st-pw-picker-main-title {
+  font-size: 0.96rem;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.st-pw-picker-sub-title {
+  font-size: 0.78rem;
+  opacity: 0.72;
+}
+
+.st-pw-picker-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.st-pw-picker-toolbar .st-pw-picker-search {
+  flex: 1 1 140px;
+  min-width: 100px;
+  width: auto !important;
+  padding: 4px 8px !important;
+  font-size: 0.84rem !important;
+}
+
+.st-pw-picker-list {
+  flex: 1 1 auto;
+  min-height: 120px;
+  max-height: 48vh;
+  max-height: 48dvh;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.st-pw-picker-wrap.is-compact-embed .st-pw-picker-list {
+  max-height: 34vh;
+  max-height: 34dvh;
+}
+
+.st-pw-used-tag {
+  border-color: rgba(94, 194, 126, 0.45) !important;
+  color: #8ce0a3 !important;
+  opacity: 0.95 !important;
+}
+
+.st-pw-picker-preset-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.st-pw-persona-list.is-view-compact .st-pw-picker-preset-row,
+.st-pw-persona-list.is-view-grid .st-pw-picker-preset-row {
+  display: none;
+}
+
+.st-pw-picker-preset-pill {
+  appearance: none;
+  background: var(--black30a, rgba(0, 0, 0, 0.3));
+  color: inherit;
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.2));
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-size: 0.72rem;
+  line-height: 1.35;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  opacity: 0.85;
+}
+
+.st-pw-picker-preset-pill:hover,
+.st-pw-picker-preset-pill.is-active-preset {
+  opacity: 1;
+  background: var(--white20a, rgba(255, 255, 255, 0.15));
+  border-color: var(--SmartThemeQuoteColor, rgba(255, 255, 255, 0.48));
+}
+
+.st-pw-picker-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 6px;
+  border-top: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.1));
+}
+
+.st-pw-picker-bind-chk {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.78rem;
+  opacity: 0.85;
+  cursor: pointer;
+  user-select: none;
+}
+
+.st-pw-picker-bind-chk input {
+  margin: 0 !important;
+}
+
+.st-pw-picker-footer-btns {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-left: auto;
+}
+
+/* 「开始新聊天？」弹窗内的轻量人设预选条 */
+.st-pw-newchat-inline-box {
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: var(--black20a, rgba(0, 0, 0, 0.2));
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.14));
+  border-radius: 6px;
+}
+
+.st-pw-newchat-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.st-pw-newchat-bar.has-explicit-choice {
+  border-left: 3px solid var(--SmartThemeQuoteColor, #60a5fa);
+  padding-left: 6px;
+}
+
+.st-pw-newchat-cur {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 160px;
+}
+
+.st-pw-newchat-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 4px;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+
+.st-pw-newchat-info {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.st-pw-newchat-label {
+  font-size: 0.84rem;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.st-pw-newchat-sub {
+  font-size: 0.74rem;
+  opacity: 0.68;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
