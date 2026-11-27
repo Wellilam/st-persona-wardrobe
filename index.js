@@ -345,7 +345,8 @@ function getSettings() {
   if (!store._cleanedLegacyPresetGroups) {
     const usedGroups = new Set(
       Object.values(store.profiles)
-        .map((p) => p?.group)
+        .flatMap((p) => (Array.isArray(p?.groups) ? p.groups : [p?.group]))
+        .map((g) => String(g || '').trim())
         .filter(Boolean)
     );
     store.groups = store.groups.filter(
@@ -372,12 +373,84 @@ function saveSettings() {
   }
 }
 
+function normalizeGroupList(rawGroups, legacyGroup = '') {
+  const out = [];
+  const seen = new Set();
+  const pushOne = (val) => {
+    const clean = String(val ?? '').trim();
+    if (!clean || seen.has(clean)) return;
+    seen.add(clean);
+    out.push(clean);
+  };
+  if (Array.isArray(rawGroups)) {
+    for (const item of rawGroups) pushOne(item);
+  } else if (typeof legacyGroup === 'string' && legacyGroup.trim()) {
+    pushOne(legacyGroup);
+  }
+  return out;
+}
+
+function getProfileGroups(profileOrMeta) {
+  if (!profileOrMeta || typeof profileOrMeta !== 'object') return [];
+  return normalizeGroupList(profileOrMeta.groups, profileOrMeta.group);
+}
+
+function setProfileGroups(profileOrMeta, nextGroups) {
+  if (!profileOrMeta || typeof profileOrMeta !== 'object') return [];
+  const normalized = normalizeGroupList(Array.isArray(nextGroups) ? nextGroups : [nextGroups]);
+  profileOrMeta.groups = normalized;
+  profileOrMeta.group = normalized[0] || '';
+  return normalized;
+}
+
+function hasProfileGroup(profileOrMeta, groupName) {
+  const target = String(groupName ?? '').trim();
+  if (!target) return false;
+  return getProfileGroups(profileOrMeta).includes(target);
+}
+
+function addProfileToGroup(profileOrMeta, groupName) {
+  const target = String(groupName ?? '').trim();
+  if (!target || !profileOrMeta) return getProfileGroups(profileOrMeta);
+  const cur = getProfileGroups(profileOrMeta);
+  if (!cur.includes(target)) cur.push(target);
+  return setProfileGroups(profileOrMeta, cur);
+}
+
+function removeProfileFromGroup(profileOrMeta, groupName) {
+  const target = String(groupName ?? '').trim();
+  if (!target || !profileOrMeta) return getProfileGroups(profileOrMeta);
+  const cur = getProfileGroups(profileOrMeta).filter((g) => g !== target);
+  return setProfileGroups(profileOrMeta, cur);
+}
+
+function renderPersonaGroupTagsHtml(profileOrMeta, { excludeGroup = '', maxVisible = 1 } = {}) {
+  const allGroups = getProfileGroups(profileOrMeta);
+  const filtered = excludeGroup ? allGroups.filter((g) => g !== excludeGroup) : allGroups;
+  if (filtered.length === 0) return '';
+  const shown = filtered.slice(0, maxVisible);
+  const rest = filtered.length - shown.length;
+  const prefix = excludeGroup ? '也在:' : '';
+  return (
+    shown
+      .map(
+        (g) =>
+          `<span class="st-pw-tiny-tag" title="所属分组：${escapeAttr(allGroups.join(' / '))}">${prefix}${sanitizeHtml(g)}</span>`
+      )
+      .join('') +
+    (rest > 0
+      ? `<span class="st-pw-tiny-tag" title="所属分组：${escapeAttr(allGroups.join(' / '))}">+${rest}组</span>`
+      : '')
+  );
+}
+
 function ensureProfileMeta(avatarId) {
   const settings = getSettings();
   if (!settings.profiles[avatarId]) {
     settings.profiles[avatarId] = {
       favorite: false,
       group: '',
+      groups: [],
       tags: [],
       boundCharacters: [],
       note: '',
@@ -395,6 +468,10 @@ function ensureProfileMeta(avatarId) {
   const profile = settings.profiles[avatarId];
   if (typeof profile.favorite !== 'boolean') profile.favorite = false;
   if (typeof profile.group !== 'string') profile.group = '';
+  setProfileGroups(
+    profile,
+    Array.isArray(profile.groups) ? profile.groups : profile.group ? [profile.group] : []
+  );
   if (!Array.isArray(profile.tags)) profile.tags = [];
   if (!Array.isArray(profile.boundCharacters)) profile.boundCharacters = [];
   if (typeof profile.note !== 'string') profile.note = '';
@@ -580,8 +657,9 @@ function moveCustomGroupOrder(groupName, direction) {
   const settings = getSettings();
   const allNames = [...new Set([...(settings.groups || []).filter(Boolean)])];
   for (const prof of Object.values(settings.profiles || {})) {
-    const g = String(prof?.group || '').trim();
-    if (g && !allNames.includes(g)) allNames.push(g);
+    for (const g of getProfileGroups(prof)) {
+      if (g && !allNames.includes(g)) allNames.push(g);
+    }
   }
   const idx = allNames.indexOf(clean);
   if (idx === -1) return;
@@ -2634,11 +2712,11 @@ function buildUnifiedPersonaGroups(personas) {
     return a.name.localeCompare(b.name, 'zh-CN');
   });
 
-  // 2. 收集所有「自定义分组」
+  // 2. 收集所有「自定义分组」（支持单个 User 同时归属多个自定义分组）
   const customGroupNames = new Set(settings.groups.filter(Boolean));
   for (const p of personas) {
-    if (p.meta.group && p.meta.group.trim()) {
-      customGroupNames.add(p.meta.group.trim());
+    for (const g of getProfileGroups(p.meta)) {
+      customGroupNames.add(g);
     }
   }
 
@@ -2646,12 +2724,12 @@ function buildUnifiedPersonaGroups(personas) {
     id: `group:${gName}`,
     type: 'group',
     name: gName,
-    members: personas.filter((p) => p.meta.group === gName),
+    members: personas.filter((p) => hasProfileGroup(p.meta, gName)),
   }));
 
   // 3. 收集既不在任何角色组、也不在任何自定义组里的「未分组」User
   const ungroupedMembers = personas.filter(
-    (p) => p.meta.boundCharacters.length === 0 && !p.meta.group
+    (p) => p.meta.boundCharacters.length === 0 && getProfileGroups(p.meta).length === 0
   );
 
   return {
@@ -2869,43 +2947,62 @@ async function executeBatchMoveToGroup(rawTargetGroup) {
   if (ids.length === 0) return;
 
   const settings = getSettings();
-  let finalGroup = '';
 
   if (rawTargetGroup === '__new__') {
-    const entered = await promptUserText('新建自定义分组并批量移入', '', {
-      subtitle: `将当前选中的 ${ids.length} 个 User 一并移入新分组`,
-      placeholder: '输入新分组名称…',
+    openGroupMemberPickerModal({
+      mode: 'create_group',
+      preselectedIds: ids,
+      onSaved: () => {
+        state.multiSelectedIds.clear();
+        refreshAllViews();
+      },
     });
-    if (!entered || !entered.trim()) return;
-    finalGroup = entered.trim();
-    if (!settings.groups.includes(finalGroup)) {
-      settings.groups.push(finalGroup);
+    return;
+  }
+
+  if (rawTargetGroup === '__ungroup__') {
+    for (const id of ids) {
+      setProfileGroups(ensureProfileMeta(id), []);
     }
-  } else if (rawTargetGroup === '__ungroup__') {
-    finalGroup = '';
-  } else {
-    finalGroup = String(rawTargetGroup || '').trim();
-    if (!finalGroup) return;
+    state.multiSelectedIds.clear();
+    invalidateRenderedHtmlCache();
+    saveSettings();
+    refreshAllViews();
+    globalThis.toastr?.success?.(`已清空 ${ids.length} 个 User 的全部自定义分组`);
+    return;
+  }
+
+  if (String(rawTargetGroup || '').startsWith('remove:')) {
+    const removeGroup = String(rawTargetGroup).slice('remove:'.length).trim();
+    if (!removeGroup) return;
+    for (const id of ids) {
+      removeProfileFromGroup(ensureProfileMeta(id), removeGroup);
+    }
+    state.multiSelectedIds.clear();
+    invalidateRenderedHtmlCache();
+    saveSettings();
+    refreshAllViews();
+    globalThis.toastr?.success?.(`已将 ${ids.length} 个 User 从分组「${removeGroup}」移出`);
+    return;
+  }
+
+  const finalGroup = String(rawTargetGroup || '').replace(/^add:/, '').trim();
+  if (!finalGroup) return;
+  if (!settings.groups.includes(finalGroup)) {
+    settings.groups.push(finalGroup);
   }
 
   for (const id of ids) {
-    const meta = ensureProfileMeta(id);
-    meta.group = finalGroup;
+    addProfileToGroup(ensureProfileMeta(id), finalGroup);
   }
-  if (finalGroup) {
-    state.collapsedSections.delete(`group:${finalGroup}`);
-    syncCollapsedSectionsToSettings();
-  }
+  state.collapsedSections.delete(`group:${finalGroup}`);
+  syncCollapsedSectionsToSettings();
   // 批量归组后自动清空勾选并保持多选开启，方便紧接着勾选下一批人设归入其他分组！
   state.multiSelectedIds.clear();
   invalidateRenderedHtmlCache();
   saveSettings();
   refreshAllViews();
-  globalThis.toastr?.success?.(
-    finalGroup
-      ? `已将 ${ids.length} 个 User 移入分组「${finalGroup}」`
-      : `已将 ${ids.length} 个 User 移出自定义分组`
-  );
+  globalThis.toastr?.success?.(`已将 ${ids.length} 个 User 加入分组「${finalGroup}」`);
 }
 
 async function executeBatchCharacterAction(rawAction) {
@@ -3481,9 +3578,11 @@ async function clonePersonaVariant(sourcePersona, { customName = '', fromPreset 
   // 3. 完整克隆扩展 Profile 元数据（分组、标签、角色绑定、附加世界书、随身设定、状态快照）
   const settings = getSettings();
   const srcMeta = sourcePersona.meta;
+  const clonedGroups = getProfileGroups(srcMeta);
   settings.profiles[newAvatarId] = {
     favorite: Boolean(srcMeta.favorite),
-    group: srcMeta.group || '',
+    group: clonedGroups[0] || '',
+    groups: [...clonedGroups],
     tags: [...(srcMeta.tags || [])],
     boundCharacters: [...(srcMeta.boundCharacters || [])],
     note: srcMeta.note || '',
@@ -3684,7 +3783,8 @@ async function exportPersonaSharePack(rawIds) {
       title: rawDescObj.title ?? p.title ?? '',
       profile: {
         favorite: Boolean(p.meta?.favorite),
-        group: p.meta?.group || '',
+        group: getProfileGroups(p.meta)[0] || '',
+        groups: [...getProfileGroups(p.meta)],
         tags: [...(p.meta?.tags || [])],
         note: p.meta?.note || '',
         extraWorldbooks: structuredClone(p.meta?.extraWorldbooks || []),
@@ -3868,12 +3968,12 @@ async function importPersonaSharePackData(parsed) {
     }
 
     const prof = item.profile && typeof item.profile === 'object' ? item.profile : {};
-    const groupName = String(prof.group || '').trim();
-    if (groupName) {
-      if (!settings.groups.includes(groupName)) {
-        settings.groups.push(groupName);
+    const importedGroups = getProfileGroups(prof);
+    for (const gName of importedGroups) {
+      if (!settings.groups.includes(gName)) {
+        settings.groups.push(gName);
       }
-      state.collapsedSections.delete(`group:${groupName}`);
+      state.collapsedSections.delete(`group:${gName}`);
     }
 
     if (!uploadedRealImage && /^https?:\/\//i.test(String(item.externalAvatarUrl || ''))) {
@@ -3882,7 +3982,8 @@ async function importPersonaSharePackData(parsed) {
 
     settings.profiles[newAvatarId] = {
       favorite: Boolean(prof.favorite),
-      group: groupName,
+      group: importedGroups[0] || '',
+      groups: [...importedGroups],
       tags: Array.isArray(prof.tags) ? prof.tags.map((t) => String(t).trim()).filter(Boolean) : [],
       boundCharacters: [],
       note: String(prof.note || ''),
@@ -4113,6 +4214,7 @@ function bindModalBackdropEvents(modal) {
 
 function closeTopmostWardrobeModal() {
   const modalIds = [
+    '#st_pw_group_member_modal',
     '#st_pw_chat_picker_modal',
     '#st_pw_preview_modal',
     '#st_pw_wb_inspector_modal',
@@ -4875,13 +4977,18 @@ function renderMultiSelectToolbarHtml(settings, hostChars, currentCharName, avai
       </div>
 
       <div class="st-pw-multi-bar-actions">
-        <select class="text_pole st-pw-multi-select-ctrl st-pw-multi-group-select" ${disAttr} title="将已勾选的 User 一次性批量移入指定分组">
-          <option value="">批量移入分组…</option>
+        <select class="text_pole st-pw-multi-select-ctrl st-pw-multi-group-select" ${disAttr} title="将已勾选的 User 一次性批量加入或移出分组（支持同时属于多个分组）">
+          <option value="">批量分组操作…</option>
           ${(settings.groups || [])
-            .map((g) => `<option value="${escapeAttr(g)}">移入分组：${sanitizeHtml(g)}</option>`)
+            .map((g) => `<option value="add:${escapeAttr(g)}">加入分组：${sanitizeHtml(g)}</option>`)
             .join('')}
-          <option value="__new__">+ 新建分组并移入…</option>
-          <option value="__ungroup__">— 移出自定义分组（恢复未分组）—</option>
+          <option value="__new__">+ 新建分组并加入…</option>
+          ${
+            state.activeFilter.startsWith('group:')
+              ? `<option value="remove:${escapeAttr(state.activeFilter.slice('group:'.length))}">— 从当前分组「${sanitizeHtml(state.activeFilter.slice('group:'.length))}」移出 —</option>`
+              : ''
+          }
+          <option value="__ungroup__">— 清空所选的全部自定义分组 —</option>
         </select>
 
         <select class="text_pole st-pw-multi-select-ctrl st-pw-multi-char-select" ${disAttr} title="将已勾选的 User 一次性绑定到角色卡或清空绑定">
@@ -4924,7 +5031,7 @@ function renderMultiSelectToolbarHtml(settings, hostChars, currentCharName, avai
   `;
 }
 
-function renderPersonaRowHtml(p, selectedAvatarId) {
+function renderPersonaRowHtml(p, selectedAvatarId, { currentGroupName = '' } = {}) {
   const isMulti = Boolean(state.multiSelectMode);
   const isMultiChecked = isMulti && state.multiSelectedIds.has(p.avatarId);
   const isSelected = !isMulti && selectedAvatarId === p.avatarId;
@@ -4948,8 +5055,8 @@ function renderPersonaRowHtml(p, selectedAvatarId) {
       <img class="st-pw-item-avatar b-loaded loaded ${isPendingPlaceholder ? 'st-pw-placeholder-pending' : ''}" src="${escapeAttr(p.avatarUrl)}" data-real-src="${escapeAttr(p.avatarUrl)}" data-no-lazy="1" data-loaded="true" data-avatar-id="${escapeAttr(p.avatarId)}" data-fallback-src="${escapeAttr(fallbackAvatarUrl)}" decoding="async" alt="" />
       <div class="st-pw-item-main">
         <div class="st-pw-item-title-line">
-          <span class="st-pw-item-name">${sanitizeHtml(p.name)}</span>
-          ${p.meta.group ? `<span class="st-pw-tiny-tag">${sanitizeHtml(p.meta.group)}</span>` : ''}
+          <span class="st-pw-item-name" title="${escapeAttr(p.name)}">${sanitizeHtml(p.name)}</span>
+          ${renderPersonaGroupTagsHtml(p.meta, { excludeGroup: currentGroupName, maxVisible: 1 })}
           ${p.isLukerCharacterOnly ? `<span class="st-pw-tiny-tag" title="Luker 角色卡专属人设 (Character Only)">卡内专属</span>` : ''}
         </div>
         <div class="st-pw-item-sub-line">
@@ -4996,7 +5103,7 @@ function matchesSearch(p, q) {
     p.avatarId,
     p.description,
     p.lorebook,
-    p.meta.group,
+    ...getProfileGroups(p.meta),
     p.meta.note,
     ...(p.meta.tags || []),
     ...(p.meta.boundCharacters || []),
@@ -5416,7 +5523,7 @@ function renderWardrobeModalContent({ force = false } = {}) {
 }
 
 /**
- * 在分组标题下直接展开「批量勾选哪些 User 属于该角色 / 该自定义分组」的清单
+ * 在分组标题下直接展开「批量勾选哪些 User 属于该角色 / 该自定义分组」的清单（兜底保留，主入口已升级为带搜索多选弹窗）
  */
 function renderBatchChecklistHtml(targetType, targetName, allPersonas) {
   return `
@@ -5431,7 +5538,7 @@ function renderBatchChecklistHtml(targetType, targetName, allPersonas) {
             const isChecked =
               targetType === 'character'
                 ? p.meta.boundCharacters.some((c) => c.toLowerCase() === targetName.toLowerCase())
-                : p.meta.group === targetName;
+                : hasProfileGroup(p.meta, targetName);
             return `
               <label class="st-pw-batch-item">
                 <input type="checkbox" class="st-pw-batch-check" data-target-type="${escapeAttr(targetType)}" data-target-name="${escapeAttr(targetName)}" data-avatar-id="${escapeAttr(p.avatarId)}" ${isChecked ? 'checked' : ''} />
@@ -5443,6 +5550,512 @@ function renderBatchChecklistHtml(targetType, targetName, allPersonas) {
       </div>
     </div>
   `;
+}
+
+/**
+ * 渲染单个 User 所属的多个自定义分组胶囊 + 快速加入新分组下拉框
+ */
+function renderCustomGroupChipsHtml(persona, settings) {
+  const assignedGroups = getProfileGroups(persona?.meta);
+  const unassignedGroups = (settings.groups || []).filter((g) => !assignedGroups.includes(g));
+
+  return `
+    <div class="st-pw-char-chips-row st-pw-group-chips-row">
+      ${
+        assignedGroups.length === 0
+          ? `<span class="st-pw-muted" style="font-size:0.82rem;">未加入自定义分组</span>`
+          : assignedGroups
+              .map(
+                (gName) => `
+                  <span class="st-pw-char-chip st-pw-group-chip">
+                    <span class="st-pw-group-chip-jump" data-group="${escapeAttr(gName)}" title="点击在左侧筛选该分组下的所有 User"><i class="fa-regular fa-folder" style="opacity:0.75;margin-right:3px;"></i>${sanitizeHtml(gName)}</span>
+                    <button type="button" class="st-pw-chip-remove st-pw-group-chip-remove" data-group="${escapeAttr(gName)}" title="从分组「${escapeAttr(gName)}」移出">×</button>
+                  </span>
+                `
+              )
+              .join('')
+      }
+      <select id="st_pw_detail_group" class="text_pole st-pw-char-add-select" title="将此 User 加入自定义分组（支持同时属于多个分组）">
+        <option value="">+ 加入自定义分组…</option>
+        ${unassignedGroups
+          .map((g) => `<option value="add:${escapeAttr(g)}">加入分组：${sanitizeHtml(g)}</option>`)
+          .join('')}
+        <option value="__new__">+ 新建自定义分组…</option>
+        ${
+          assignedGroups.length >= 2
+            ? `<option value="__clear_all__">— 清空所属分组 (${assignedGroups.length}) —</option>`
+            : ''
+        }
+      </select>
+    </div>
+  `;
+}
+
+/**
+ * 打开「新建分组 & 带搜索多选管理组员」统一弹窗
+ * - 默认开启多选，点击整行即可勾选/取消（支持 Shift 连选），绝不跳滚动条
+ * - 支持实时搜索（不打断中文输入法）与「全部 / 已勾选 / 未分组 / 收藏」筛选
+ * - 支持同一个 User 同时放入多个自定义分组（不会踢出原分组）
+ */
+function openGroupMemberPickerModal({
+  mode = 'create_group', // 'create_group' | 'edit_group' | 'edit_character'
+  targetName = '',
+  preselectedIds = [],
+  onSaved = null,
+} = {}) {
+  const settings = getSettings();
+  const personas = sortPersonasList(getHostPersonas(), settings.sortBy || 'default');
+  const cleanTarget = String(targetName || '').trim();
+
+  const initialChecked = new Set(preselectedIds.filter(Boolean));
+  if (mode === 'edit_group' && cleanTarget) {
+    for (const p of personas) {
+      if (hasProfileGroup(p.meta, cleanTarget)) {
+        initialChecked.add(p.avatarId);
+      }
+    }
+  } else if (mode === 'edit_character' && cleanTarget) {
+    const lowerChar = cleanTarget.toLowerCase();
+    for (const p of personas) {
+      if (p.meta.boundCharacters.some((c) => c.toLowerCase() === lowerChar)) {
+        initialChecked.add(p.avatarId);
+      }
+    }
+  }
+
+  const checkedSet = new Set(initialChecked);
+  let searchQuery = '';
+  let activeTab = 'all'; // 'all' | 'checked' | 'ungrouped' | 'fav'
+  let lastClickedId = '';
+  let lastVisibleIds = [];
+
+  let modal = document.querySelector('#st_pw_group_member_modal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'st_pw_group_member_modal';
+    modal.className = 'st-pw-modal-backdrop st-pw-group-picker-backdrop';
+    document.body.appendChild(modal);
+  }
+  bindModalBackdropEvents(modal);
+  modal.classList.remove('st-pw-hidden');
+
+  const isCreate = mode === 'create_group';
+  const isChar = mode === 'edit_character';
+  const headerTitle = isCreate
+    ? '新建分组并选择成员'
+    : isChar
+      ? `管理角色「${cleanTarget}」绑定的 User`
+      : `管理分组「${cleanTarget}」成员`;
+
+  const ungroupedTotal = personas.filter((p) => getProfileGroups(p.meta).length === 0).length;
+  const favTotal = personas.filter((p) => p.meta.favorite).length;
+
+  modal.innerHTML = `
+    <div class="st-pw-group-picker-dialog" role="dialog" aria-modal="true" aria-label="${escapeAttr(headerTitle)}">
+      <div class="st-pw-modal-header">
+        <div class="st-pw-header-left">
+          <span class="st-pw-modal-title">${sanitizeHtml(headerTitle)}</span>
+        </div>
+        <div class="st-pw-modal-header-actions">
+          <button type="button" class="menu_button st-pw-mini-btn st-pw-gp-close-btn" title="关闭"><i class="fa-solid fa-xmark"></i> 关闭</button>
+        </div>
+      </div>
+
+      <div class="st-pw-gp-controls">
+        ${
+          isCreate
+            ? `
+              <div class="st-pw-gp-name-wrap">
+                <label class="st-pw-gp-field-label" for="st_pw_gp_group_name">新分组名称</label>
+                <input type="text" id="st_pw_gp_group_name" class="text_pole st-pw-gp-name-input" placeholder="输入分组名称（如：古风、现代、无限流）…" autocomplete="off" />
+                <div class="st-pw-gp-name-err st-pw-hidden">请先填写分组名称</div>
+              </div>
+            `
+            : ''
+        }
+
+        <div class="st-pw-gp-search-row">
+          <div class="st-pw-gp-search-input-wrap">
+            <i class="fa-solid fa-magnifying-glass st-pw-gp-search-icon"></i>
+            <input type="text" id="st_pw_gp_search" class="text_pole st-pw-gp-search-input" placeholder="搜索 User 名称、分组、标签、世界书或角色…" autocomplete="off" />
+            <button type="button" class="st-pw-gp-search-clear st-pw-hidden" title="清空搜索">×</button>
+          </div>
+        </div>
+
+        <div class="st-pw-gp-toolbar-row">
+          <div class="st-pw-group-tabs st-pw-gp-tabs">
+            <button type="button" class="st-pw-filter-pill active" data-gp-tab="all">全部 (${personas.length})</button>
+            <button type="button" class="st-pw-filter-pill" data-gp-tab="checked">已选 (<span class="st-pw-gp-tab-checked-num">${checkedSet.size}</span>)</button>
+            <button type="button" class="st-pw-filter-pill" data-gp-tab="ungrouped">未分组 (${ungroupedTotal})</button>
+            ${favTotal > 0 ? `<button type="button" class="st-pw-filter-pill" data-gp-tab="fav">收藏 (${favTotal})</button>` : ''}
+          </div>
+          <div class="st-pw-gp-batch-btns">
+            <button type="button" class="menu_button st-pw-mini-btn st-pw-gp-select-visible">全选当前</button>
+            <button type="button" class="menu_button st-pw-mini-btn st-pw-gp-clear-visible">取消当前</button>
+          </div>
+        </div>
+
+        <div class="st-pw-gp-subhint">
+          ${
+            isChar
+              ? '默认多选：点击整行即可勾选/取消绑定到此角色（支持 Shift 连选）'
+              : '默认多选：点击整行即可勾选，同一个 User 可同时放进多个分组（不会从原分组移出）'
+          }
+        </div>
+      </div>
+
+      <div class="st-pw-gp-list"></div>
+
+      <div class="st-pw-gp-footer">
+        <span class="st-pw-gp-selected-summary">当前已勾选 <strong class="st-pw-gp-count-num">${checkedSet.size}</strong> 个 User</span>
+        <div class="st-pw-gp-footer-btns">
+          <button type="button" class="menu_button st-pw-gp-cancel-btn">取消</button>
+          <button type="button" class="menu_button st-pw-primary-btn st-pw-gp-confirm-btn"></button>
+        </div>
+      </div>
+    </div>
+  `;
+
+  const listEl = modal.querySelector('.st-pw-gp-list');
+  const nameInput = modal.querySelector('#st_pw_gp_group_name');
+  const nameErrEl = modal.querySelector('.st-pw-gp-name-err');
+  const searchInput = modal.querySelector('#st_pw_gp_search');
+  const searchClearBtn = modal.querySelector('.st-pw-gp-search-clear');
+  const confirmBtn = modal.querySelector('.st-pw-gp-confirm-btn');
+
+  function getFilteredPersonas() {
+    const q = searchQuery.trim().toLowerCase();
+    return personas.filter((p) => {
+      if (activeTab === 'checked' && !checkedSet.has(p.avatarId)) return false;
+      if (activeTab === 'ungrouped' && getProfileGroups(p.meta).length > 0) return false;
+      if (activeTab === 'fav' && !p.meta.favorite) return false;
+      return matchesSearch(p, q);
+    });
+  }
+
+  function syncCountsAndFooter() {
+    const count = checkedSet.size;
+    modal.querySelectorAll('.st-pw-gp-count-num, .st-pw-gp-tab-checked-num').forEach((el) => {
+      el.textContent = String(count);
+    });
+    modal.querySelectorAll('[data-gp-tab]').forEach((btn) => {
+      btn.classList.toggle('active', btn.getAttribute('data-gp-tab') === activeTab);
+    });
+    if (confirmBtn) {
+      if (isCreate) {
+        confirmBtn.innerHTML =
+          count > 0
+            ? `<i class="fa-solid fa-check"></i> 创建并加入 (${count})`
+            : `<i class="fa-solid fa-folder-plus"></i> 创建空分组`;
+      } else {
+        confirmBtn.innerHTML = `<i class="fa-solid fa-check"></i> 保存成员 (${count})`;
+      }
+    }
+  }
+
+  function renderListItems() {
+    const visible = getFilteredPersonas();
+    lastVisibleIds = visible.map((p) => p.avatarId);
+    syncCountsAndFooter();
+
+    if (visible.length === 0) {
+      listEl.innerHTML = `<div class="st-pw-empty-state">${
+        searchQuery.trim()
+          ? '没有匹配当前搜索词的 User，试试换个关键词'
+          : activeTab === 'checked'
+            ? '暂未勾选任何 User，切回「全部」点击任意行即可多选'
+            : '当前筛选下暂无 User'
+      }</div>`;
+      return;
+    }
+
+    listEl.innerHTML = visible
+      .map((p) => {
+        const checked = checkedSet.has(p.avatarId);
+        const fallbackAvatarUrl = resolvePersonaDirectAvatarUrl(p.avatarId);
+        const groups = getProfileGroups(p.meta);
+        const otherGroups =
+          mode === 'edit_group' && cleanTarget ? groups.filter((g) => g !== cleanTarget) : groups;
+        const shownGroups = otherGroups.slice(0, 2);
+        const restGroupCount = otherGroups.length - shownGroups.length;
+        const groupBadgesHtml =
+          shownGroups
+            .map(
+              (g) =>
+                `<span class="st-pw-tiny-tag">${mode === 'edit_group' ? `也在:${sanitizeHtml(g)}` : sanitizeHtml(g)}</span>`
+            )
+            .join('') +
+          (restGroupCount > 0
+            ? `<span class="st-pw-tiny-tag" title="${escapeAttr(otherGroups.join(' / '))}">+${restGroupCount}组</span>`
+            : '');
+
+        const charCount = p.meta.boundCharacters?.length || 0;
+        const subParts = [];
+        subParts.push(
+          p.lorebook
+            ? `<span class="st-pw-item-book">${sanitizeHtml(p.lorebook)}</span>`
+            : `<span class="st-pw-muted">未绑书</span>`
+        );
+        if (charCount > 0) {
+          subParts.push(
+            `<span>· 绑${charCount}卡${charCount === 1 ? `(${sanitizeHtml(p.meta.boundCharacters[0])})` : ''}</span>`
+          );
+        }
+        if (p.meta.tags?.length) {
+          subParts.push(`<span class="st-pw-muted">· #${sanitizeHtml(p.meta.tags.slice(0, 2).join(' #'))}</span>`);
+        }
+
+        return `
+          <div class="st-pw-gp-item ${checked ? 'is-checked' : ''}" data-avatar-id="${escapeAttr(p.avatarId)}">
+            <input type="checkbox" class="st-pw-gp-check" data-avatar-id="${escapeAttr(p.avatarId)}" ${checked ? 'checked' : ''} aria-label="勾选 ${escapeAttr(p.name)}" />
+            <img class="st-pw-item-avatar st-pw-gp-avatar b-loaded loaded" src="${escapeAttr(p.avatarUrl)}" data-real-src="${escapeAttr(p.avatarUrl)}" data-no-lazy="1" data-loaded="true" data-avatar-id="${escapeAttr(p.avatarId)}" data-fallback-src="${escapeAttr(fallbackAvatarUrl)}" decoding="async" alt="" />
+            <div class="st-pw-item-main">
+              <div class="st-pw-item-title-line">
+                <span class="st-pw-item-name">${sanitizeHtml(p.name)}</span>
+                ${p.isActive ? `<span class="st-pw-tiny-tag">当前</span>` : ''}
+                ${groupBadgesHtml}
+              </div>
+              <div class="st-pw-item-sub-line">
+                ${subParts.join(' ')}
+              </div>
+            </div>
+          </div>
+        `;
+      })
+      .join('');
+
+    bindAvatarErrorFallback(listEl);
+  }
+
+  function toggleOneInPlace(avatarId, nextState, shiftKey = false) {
+    if (!avatarId) return;
+    const shouldCheck = typeof nextState === 'boolean' ? nextState : !checkedSet.has(avatarId);
+
+    if (shiftKey && lastClickedId && lastClickedId !== avatarId) {
+      const idxA = lastVisibleIds.indexOf(lastClickedId);
+      const idxB = lastVisibleIds.indexOf(avatarId);
+      if (idxA !== -1 && idxB !== -1) {
+        const [start, end] = idxA < idxB ? [idxA, idxB] : [idxB, idxA];
+        for (let i = start; i <= end; i++) {
+          const rid = lastVisibleIds[i];
+          if (shouldCheck) checkedSet.add(rid);
+          else checkedSet.delete(rid);
+        }
+      } else {
+        if (shouldCheck) checkedSet.add(avatarId);
+        else checkedSet.delete(avatarId);
+      }
+    } else {
+      if (shouldCheck) checkedSet.add(avatarId);
+      else checkedSet.delete(avatarId);
+    }
+    lastClickedId = avatarId;
+
+    // 若当前在「已选」标签页取消勾选，重绘列表；否则原地更新 DOM 属性，0 滚动跳动
+    if (activeTab === 'checked' && !shouldCheck) {
+      const prevScroll = listEl.scrollTop;
+      renderListItems();
+      listEl.scrollTop = prevScroll;
+      return;
+    }
+
+    listEl.querySelectorAll('.st-pw-gp-item').forEach((row) => {
+      const rid = row.getAttribute('data-avatar-id');
+      const isChk = checkedSet.has(rid);
+      row.classList.toggle('is-checked', isChk);
+      const cb = row.querySelector('.st-pw-gp-check');
+      if (cb && cb.checked !== isChk) cb.checked = isChk;
+    });
+    syncCountsAndFooter();
+  }
+
+  const closeModal = () => {
+    modal.classList.add('st-pw-hidden');
+  };
+
+  modal.querySelector('.st-pw-gp-close-btn')?.addEventListener('click', closeModal);
+  modal.querySelector('.st-pw-gp-cancel-btn')?.addEventListener('click', closeModal);
+
+  nameInput?.addEventListener('input', () => {
+    nameErrEl?.classList.add('st-pw-hidden');
+    nameInput.classList.remove('st-pw-input-invalid');
+  });
+
+  nameInput?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (checkedSet.size === 0 && searchInput) {
+        searchInput.focus();
+      } else {
+        confirmBtn?.click();
+      }
+    }
+  });
+
+  let isComposing = false;
+  searchInput?.addEventListener('compositionstart', () => {
+    isComposing = true;
+  });
+  searchInput?.addEventListener('compositionend', (e) => {
+    isComposing = false;
+    searchQuery = e.target.value || '';
+    searchClearBtn?.classList.toggle('st-pw-hidden', !searchQuery);
+    listEl.scrollTop = 0;
+    renderListItems();
+  });
+  searchInput?.addEventListener('input', (e) => {
+    searchQuery = e.target.value || '';
+    searchClearBtn?.classList.toggle('st-pw-hidden', !searchQuery);
+    if (isComposing) return;
+    listEl.scrollTop = 0;
+    renderListItems();
+  });
+
+  searchClearBtn?.addEventListener('click', () => {
+    searchQuery = '';
+    if (searchInput) {
+      searchInput.value = '';
+      searchInput.focus();
+    }
+    searchClearBtn.classList.add('st-pw-hidden');
+    listEl.scrollTop = 0;
+    renderListItems();
+  });
+
+  modal.querySelectorAll('[data-gp-tab]').forEach((tabBtn) => {
+    tabBtn.addEventListener('click', () => {
+      const nextTab = tabBtn.getAttribute('data-gp-tab') || 'all';
+      if (activeTab === nextTab) return;
+      activeTab = nextTab;
+      listEl.scrollTop = 0;
+      renderListItems();
+    });
+  });
+
+  modal.querySelector('.st-pw-gp-select-visible')?.addEventListener('click', () => {
+    for (const id of lastVisibleIds) checkedSet.add(id);
+    listEl.querySelectorAll('.st-pw-gp-item').forEach((row) => {
+      row.classList.add('is-checked');
+      const cb = row.querySelector('.st-pw-gp-check');
+      if (cb) cb.checked = true;
+    });
+    syncCountsAndFooter();
+  });
+
+  modal.querySelector('.st-pw-gp-clear-visible')?.addEventListener('click', () => {
+    for (const id of lastVisibleIds) checkedSet.delete(id);
+    if (activeTab === 'checked') {
+      renderListItems();
+      return;
+    }
+    listEl.querySelectorAll('.st-pw-gp-item').forEach((row) => {
+      row.classList.remove('is-checked');
+      const cb = row.querySelector('.st-pw-gp-check');
+      if (cb) cb.checked = false;
+    });
+    syncCountsAndFooter();
+  });
+
+  listEl.addEventListener('click', (e) => {
+    const row = e.target.closest('.st-pw-gp-item');
+    if (!row) return;
+    const avatarId = row.getAttribute('data-avatar-id');
+    if (!avatarId) return;
+    if (e.target.classList.contains('st-pw-gp-check')) {
+      toggleOneInPlace(avatarId, e.target.checked, Boolean(e.shiftKey));
+    } else {
+      e.preventDefault();
+      toggleOneInPlace(avatarId, !checkedSet.has(avatarId), Boolean(e.shiftKey));
+    }
+  });
+
+  confirmBtn?.addEventListener('click', async () => {
+    if (isCreate) {
+      const rawName = String(nameInput?.value || '').trim();
+      if (!rawName) {
+        nameErrEl?.classList.remove('st-pw-hidden');
+        nameInput?.classList.add('st-pw-input-invalid');
+        nameInput?.focus();
+        globalThis.toastr?.warning?.('请先输入新分组名称');
+        return;
+      }
+      if (!settings.groups.includes(rawName)) {
+        settings.groups.push(rawName);
+      }
+      for (const id of checkedSet) {
+        addProfileToGroup(ensureProfileMeta(id), rawName);
+      }
+      state.batchAssignTarget = null;
+      state.collapsedSections.delete(`group:${rawName}`);
+      syncCollapsedSectionsToSettings();
+      invalidateRenderedHtmlCache();
+      saveSettings();
+      closeModal();
+      refreshAllViews();
+      onSaved?.(rawName, [...checkedSet]);
+      globalThis.toastr?.success?.(
+        checkedSet.size > 0
+          ? `已创建分组「${rawName}」并加入 ${checkedSet.size} 个 User`
+          : `已创建分组「${rawName}」`
+      );
+      return;
+    }
+
+    if (mode === 'edit_group' && cleanTarget) {
+      if (!settings.groups.includes(cleanTarget)) {
+        settings.groups.push(cleanTarget);
+      }
+      for (const p of personas) {
+        const meta = ensureProfileMeta(p.avatarId);
+        if (checkedSet.has(p.avatarId)) {
+          addProfileToGroup(meta, cleanTarget);
+        } else {
+          removeProfileFromGroup(meta, cleanTarget);
+        }
+      }
+      state.batchAssignTarget = null;
+      state.collapsedSections.delete(`group:${cleanTarget}`);
+      syncCollapsedSectionsToSettings();
+      invalidateRenderedHtmlCache();
+      saveSettings();
+      closeModal();
+      refreshAllViews();
+      onSaved?.(cleanTarget, [...checkedSet]);
+      globalThis.toastr?.success?.(`已更新分组「${cleanTarget}」成员（共 ${checkedSet.size} 人）`);
+      return;
+    }
+
+    if (isChar && cleanTarget) {
+      confirmBtn.disabled = true;
+      for (const p of personas) {
+        const wasIn = initialChecked.has(p.avatarId);
+        const nowIn = checkedSet.has(p.avatarId);
+        if (!wasIn && nowIn) {
+          await bindPersonaToCharacter(p.avatarId, cleanTarget, { skipRefresh: true });
+        } else if (wasIn && !nowIn) {
+          await unbindPersonaFromCharacter(p.avatarId, cleanTarget, { skipRefresh: true });
+        }
+      }
+      state.batchAssignTarget = null;
+      state.collapsedSections.delete(`char:${cleanTarget}`);
+      syncCollapsedSectionsToSettings();
+      invalidateRenderedHtmlCache();
+      saveSettings();
+      closeModal();
+      refreshAllViews();
+      onSaved?.(cleanTarget, [...checkedSet]);
+      globalThis.toastr?.success?.(`已更新角色「${cleanTarget}」绑定的 User（共 ${checkedSet.size} 人）`);
+    }
+  });
+
+  renderListItems();
+  requestAnimationFrame(() => {
+    if (isCreate && nameInput) {
+      nameInput.focus({ preventScroll: true });
+    } else if (searchInput) {
+      searchInput.focus({ preventScroll: true });
+    }
+  });
 }
 
 function renderRightBlockToggleHtml(blockId, titleText, summaryText = '') {
@@ -5728,18 +6341,9 @@ function renderSelectedPersonaDetail(persona, availableBooks, hostChars, current
             </button>
           </div>
           <div class="st-pw-detail-meta-inputs">
-            <select id="st_pw_detail_group" class="text_pole" title="所属自定义分组">
-              <option value="">自定义分组：无</option>
-              ${settings.groups
-                .map(
-                  (g) =>
-                    `<option value="${escapeAttr(g)}" ${meta.group === g ? 'selected' : ''}>分组：${sanitizeHtml(g)}</option>`
-                )
-                .join('')}
-              <option value="__new__">+ 新建自定义分组…</option>
-            </select>
             <input type="text" id="st_pw_detail_tags" class="text_pole" placeholder="标签 (逗号分隔)" value="${escapeAttr(meta.tags.join(', '))}" />
           </div>
+          ${renderCustomGroupChipsHtml(persona, settings)}
         </div>
         <div>
           ${
@@ -6128,54 +6732,43 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
     });
   });
 
-  // 从左上角下拉框选一个角色卡，开启批量勾选多个 User 绑到该角色下自动成组
+  // 从左上角下拉框选一个角色卡，弹出带搜索多选弹窗勾选多个 User 绑到该角色下自动成组
   modal
     .querySelector('#st_pw_create_char_group_select, #st_pw_inline_char_group_select')
     ?.addEventListener('change', (e) => {
       const charName = e.target.value;
+      e.target.value = '';
       if (!charName) return;
-      if (selectedPersona) {
-        bindPersonaToCharacter(selectedPersona.avatarId, charName);
-      }
-      state.batchAssignTarget = { type: 'character', name: charName };
-      state.collapsedSections.delete(`char:${charName}`);
-      syncCollapsedSectionsToSettings();
-      rerenderPanels();
+      openGroupMemberPickerModal({
+        mode: 'edit_character',
+        targetName: charName,
+        preselectedIds: selectedPersona ? [selectedPersona.avatarId] : [],
+      });
     });
 
-  // 点击某个角色组标题右侧的「+」批量勾选该角色下的多个 User
+  // 点击某个角色组标题右侧的「👤+」弹出带搜索多选弹窗管理该角色下的多个 User
   modal.querySelectorAll('.st-pw-open-batch-char').forEach((btn) => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       const charName = btn.getAttribute('data-char-name');
       if (!charName) return;
-      if (
-        state.batchAssignTarget?.type === 'character' &&
-        state.batchAssignTarget?.name === charName
-      ) {
-        state.batchAssignTarget = null;
-      } else {
-        state.batchAssignTarget = { type: 'character', name: charName };
-      }
-      rerenderPanels();
+      openGroupMemberPickerModal({
+        mode: 'edit_character',
+        targetName: charName,
+      });
     });
   });
 
-  // 点击某个自定义分组标题右侧的「+」批量勾选该组内的多个 User
+  // 点击某个自定义分组标题右侧的「👤+」弹出带搜索多选弹窗管理该组内的多个 User
   modal.querySelectorAll('.st-pw-open-batch-group').forEach((btn) => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       const groupName = btn.getAttribute('data-group-name');
       if (!groupName) return;
-      if (
-        state.batchAssignTarget?.type === 'group' &&
-        state.batchAssignTarget?.name === groupName
-      ) {
-        state.batchAssignTarget = null;
-      } else {
-        state.batchAssignTarget = { type: 'group', name: groupName };
-      }
-      rerenderPanels();
+      openGroupMemberPickerModal({
+        mode: 'edit_group',
+        targetName: groupName,
+      });
     });
   });
 
@@ -6186,7 +6779,7 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
     });
   });
 
-  // 批量勾选/取消勾选某个 User 到角色组或自定义组
+  // 兜底：内联批量勾选/取消勾选某个 User 到角色组或自定义组
   modal.querySelectorAll('.st-pw-batch-check').forEach((chk) => {
     chk.addEventListener('change', (e) => {
       const targetType = e.target.getAttribute('data-target-type');
@@ -6202,31 +6795,24 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
         }
       } else if (targetType === 'group') {
         const meta = ensureProfileMeta(avatarId);
-        meta.group = e.target.checked ? targetName : '';
+        if (e.target.checked) {
+          addProfileToGroup(meta, targetName);
+        } else {
+          removeProfileFromGroup(meta, targetName);
+        }
         saveSettings();
         rerenderPanels();
       }
     });
   });
 
-  // 新建自定义分组
+  // 新建自定义分组（直接打开带组名输入 + 实时搜索 + 默认多选 User 的建组弹窗）
   modal
     .querySelector('.st-pw-add-group-btn, .st-pw-inline-add-group-btn')
-    ?.addEventListener('click', async () => {
-      const newGroup = await promptUserText('新建自定义分组', '', {
-        placeholder: '输入新分组名称…',
+    ?.addEventListener('click', () => {
+      openGroupMemberPickerModal({
+        mode: 'create_group',
       });
-      if (newGroup && newGroup.trim()) {
-        const clean = newGroup.trim();
-        if (!settings.groups.includes(clean)) {
-          settings.groups.push(clean);
-          saveSettings();
-        }
-        state.batchAssignTarget = { type: 'group', name: clean };
-        state.collapsedSections.delete(`group:${clean}`);
-        syncCollapsedSectionsToSettings();
-        rerenderPanels();
-      }
     });
 
   // 自定义分组排序（置顶 / 上移 / 下移）
@@ -6241,7 +6827,7 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
     });
   });
 
-  // 重命名自定义分组
+  // 重命名自定义分组（完整同步所有 User 的多分组列表）
   modal.querySelectorAll('.st-pw-rename-group-btn').forEach((btn) => {
     btn.addEventListener('click', async (e) => {
       e.stopPropagation();
@@ -6251,19 +6837,30 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
       if (!nextName || !nextName.trim() || nextName.trim() === oldName) return;
       const clean = nextName.trim();
       const idx = settings.groups.indexOf(oldName);
-      if (idx !== -1) settings.groups[idx] = clean;
+      if (idx !== -1) {
+        settings.groups[idx] = clean;
+        settings.groups = [...new Set(settings.groups)];
+      }
       for (const prof of Object.values(settings.profiles)) {
-        if (prof && prof.group === oldName) prof.group = clean;
+        if (!prof) continue;
+        const curGroups = getProfileGroups(prof);
+        if (curGroups.includes(oldName)) {
+          setProfileGroups(
+            prof,
+            curGroups.map((g) => (g === oldName ? clean : g))
+          );
+        }
       }
       if (state.activeFilter === `group:${oldName}`) {
         state.activeFilter = `group:${clean}`;
       }
+      invalidateRenderedHtmlCache();
       saveSettings();
       rerenderPanels();
     });
   });
 
-  // 删除自定义分组
+  // 删除自定义分组（仅从各 User 的多分组列表中移除该组，保留其他所属分组）
   modal.querySelectorAll('.st-pw-delete-group-btn').forEach((btn) => {
     btn.addEventListener('click', async (e) => {
       e.stopPropagation();
@@ -6272,18 +6869,19 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
       if (
         !(await confirmUserAction(
           `删除自定义分组「${oldName}」`,
-          '组内 User 本身不会被删除，仅恢复为未分组。'
+          '组内 User 本身不会被删除，仅从该分组移出（其他所属分组不受影响）。'
         ))
       ) {
         return;
       }
       settings.groups = settings.groups.filter((g) => g !== oldName);
       for (const prof of Object.values(settings.profiles)) {
-        if (prof && prof.group === oldName) prof.group = '';
+        if (prof) removeProfileFromGroup(prof, oldName);
       }
       if (state.activeFilter === `group:${oldName}`) {
         state.activeFilter = 'all';
       }
+      invalidateRenderedHtmlCache();
       saveSettings();
       rerenderPanels();
     });
@@ -6526,23 +7124,54 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
 
   modal.querySelector('#st_pw_detail_group')?.addEventListener('change', async (e) => {
     const selectEl = e.target;
-    if (selectEl.value === '__new__') {
+    const rawVal = selectEl.value;
+    selectEl.value = '';
+    if (!rawVal) return;
+
+    if (rawVal === '__new__') {
       const newGroup = await promptUserText('新建自定义分组', '', {
         placeholder: '输入新分组名称…',
       });
-      if (newGroup && newGroup.trim()) {
-        const clean = newGroup.trim();
-        if (!settings.groups.includes(clean)) settings.groups.push(clean);
-        meta.group = clean;
-      } else {
-        selectEl.value = meta.group || '';
-        return;
-      }
+      if (!newGroup || !newGroup.trim()) return;
+      const clean = newGroup.trim();
+      if (!settings.groups.includes(clean)) settings.groups.push(clean);
+      addProfileToGroup(meta, clean);
+      state.collapsedSections.delete(`group:${clean}`);
+      syncCollapsedSectionsToSettings();
+    } else if (rawVal === '__clear_all__') {
+      setProfileGroups(meta, []);
     } else {
-      meta.group = selectEl.value;
+      const targetGroup = rawVal.replace(/^add:/, '').trim();
+      if (!targetGroup) return;
+      if (!settings.groups.includes(targetGroup)) settings.groups.push(targetGroup);
+      addProfileToGroup(meta, targetGroup);
     }
+    invalidateRenderedHtmlCache();
     saveSettings();
     rerenderPanels();
+  });
+
+  modal.querySelectorAll('.st-pw-group-chip-remove').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const gName = btn.getAttribute('data-group');
+      if (!gName) return;
+      removeProfileFromGroup(meta, gName);
+      invalidateRenderedHtmlCache();
+      saveSettings();
+      rerenderPanels();
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-group-chip-jump').forEach((el) => {
+    el.addEventListener('click', () => {
+      const gName = el.getAttribute('data-group');
+      if (!gName) return;
+      state.activeFilter = `group:${gName}`;
+      state.collapsedSections.delete(`group:${gName}`);
+      syncCollapsedSectionsToSettings();
+      rerenderPanels();
+    });
   });
 
   modal.querySelector('#st_pw_detail_tags')?.addEventListener('change', (e) => {
@@ -7045,7 +7674,9 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
   // 1.5) 绑定了 >= 3 个单人角色卡的通用人设聚合组（只展示 1 次，不再重复刷出几十个单人卡片组）
   if (state.activeFilter === 'all' && generalMultiBoundMap.size > 0) {
     const generalMembers = sortPersonasList(
-      [...generalMultiBoundMap.values()].filter((p) => !p.meta.group && matchesSearch(p, q)),
+      [...generalMultiBoundMap.values()].filter(
+        (p) => getProfileGroups(p.meta).length === 0 && matchesSearch(p, q)
+      ),
       sortBy
     );
     if (generalMembers.length > 0) {
@@ -7138,7 +7769,11 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
           !isCollapsed
             ? `<div class="st-pw-folder-body">${
                 visibleMembers.length
-                  ? visibleMembers.map((p) => renderPersonaRowHtml(p, selectedAvatarId)).join('')
+                  ? visibleMembers
+                      .map((p) =>
+                        renderPersonaRowHtml(p, selectedAvatarId, { currentGroupName: grp.name })
+                      )
+                      .join('')
                   : `<div class="st-pw-muted-hint">组内暂无 User，点右上角小人图标可批量勾选加入</div>`
               }</div>`
             : ''
@@ -7458,7 +8093,14 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
   const traitsCollapsed = isRightBlockCollapsed('right:traits');
   const enabledExtraCount = meta.extraWorldbooks.filter((b) => b.enabled).length;
   const enabledTraitCount = meta.traits.filter((t) => t.enabled).length;
-  const bindingSummary = `${meta.group ? `组:${meta.group}` : '未分组'} · 绑${meta.boundCharacters.length}卡`;
+  const assignedGroups = getProfileGroups(meta);
+  const groupSummary =
+    assignedGroups.length === 0
+      ? '未分组'
+      : assignedGroups.length === 1
+        ? `组:${assignedGroups[0]}`
+        : `${assignedGroups.length}组:${assignedGroups[0]}+`;
+  const bindingSummary = `${groupSummary} · 绑${meta.boundCharacters.length}卡`;
 
   const nextRightHtml = `
     <!-- 0. 使用足迹统计（聊过几个角色卡 · 几个聊天档 · 聊了多久） -->
@@ -7484,18 +8126,10 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
           ? ''
           : `
             <div class="st-pw-detail-meta-inputs">
-              <select id="st_pw_detail_group" class="text_pole" title="所属自定义分组">
-                <option value="">自定义分组：无</option>
-                ${settings.groups
-                  .map(
-                    (g) =>
-                      `<option value="${escapeAttr(g)}" ${meta.group === g ? 'selected' : ''}>分组：${sanitizeHtml(g)}</option>`
-                  )
-                  .join('')}
-                <option value="__new__">+ 新建自定义分组…</option>
-              </select>
               <input type="text" id="st_pw_detail_tags" class="text_pole" placeholder="标签 (逗号分隔)" value="${escapeAttr(meta.tags.join(', '))}" />
             </div>
+
+            ${renderCustomGroupChipsHtml(targetPersona, settings)}
 
             ${renderBoundCharacterChipsHtml(targetPersona, unboundHostChars, currentCharName)}
           `
@@ -7738,8 +8372,9 @@ function refreshAllViews() {
   const extraSummaryEl = document.querySelector('#st_pw_drawer_extra_summary');
 
   if (activeUserEl) {
+    const activeGroups = active ? getProfileGroups(active.meta) : [];
     activeUserEl.textContent = active
-      ? `${active.name}${active.meta.group ? ` (${active.meta.group})` : ''}`
+      ? `${active.name}${activeGroups.length ? ` (${activeGroups.join(' / ')})` : ''}`
       : '未检测到';
   }
   if (primaryBookEl) {
@@ -7779,7 +8414,7 @@ function renderPickerPersonaItemHtml(
       <div class="st-pw-item-main">
         <div class="st-pw-item-title-line">
           <span class="st-pw-item-name">${sanitizeHtml(p.name)}</span>
-          ${p.meta.group ? `<span class="st-pw-tiny-tag">${sanitizeHtml(p.meta.group)}</span>` : ''}
+          ${renderPersonaGroupTagsHtml(p.meta)}
           ${isHighlighted ? `<span class="st-pw-tiny-tag st-pw-used-tag" title="本聊天档内曾使用过此 User">本档曾用</span>` : ''}
           ${p.isActive ? `<span class="st-pw-tiny-tag">当前</span>` : ''}
         </div>
@@ -8004,7 +8639,7 @@ function mountWardrobePickerWidget(
           `);
         }
         const restList = sortPersonasList(
-          personas.filter((p) => !p.meta.group && !boundSet.has(p.avatarId)),
+          personas.filter((p) => getProfileGroups(p.meta).length === 0 && !boundSet.has(p.avatarId)),
           sortBy
         );
         if (restList.length > 0) {
@@ -9325,6 +9960,7 @@ export async function onDisable() {
     document.querySelector('#PersonaManagement .persona_management_left_column')
   );
   document.querySelector('#st_pw_inline_left_panel')?.remove();
+  document.querySelector('#st_pw_group_member_modal')?.remove();
   document.querySelector('#st_pw_chat_picker_modal')?.remove();
   document.querySelector('#st_pw_wardrobe_modal')?.remove();
   document.querySelector('#st_pw_wb_inspector_modal')?.remove();
