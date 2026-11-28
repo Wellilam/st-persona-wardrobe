@@ -1,10 +1,14 @@
 /**
- * Persona Wardrobe (st-persona-wardrobe) — User 人设与世界书总管
+ * st-persona-wardrobe — User 人设与世界书管理
  * Copyright (C) 2026 Wellilam
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 const MODULE_ID = 'st-persona-wardrobe';
 const EXTENSION_FOLDER = 'third-party/st-persona-wardrobe';
+const CURRENT_EXT_VERSION = '1.7.0';
+const UPDATE_CHECK_COOLDOWN_MS = 15 * 60 * 1000;
+const SESSION_UPDATE_TS_KEY = 'st_pw_last_update_check_ts';
+const SESSION_HAS_UPDATE_KEY = 'st_pw_update_available_cache';
 
 const LEGACY_PRESET_GROUPS = new Set([
   '现代都市',
@@ -26,6 +30,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   showTopbarButton: false,
   showWandButton: true,
   autoSwitchOnCharacterChat: true,
+  autoCheckUpdate: true,
   scanDepth: 5,
   sortBy: 'default', // 'default' | 'recent' | 'duration' | 'chats' | 'fav' | 'name'
   viewMode: 'standard', // 'standard' | 'compact' | 'grid'
@@ -87,6 +92,13 @@ const state = {
   worldbookCache: new Map(),
   lastPromptInjectedSummary: [],
   minimizedReturnPill: null,
+  updateAvailable: false,
+  updateDismissedThisSession: false,
+  updateScopeGlobal: false,
+  isCheckingUpdate: false,
+  isUpdatingExtension: false,
+  updateCheckTimerId: null,
+  hasShownAutoUpdateToast: false,
   hostPersonasModule: null,
   hostWorldInfoModule: null,
   hostPopupModule: null,
@@ -5535,7 +5547,29 @@ function renderLeftHeaderControlsHtml({
   const sortBy = settings.sortBy || 'default';
   const viewMode = settings.viewMode || 'standard';
 
+  const showUpdateBanner = state.updateAvailable && !state.updateDismissedThisSession;
+
   return `
+    ${
+      showUpdateBanner
+        ? `
+          <div class="st-pw-update-banner">
+            <span class="st-pw-update-banner-text">
+              <i class="fa-solid fa-bell"></i> 检测到 User 人设管理有新版本
+            </span>
+            <div class="st-pw-update-banner-actions">
+              <button type="button" class="menu_button st-pw-mini-btn st-pw-primary-btn st-pw-do-self-update-btn" ${state.isUpdatingExtension ? 'disabled' : ''}>
+                <i class="fa-solid fa-${state.isUpdatingExtension ? 'spinner fa-spin' : 'cloud-arrow-down'}"></i>
+                ${state.isUpdatingExtension ? '更新中…' : '一键更新'}
+              </button>
+              <button type="button" class="st-pw-icon-btn st-pw-dismiss-update-btn" title="本次会话隐藏此更新条">
+                <i class="fa-solid fa-xmark"></i>
+              </button>
+            </div>
+          </div>
+        `
+        : ''
+    }
     <div class="st-pw-inline-left-top">
       <input type="search" id="${escapeAttr(searchId)}" class="text_pole st-pw-sidebar-search" placeholder="搜索 User、分组、世界书…" value="${escapeAttr(state.searchQuery)}" />
       <button type="button" class="menu_button st-pw-mini-btn st-pw-toggle-multi-btn ${state.multiSelectMode ? 'is-active-mode' : ''}" title="开启多选模式，批量移入分组、绑卡、绑世界书、导出分享包或删除">
@@ -5580,6 +5614,9 @@ function renderLeftHeaderControlsHtml({
               </button>
               <button type="button" class="menu_button st-pw-mini-btn st-pw-sync-cloud-avatars-btn" title="一键唤醒原生人设池同步图床/云端/美化插件头像">
                 <i class="fa-solid fa-arrows-rotate"></i> 刷图
+              </button>
+              <button type="button" class="menu_button st-pw-mini-btn st-pw-manual-check-update-btn" ${state.isCheckingUpdate || state.isUpdatingExtension ? 'disabled' : ''} title="检查 GitHub 仓库是否有新版本可更新（当前 v${CURRENT_EXT_VERSION}）">
+                <i class="fa-solid fa-${state.isCheckingUpdate ? 'spinner fa-spin' : 'cloud-arrow-down'}"></i> ${state.isCheckingUpdate ? '检查中…' : `检查更新 (v${CURRENT_EXT_VERSION})`}
               </button>
               ${
                 isInline
@@ -7287,6 +7324,29 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
 
   modal.querySelector('.st-pw-close-wardrobe-btn')?.addEventListener('click', () => {
     modal.classList.add('st-pw-hidden');
+  });
+
+  modal.querySelectorAll('.st-pw-do-self-update-btn').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await performExtensionSelfUpdate();
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-dismiss-update-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      state.updateDismissedThisSession = true;
+      invalidateRenderedHtmlCache();
+      rerenderPanels();
+    });
+  });
+
+  modal.querySelectorAll('.st-pw-manual-check-update-btn').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await checkExtensionUpdateStatus({ manual: true });
+    });
   });
 
   modal.querySelector('.st-pw-refresh-host-btn')?.addEventListener('click', async () => {
@@ -9317,52 +9377,90 @@ function syncNativePersonaPanelEnhancement({ forceRight = false } = {}) {
 
 function syncQuickEntryButtons() {
   const settings = getSettings();
+  const hasUpdate = Boolean(state.updateAvailable && !state.updateDismissedThisSession);
 
-  const existingTopBtn = document.querySelector('#st_pw_topbar_btn');
+  let topBtn = document.querySelector('#st_pw_topbar_btn');
   if (!settings.showTopbarButton) {
-    existingTopBtn?.remove();
-  } else if (!existingTopBtn) {
+    topBtn?.remove();
+    topBtn = null;
+  } else if (!topBtn) {
     const topBarHolder =
       document.querySelector('#top-settings-holder') ||
       document.querySelector('#top-bar');
     if (topBarHolder) {
-      const btn = document.createElement('div');
-      btn.id = 'st_pw_topbar_btn';
-      btn.className = 'drawer st-pw-topbar-drawer';
-      btn.innerHTML = `
-        <div class="drawer-toggle">
+      topBtn = document.createElement('div');
+      topBtn.id = 'st_pw_topbar_btn';
+      topBtn.className = 'drawer st-pw-topbar-drawer';
+      topBtn.innerHTML = `
+        <div class="drawer-toggle st-pw-topbar-toggle-wrap">
           <div class="drawer-icon fa-solid fa-id-card-clip fa-fw closedIcon" title="User 人设管理"></div>
         </div>
       `;
-      btn.addEventListener('click', (e) => {
+      topBtn.addEventListener('click', (e) => {
         e.preventDefault();
         e.stopPropagation();
         openNativePersonaDrawer();
       });
-      topBarHolder.appendChild(btn);
+      topBarHolder.appendChild(topBtn);
+    }
+  }
+  if (topBtn) {
+    const toggleWrap = topBtn.querySelector('.drawer-toggle');
+    let dot = topBtn.querySelector('.st-pw-update-dot');
+    if (hasUpdate && toggleWrap && !dot) {
+      dot = document.createElement('span');
+      dot.className = 'st-pw-update-dot';
+      dot.title = 'User 人设管理有新版本可更新';
+      toggleWrap.appendChild(dot);
+    } else if (!hasUpdate && dot) {
+      dot.remove();
     }
   }
 
-  const existingWandBtn = document.querySelector('#st_pw_wand_btn');
+  let wandBtn = document.querySelector('#st_pw_wand_btn');
   if (!settings.showWandButton) {
-    existingWandBtn?.remove();
-  } else if (!existingWandBtn) {
+    wandBtn?.remove();
+    wandBtn = null;
+  } else if (!wandBtn) {
     const extMenu = document.querySelector('#extensionsMenu');
     if (extMenu) {
-      const item = document.createElement('div');
-      item.id = 'st_pw_wand_btn';
-      item.className = 'list-group-item flex-container flexGap5 interactable';
-      item.tabIndex = 0;
-      item.innerHTML = `
+      wandBtn = document.createElement('div');
+      wandBtn.id = 'st_pw_wand_btn';
+      wandBtn.className = 'list-group-item flex-container flexGap5 interactable';
+      wandBtn.tabIndex = 0;
+      wandBtn.innerHTML = `
         <div class="fa-solid fa-id-card-clip extensionsMenuExtensionButton"></div>
         <span>User 人设管理</span>
       `;
-      item.addEventListener('click', (e) => {
+      wandBtn.addEventListener('click', (e) => {
         e.preventDefault();
         openNativePersonaDrawer({ fromWandClick: true });
       });
-      extMenu.appendChild(item);
+      extMenu.appendChild(wandBtn);
     }
+  }
+  if (wandBtn) {
+    let badge = wandBtn.querySelector('.st-pw-wand-update-pill');
+    if (hasUpdate && !badge) {
+      badge = document.createElement('span');
+      badge.className = 'st-pw-tiny-tag st-pw-wand-update-pill';
+      badge.textContent = '有更新';
+      wandBtn.appendChild(badge);
+    } else if (!hasUpdate && badge) {
+      badge.remove();
+    }
+  }
+
+  const checkBtnInSettings = document.querySelector('#st_pw_check_update_btn');
+  if (checkBtnInSettings) {
+    checkBtnInSettings.disabled = Boolean(state.isCheckingUpdate || state.isUpdatingExtension);
+    checkBtnInSettings.textContent = state.isUpdatingExtension
+      ? '更新中…'
+      : state.isCheckingUpdate
+        ? '检查中…'
+        : state.updateAvailable
+          ? '✨ 一键更新新版本'
+          : `检查更新 (v${CURRENT_EXT_VERSION})`;
   }
 }
 
@@ -9878,7 +9976,7 @@ function mountWardrobePickerWidget(
                       : ''
                   }
                   <button type="button" class="menu_button st-pw-mini-btn st-pw-picker-open-wardrobe-btn">
-                    <i class="fa-solid fa-id-card-clip"></i> 打开衣柜管理
+                    <i class="fa-solid fa-id-card-clip"></i> 打开人设管理
                   </button>
                   <button type="button" class="menu_button st-pw-mini-btn st-pw-primary-btn st-pw-picker-keep-btn">
                     保持当前 (${sanitizeHtml(activePersona?.name || '不切换')})
@@ -10365,16 +10463,16 @@ function enhanceNewChatConfirmDialog(dlg) {
             <div class="st-pw-newchat-sub">
               ${
                 !chosenAvatarId && boundCount >= 2
-                  ? `该角色绑有 ${boundCount} 套人设（点确定后将弹出衣柜选择，也可在此提前选定）`
+                  ? `该角色绑有 ${boundCount} 套人设（点确定后将弹出人设选择，也可在此提前选定）`
                   : displayPersona?.lorebook
                     ? `主世界书：${sanitizeHtml(displayPersona.lorebook)}`
-                    : '可点右侧从衣柜分组切换新档人设'
+                    : '可点右侧按分组切换新档人设'
               }
             </div>
           </div>
         </div>
         <button type="button" class="menu_button st-pw-mini-btn st-pw-newchat-toggle-btn">
-          <i class="fa-solid fa-id-card-clip"></i> ${isExpanded ? '收起列表 ▴' : '从衣柜选人设 ▾'}
+          <i class="fa-solid fa-id-card-clip"></i> ${isExpanded ? '收起列表 ▴' : '按分组选人设 ▾'}
         </button>
       </div>
       ${isExpanded ? `<div class="st-pw-newchat-picker-mount"></div>` : ''}
@@ -10646,6 +10744,15 @@ async function mountSettingsPanel() {
   bindCheckbox('#st_pw_show_topbar', 'showTopbarButton', syncQuickEntryButtons);
   bindCheckbox('#st_pw_show_wand', 'showWandButton', syncQuickEntryButtons);
   bindCheckbox('#st_pw_auto_switch_char', 'autoSwitchOnCharacterChat');
+  bindCheckbox('#st_pw_auto_check_update', 'autoCheckUpdate');
+
+  document.querySelector('#st_pw_check_update_btn')?.addEventListener('click', async () => {
+    if (state.updateAvailable) {
+      await performExtensionSelfUpdate();
+    } else {
+      await checkExtensionUpdateStatus({ manual: true });
+    }
+  });
 
   const scanInput = document.querySelector('#st_pw_scan_depth');
   if (scanInput) {
@@ -10777,11 +10884,238 @@ function ensureStylesheetCacheBusted(versionStr) {
   } catch (_e) {}
 }
 
+/**
+ * 查询本扩展在当前酒馆中的安装作用域（local 用户目录 / global 全局目录），
+ * 仅调用宿主同源接口 /api/extensions/discover
+ */
+async function resolveExtensionInstallScope() {
+  try {
+    const context = getContext();
+    const headers =
+      typeof context.getRequestHeaders === 'function' ? context.getRequestHeaders() : {};
+    const res = await fetch('/api/extensions/discover', { method: 'GET', headers });
+    if (!res.ok) return { found: false, isGlobal: false };
+    const list = await res.json();
+    if (!Array.isArray(list)) return { found: false, isGlobal: false };
+    const matched = list.find(
+      (item) =>
+        item?.name === EXTENSION_FOLDER || String(item?.name || '').endsWith(`/${MODULE_ID}`)
+    );
+    return {
+      found: Boolean(matched),
+      isGlobal: matched?.type === 'global',
+    };
+  } catch (_e) {
+    return { found: false, isGlobal: false };
+  }
+}
+
+/**
+ * 通过宿主内置同源接口 /api/extensions/version 检查 Git 仓库是否有新版本可更新
+ * - 零浏览器端外部请求，完全复用酒馆自身扩展版本检查能力
+ * - 启动自动检测带 15 分钟会话冷却且静默容错（断网绝不报错打扰）
+ */
+async function checkExtensionUpdateStatus({ manual = false } = {}) {
+  if (state.isCheckingUpdate || state.isUpdatingExtension) return false;
+
+  if (!manual) {
+    if (!getSettings().autoCheckUpdate) return false;
+    try {
+      if (globalThis.sessionStorage?.getItem(SESSION_HAS_UPDATE_KEY) === '1') {
+        state.updateAvailable = true;
+        invalidateRenderedHtmlCache();
+        refreshAllViews();
+      }
+      const lastTs = Number(globalThis.sessionStorage?.getItem(SESSION_UPDATE_TS_KEY) || 0);
+      if (lastTs > 0 && Date.now() - lastTs < UPDATE_CHECK_COOLDOWN_MS) {
+        return state.updateAvailable;
+      }
+    } catch (_e) {}
+  }
+
+  state.isCheckingUpdate = true;
+  if (manual) {
+    invalidateRenderedHtmlCache();
+    refreshAllViews();
+  }
+
+  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timeoutId = ctrl ? setTimeout(() => ctrl.abort(), 12_000) : null;
+
+  try {
+    const scope = await resolveExtensionInstallScope();
+    state.updateScopeGlobal = scope.isGlobal;
+
+    const context = getContext();
+    const headers =
+      typeof context.getRequestHeaders === 'function'
+        ? context.getRequestHeaders()
+        : { 'Content-Type': 'application/json' };
+
+    const res = await fetch('/api/extensions/version', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        extensionName: MODULE_ID,
+        global: scope.isGlobal,
+      }),
+      ...(ctrl ? { signal: ctrl.signal } : {}),
+    });
+
+    if (!res.ok) {
+      if (manual) {
+        globalThis.toastr?.warning?.('无法连接更新检查接口，请确认酒馆网络通畅或在扩展管理中查看');
+      }
+      return false;
+    }
+
+    const data = await res.json();
+    try {
+      globalThis.sessionStorage?.setItem(SESSION_UPDATE_TS_KEY, String(Date.now()));
+    } catch (_e) {}
+
+    if (!data?.remoteUrl) {
+      state.updateAvailable = false;
+      try {
+        globalThis.sessionStorage?.removeItem(SESSION_HAS_UPDATE_KEY);
+      } catch (_e) {}
+      if (manual) {
+        globalThis.toastr?.info?.(
+          '当前为本地文件夹拷贝安装（未绑定 Git 仓库），如需在线一键更新建议通过仓库链接安装'
+        );
+      }
+      return false;
+    }
+
+    if (data.isUpToDate === false) {
+      state.updateAvailable = true;
+      if (manual) {
+        state.updateDismissedThisSession = false;
+      }
+      try {
+        globalThis.sessionStorage?.setItem(SESSION_HAS_UPDATE_KEY, '1');
+      } catch (_e) {}
+
+      if (manual || !state.hasShownAutoUpdateToast) {
+        state.hasShownAutoUpdateToast = true;
+        globalThis.toastr?.info?.(
+          '检测到新版本可更新！打开人设栏点顶部「一键更新」即可直接升级。',
+          'User 人设管理 · 发现新版本 ✨',
+          {
+            timeOut: 8500,
+            onclick: () => {
+              openNativePersonaDrawer();
+            },
+          }
+        );
+      }
+      return true;
+    }
+
+    state.updateAvailable = false;
+    try {
+      globalThis.sessionStorage?.removeItem(SESSION_HAS_UPDATE_KEY);
+    } catch (_e) {}
+    if (manual) {
+      const hashShort = data.currentCommitHash
+        ? ` · ${String(data.currentCommitHash).slice(0, 7)}`
+        : '';
+      globalThis.toastr?.success?.(`当前已是最新版本 (v${CURRENT_EXT_VERSION}${hashShort})`);
+    }
+    return false;
+  } catch (_err) {
+    if (manual) {
+      globalThis.toastr?.warning?.('检查更新超时，请稍后再试或前往扩展管理手动更新');
+    }
+    return false;
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+    state.isCheckingUpdate = false;
+    invalidateRenderedHtmlCache();
+    refreshAllViews();
+  }
+}
+
+/**
+ * 调用宿主内置同源接口 /api/extensions/update 原位拉取最新代码并主动刷新浏览器 JS/CSS 缓存
+ */
+async function performExtensionSelfUpdate() {
+  if (state.isUpdatingExtension) return false;
+  state.isUpdatingExtension = true;
+  invalidateRenderedHtmlCache();
+  refreshAllViews();
+
+  try {
+    const scope = await resolveExtensionInstallScope();
+    const context = getContext();
+    const headers =
+      typeof context.getRequestHeaders === 'function'
+        ? context.getRequestHeaders()
+        : { 'Content-Type': 'application/json' };
+
+    const res = await fetch('/api/extensions/update', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        extensionName: MODULE_ID,
+        global: scope.isGlobal,
+      }),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      globalThis.toastr?.error?.(
+        `自动更新未完成：${errText || res.statusText}（可前往酒馆扩展管理中手动更新）`
+      );
+      return false;
+    }
+
+    state.updateAvailable = false;
+    state.updateDismissedThisSession = false;
+    try {
+      globalThis.sessionStorage?.removeItem(SESSION_HAS_UPDATE_KEY);
+      globalThis.sessionStorage?.setItem(SESSION_UPDATE_TS_KEY, String(Date.now()));
+    } catch (_e) {}
+
+    // 主动破除移动端浏览器对旧版 index.js / style.css / manifest.json 的缓存
+    await Promise.all(
+      ['index.js', 'style.css', 'manifest.json'].map((f) =>
+        fetch(`/scripts/extensions/${EXTENSION_FOLDER}/${f}`, { cache: 'reload' }).catch(() => {})
+      )
+    );
+
+    state.isUpdatingExtension = false;
+    invalidateRenderedHtmlCache();
+    refreshAllViews();
+
+    const shouldReload = await confirmUserAction(
+      '更新已完成 ✨',
+      'User 人设管理已拉取最新版本并刷新缓存！现在立即重新加载页面使新功能生效吗？'
+    );
+    if (shouldReload) {
+      saveSettings();
+      location.reload();
+    } else {
+      globalThis.toastr?.success?.('更新已完成，下次刷新页面后生效');
+    }
+    return true;
+  } catch (err) {
+    globalThis.toastr?.error?.(`更新失败：${err?.message || err}`);
+    return false;
+  } finally {
+    if (state.isUpdatingExtension) {
+      state.isUpdatingExtension = false;
+      invalidateRenderedHtmlCache();
+      refreshAllViews();
+    }
+  }
+}
+
 async function initExtension() {
   if (state.initialized) return;
   state.initialized = true;
 
-  ensureStylesheetCacheBusted('1.4.0');
+  ensureStylesheetCacheBusted(CURRENT_EXT_VERSION);
   await waitForTauriTavernReady();
   await probeHostModules();
   await refreshDiskAvatarSet();
@@ -10796,6 +11130,12 @@ async function initExtension() {
   recordCurrentOpenChatStats();
   refreshAllViews();
   scheduleAutoHistoricalStatsBackfill(450);
+
+  if (state.updateCheckTimerId) clearTimeout(state.updateCheckTimerId);
+  state.updateCheckTimerId = setTimeout(() => {
+    state.updateCheckTimerId = null;
+    checkExtensionUpdateStatus({ manual: false }).catch(() => {});
+  }, 3200);
 
   const onGlobalKeydown = (e) => {
     state.lastUserInteractionAt = Date.now();
@@ -11026,6 +11366,10 @@ export async function onActivate() {
 }
 
 export async function onDisable() {
+  if (state.updateCheckTimerId) {
+    clearTimeout(state.updateCheckTimerId);
+    state.updateCheckTimerId = null;
+  }
   if (state.harvestTimerId) {
     clearTimeout(state.harvestTimerId);
     state.harvestTimerId = null;

@@ -57,6 +57,10 @@
                     <input id="st_pw_auto_switch_char" type="checkbox" />
                     <span>切角色聊天时提醒关联 User</span>
                 </label>
+                <label class="checkbox_label" for="st_pw_auto_check_update">
+                    <input id="st_pw_auto_check_update" type="checkbox" />
+                    <span>启动时自动检查扩展更新并提醒</span>
+                </label>
                 <div class="st-pw-drawer-inline-field">
                     <label for="st_pw_scan_depth">关键词扫描最近消息数</label>
                     <input id="st_pw_scan_depth" class="text_pole st-pw-small-input" type="number" min="1" max="50" value="5" />
@@ -68,6 +72,7 @@
             <div class="st-pw-drawer-footer-btns">
                 <button id="st_pw_export_btn" class="menu_button" type="button">导出配置</button>
                 <button id="st_pw_import_btn" class="menu_button" type="button">导入配置</button>
+                <button id="st_pw_check_update_btn" class="menu_button" type="button">检查更新</button>
                 <input id="st_pw_import_file" type="file" accept=".json" style="display:none;" />
             </div>
         </div>

@@ -1,11 +1,11 @@
 {
-  "display_name": "Persona Wardrobe (User 人设与世界书总管)",
+  "display_name": "User 人设与世界书管理",
   "loading_order": 50,
   "dependencies": [],
   "js": "index.js",
   "css": "style.css",
   "author": "Wellilam",
-  "version": "1.6.1",
+  "version": "1.7.0",
   "homePage": "https://github.com/Wellilam/st-persona-wardrobe",
   "auto_update": true,
   "minimum_client_version": "1.14.0",
