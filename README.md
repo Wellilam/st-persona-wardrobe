@@ -1,5 +1,9 @@
 # Persona Wardrobe (User 人设与世界书总管)
 
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](./LICENSE)
+![Type: UI Extension](https://img.shields.io/badge/SillyTavern-UI_Extension_(纯前端)-success)
+![AI-Assisted](https://img.shields.io/badge/AI--Assisted-人工审查与多端实测-6366f1)
+
 专为 **SillyTavern**、**Luker** 与 **TauriTavern (TRT)** 全端（桌面端 & Android / iOS / HarmonyOS 移动端）设计的 User 人设（Persona）分类管理、状态快照与关联世界书增强扩展。
 
 原位接管酒馆顶栏原生人设抽屉（`#PersonaManagement`），并保留一键切换原生平铺列表与独立双栏总管窗口。
@@ -56,6 +60,29 @@
 
 ---
 
-## 权限与安全边界说明
-- 纯前端 UI Extension，不包含 Server Plugin，不向任何外部服务器发送请求。
-- 禁用扩展（`onDisable`）时自动卸载全部事件监听、安卓返回桥接与注入 DOM，零残留。
+## 权限、数据读写与提示词注入边界
+
+本扩展为**纯浏览器端 UI Extension**，明文源码无混淆，不包含也不依赖任何 Node.js 后端插件（`Server Plugin`）。具体运行边界如下：
+
+| 维度 | 实际行为与边界说明 |
+|---|---|
+| **网络请求范围** | **零外部联网、零遥测上报**。仅调用当前酒馆实例自身的同源接口：`/api/avatars/*`（读取/上传/删除头像）、`/api/worldinfo/*`（读取/保存世界书条目）、`/api/characters/*` 与 `/api/chats/*`（仅在你主动点击「扫描历史档」时本地统计使用足迹）。唯一会请求非 `/api/` 地址的场景是你的人设本身使用了外部图床 URL 且主动点击「导出分享包」打包该头像图片。 |
+| **配置与数据存储** | 分组、标签、随身设定、状态快照与统计缓存统一保存在宿主 `extension_settings['st-persona-wardrobe']` 中；修改人设名称、描述、主世界书或角色连线时，按宿主标准机制同步至 `power_user.personas` / `persona_descriptions`（在 Luker 下同步兼容角色卡 `dedicated_personas`）。**绝不触碰 API Key、Cookie 或其他敏感凭证。** |
+| **世界书与人设安全** | **绝不静默删除或覆盖你原有的原生人设与世界书**。编辑世界书条目采用「先读取最新整书数据 → 仅更新目标条目 → 写回」机制；导入分享包附带世界书时，仅在本地不存在同名世界书时补齐，绝不覆盖本地同名书；删除人设需经二次确认，且自动保护当前使用中与系统默认人设。 |
+| **第三方图床只读兼容** | 为显示第三方美化/图床扩展绑定的云端头像，会只读匹配宿主 `extension_settings` 与浏览器 `localStorage` 中含 `avatar/persona/图床` 字样键名下的图片链接，**只读不写，绝不修改其他扩展数据**。 |
+| **提示词注入拦截** | 注册了 `generate_interceptor`（`PersonaWardrobe_interceptGeneration`）：**仅当当前生效人设启用了「附加世界书」或「随身设定」且命中条件时**，才向本轮对话上下文插入对应设定片段（自动跳过 `quiet` 后台生成）。未使用附加书/随身设定时零额外注入。 |
+| **禁用、清理与卸载** | 实现了 `onActivate` / `onDisable` / `onClean` 钩子：在扩展管理中**禁用**时，立即移除全部注入 DOM、事件监听、返回手势与生成拦截，恢复原生界面（默认保留已建分组配置）；点击卸载删除扩展目录不会删除你原有的酒馆原生人设与世界书。`manifest.json` 中的 `auto_update: true` 仅遵循酒馆标准扩展更新机制，不会在后台私自拉取执行外部脚本。 |
+
+---
+
+## 开源协议与社区声明
+
+- **开源协议**：本项目基于 **[GNU Affero General Public License v3.0 (AGPL-3.0)](./LICENSE)** 开源（`Copyright (C) 2026 Wellilam`），与 SillyTavern 官方协议保持一致。任何基于本项目的修改、二次分发或通过网络服务部署（如商业/公共云酒馆集成），均须保留原作者版权声明并以相同 `AGPL-3.0` 协议完整公开修改后的源代码。
+- **社区非商用声明**：本插件面向酒馆玩家社区**完全免费开源分享**，严禁任何个人或店铺将其用于闲鱼/淘宝付费倒卖、加密套壳、卡密授权或捆绑商业引流。搬运或二创请保留原仓库链接与作者署名。
+- **AI 辅助开发声明**：本项目在代码编写、跨宿主兼容调试与文档整理过程中使用了 AI 编程工具辅助，所有功能设计、权限边界审查及 SillyTavern / Luker / TauriTavern 三端实机测试均由作者本人把关核验。
+
+---
+
+## 反馈与交流
+
+如在使用中遇到特定酒馆版本、移动端浏览器或第三方主题兼容问题，欢迎提交 [GitHub Issue](https://github.com/Wellilam/st-persona-wardrobe/issues) 或在社区发布帖下留言反馈。

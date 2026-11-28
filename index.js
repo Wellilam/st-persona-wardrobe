@@ -1,3 +1,8 @@
+/**
+ * Persona Wardrobe (st-persona-wardrobe) — User 人设与世界书总管
+ * Copyright (C) 2026 Wellilam
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ */
 const MODULE_ID = 'st-persona-wardrobe';
 const EXTENSION_FOLDER = 'third-party/st-persona-wardrobe';
 
