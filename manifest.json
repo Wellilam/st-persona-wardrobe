@@ -5,7 +5,7 @@
   "js": "index.js",
   "css": "style.css",
   "author": "Wellilam",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "homePage": "https://github.com/Wellilam/st-persona-wardrobe",
   "auto_update": true,
   "minimum_client_version": "1.14.0",

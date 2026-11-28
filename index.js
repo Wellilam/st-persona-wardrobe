@@ -496,6 +496,68 @@ function getExistingParentCategoryNames(settings) {
   return out;
 }
 
+/**
+ * 批量重写自定义分组路径（支持单组改名/加减上级大类、大类改名及多组并入/移出大类）
+ * - 保留 settings.groups 既有顺序并自动去重
+ * - 完整同步所有 User 的多分组列表（若目标分组已存在则无损合并成员）
+ */
+function applyGroupPathRenames(renameMap) {
+  if (!(renameMap instanceof Map) || renameMap.size === 0) return false;
+  const settings = getSettings();
+  const mapOne = (g) => (renameMap.has(g) ? renameMap.get(g) : g);
+
+  const nextGroups = [];
+  const seenGroups = new Set();
+  for (const g of settings.groups || []) {
+    const mapped = normalizeSingleGroupPath(mapOne(g));
+    if (mapped && !seenGroups.has(mapped)) {
+      seenGroups.add(mapped);
+      nextGroups.push(mapped);
+    }
+  }
+  for (const newVal of renameMap.values()) {
+    const mapped = normalizeSingleGroupPath(newVal);
+    if (mapped && !seenGroups.has(mapped)) {
+      seenGroups.add(mapped);
+      nextGroups.push(mapped);
+    }
+  }
+  settings.groups = nextGroups;
+
+  for (const prof of Object.values(settings.profiles || {})) {
+    if (!prof || typeof prof !== 'object') continue;
+    const curGroups = getProfileGroups(prof);
+    if (curGroups.some((g) => renameMap.has(g))) {
+      setProfileGroups(prof, curGroups.map(mapOne));
+    }
+  }
+
+  if (state.activeFilter.startsWith('group:')) {
+    const curGrp = state.activeFilter.slice('group:'.length);
+    if (renameMap.has(curGrp)) {
+      const nextGrp = normalizeSingleGroupPath(renameMap.get(curGrp));
+      const spOld = splitGroupPath(curGrp);
+      const spNext = splitGroupPath(nextGrp);
+      if (!spOld.isSubgroup && spNext.isSubgroup) {
+        state.activeFilter = `gparent:${spNext.parent}`;
+      } else if (nextGrp) {
+        state.activeFilter = `group:${nextGrp}`;
+      }
+    }
+  }
+
+  for (const newVal of renameMap.values()) {
+    const sp = splitGroupPath(newVal);
+    if (sp.isSubgroup) {
+      state.collapsedSections.delete(`gparent:${sp.parent}`);
+    }
+    if (sp.fullName) {
+      state.collapsedSections.delete(`group:${sp.fullName}`);
+    }
+  }
+  return true;
+}
+
 function normalizeGroupList(rawGroups, legacyGroup = '') {
   const out = [];
   const seen = new Set();
@@ -5816,35 +5878,71 @@ function renderCustomGroupChipsHtml(persona, settings) {
 }
 
 /**
- * 打开「新建分组 & 带搜索多选管理组员」统一弹窗
+ * 打开「新建/编辑分组 & 带搜索多选管理组员」统一弹窗
+ * - 支持新建分组、编辑已有分组（调整/新建上级大类 + 改名）、编辑分组与成员、管理角色绑定人设
  * - 默认开启多选，点击整行即可勾选/取消（支持 Shift 连选），绝不跳滚动条
  * - 支持实时搜索（不打断中文输入法）与「全部 / 已勾选 / 未分组 / 收藏」筛选
  * - 支持同一个 User 同时放入多个自定义分组（不会踢出原分组）
  */
 function openGroupMemberPickerModal({
-  mode = 'create_group', // 'create_group' | 'edit_group' | 'edit_character'
+  mode = 'create_group', // 'create_group' | 'edit_group' | 'edit_group_meta' | 'edit_character'
   targetName = '',
   presetParent = '',
   preselectedIds = [],
+  draftParent = undefined,
+  draftCustomParent = '',
+  draftGroupName = undefined,
   onSaved = null,
 } = {}) {
   const settings = getSettings();
   const personas = sortPersonasList(getHostPersonas(), settings.sortBy || 'default');
   const cleanTarget = String(targetName || '').trim();
   const cleanPresetParent = String(presetParent || '').split('/')[0].trim();
-  const existingParents = getExistingParentCategoryNames(settings);
+
+  const isCreate = mode === 'create_group';
+  const isEditGroup = mode === 'edit_group';
+  const isMetaOnly = mode === 'edit_group_meta';
+  const isChar = mode === 'edit_character';
+  const hasGroupMetaFields = isCreate || isEditGroup || isMetaOnly;
+
+  const spOld = splitGroupPath(cleanTarget);
+  const rawExistingParents = getExistingParentCategoryNames(settings);
+  const existingParents = rawExistingParents.filter((pName) =>
+    isCreate ? true : spOld.isSubgroup || pName !== cleanTarget
+  );
   if (cleanPresetParent && !existingParents.includes(cleanPresetParent)) {
     existingParents.unshift(cleanPresetParent);
   }
+  if (spOld.isSubgroup && spOld.parent && !existingParents.includes(spOld.parent)) {
+    existingParents.unshift(spOld.parent);
+  }
+
+  const initialParent =
+    draftParent !== undefined
+      ? String(draftParent)
+      : isCreate
+        ? cleanPresetParent
+        : spOld.isSubgroup
+          ? spOld.parent
+          : '';
+  const initialCustomParent = String(draftCustomParent || '');
+  const initialGroupName =
+    draftGroupName !== undefined
+      ? String(draftGroupName)
+      : isCreate
+        ? ''
+        : spOld.isSubgroup
+          ? spOld.child
+          : spOld.fullName;
 
   const initialChecked = new Set(preselectedIds.filter(Boolean));
-  if (mode === 'edit_group' && cleanTarget) {
+  if ((isEditGroup || isMetaOnly) && cleanTarget) {
     for (const p of personas) {
       if (hasProfileGroup(p.meta, cleanTarget)) {
         initialChecked.add(p.avatarId);
       }
     }
-  } else if (mode === 'edit_character' && cleanTarget) {
+  } else if (isChar && cleanTarget) {
     const lowerChar = cleanTarget.toLowerCase();
     for (const p of personas) {
       if (p.meta.boundCharacters.some((c) => c.toLowerCase() === lowerChar)) {
@@ -5869,19 +5967,24 @@ function openGroupMemberPickerModal({
   bindModalBackdropEvents(modal);
   modal.classList.remove('st-pw-hidden');
 
-  const isCreate = mode === 'create_group';
-  const isChar = mode === 'edit_character';
   const headerTitle = isCreate
     ? '新建分组并选择成员'
-    : isChar
-      ? `管理角色「${cleanTarget}」绑定的 User`
-      : `管理分组「${cleanTarget}」成员`;
+    : isMetaOnly
+      ? `编辑分组「${cleanTarget}」`
+      : isChar
+        ? `管理角色「${cleanTarget}」绑定的 User`
+        : `编辑分组「${cleanTarget}」与成员`;
 
   const ungroupedTotal = personas.filter((p) => getProfileGroups(p.meta).length === 0).length;
   const favTotal = personas.filter((p) => p.meta.favorite).length;
+  const isCustomParentSelected = initialParent === '__custom_parent__';
+  const noneParentLabel =
+    !isCreate && spOld.isSubgroup
+      ? `上级大类：无（移出「${sanitizeHtml(spOld.parent)}」，恢复为一级分组）`
+      : '上级大类：无（作为一级独立分组）';
 
   modal.innerHTML = `
-    <div class="st-pw-group-picker-dialog" role="dialog" aria-modal="true" aria-label="${escapeAttr(headerTitle)}">
+    <div class="st-pw-group-picker-dialog ${isMetaOnly ? 'st-pw-gp-meta-only-dialog' : ''}" role="dialog" aria-modal="true" aria-label="${escapeAttr(headerTitle)}">
       <div class="st-pw-modal-header">
         <div class="st-pw-header-left">
           <span class="st-pw-modal-title">${sanitizeHtml(headerTitle)}</span>
@@ -5893,63 +5996,85 @@ function openGroupMemberPickerModal({
 
       <div class="st-pw-gp-controls">
         ${
-          isCreate
+          hasGroupMetaFields
             ? `
               <div class="st-pw-gp-name-wrap">
+                <div class="st-pw-gp-field-head">
+                  <span class="st-pw-gp-field-label">所属上级大类</span>
+                  <button type="button" class="st-pw-link-btn st-pw-gp-quick-new-parent" title="创建一个新的上级大类文件夹并将当前分组放进去">+ 新建大类</button>
+                </div>
                 <div class="st-pw-gp-parent-row">
-                  <select id="st_pw_gp_parent_select" class="text_pole st-pw-gp-parent-select" title="可选：选择上级大类文件夹形成两级嵌套">
-                    <option value="">上级大类：无（直接作为一级分组）</option>
+                  <select id="st_pw_gp_parent_select" class="text_pole st-pw-gp-parent-select" title="选择已有上级大类、新建上级大类，或设为一级独立分组">
+                    <option value="" ${!initialParent ? 'selected' : ''}>${noneParentLabel}</option>
                     ${existingParents
                       .map(
                         (pName) =>
-                          `<option value="${escapeAttr(pName)}" ${cleanPresetParent === pName ? 'selected' : ''}>📁 归入大类：${sanitizeHtml(pName)}</option>`
+                          `<option value="${escapeAttr(pName)}" ${initialParent === pName ? 'selected' : ''}>📁 归入大类：${sanitizeHtml(pName)}</option>`
                       )
                       .join('')}
-                    <option value="__custom_parent__">+ 新建上级大类…</option>
+                    <option value="__custom_parent__" ${isCustomParentSelected ? 'selected' : ''}>+ 新建上级大类…</option>
                   </select>
-                  <input type="text" id="st_pw_gp_custom_parent" class="text_pole st-pw-gp-custom-parent st-pw-hidden" placeholder="输入新大类名称（如：古风）…" autocomplete="off" />
+                  <input type="text" id="st_pw_gp_custom_parent" class="text_pole st-pw-gp-custom-parent ${isCustomParentSelected ? '' : 'st-pw-hidden'}" placeholder="输入新大类名称（如：古风）…" value="${escapeAttr(initialCustomParent)}" autocomplete="off" />
                 </div>
-                <input type="text" id="st_pw_gp_group_name" class="text_pole st-pw-gp-name-input" placeholder="${cleanPresetParent ? `在「${escapeAttr(cleanPresetParent)}」下输入子分组名称…` : '输入组名（也可直接写 大类/子组，如：古风/仙侠）…'}" autocomplete="off" />
+                <div class="st-pw-gp-field-head">
+                  <span class="st-pw-gp-field-label">分组名称</span>
+                  <span class="st-pw-gp-path-preview"></span>
+                </div>
+                <input type="text" id="st_pw_gp_group_name" class="text_pole st-pw-gp-name-input" placeholder="${initialParent && !isCustomParentSelected ? `在「${escapeAttr(initialParent)}」下输入子分组名称…` : '输入组名（也可直接写 大类/子组，如：古风/仙侠）…'}" value="${escapeAttr(initialGroupName)}" autocomplete="off" />
                 <div class="st-pw-gp-name-err st-pw-hidden">请先填写分组名称</div>
               </div>
             `
             : ''
         }
 
-        <div class="st-pw-gp-search-row">
-          <div class="st-pw-gp-search-input-wrap">
-            <i class="fa-solid fa-magnifying-glass st-pw-gp-search-icon"></i>
-            <input type="text" id="st_pw_gp_search" class="text_pole st-pw-gp-search-input" placeholder="搜索 User 名称、分组、标签、世界书或角色…" autocomplete="off" />
-            <button type="button" class="st-pw-gp-search-clear st-pw-hidden" title="清空搜索">×</button>
-          </div>
-        </div>
+        ${
+          isMetaOnly
+            ? ''
+            : `
+              <div class="st-pw-gp-search-row">
+                <div class="st-pw-gp-search-input-wrap">
+                  <i class="fa-solid fa-magnifying-glass st-pw-gp-search-icon"></i>
+                  <input type="text" id="st_pw_gp_search" class="text_pole st-pw-gp-search-input" placeholder="搜索 User 名称、分组、标签、世界书或角色…" autocomplete="off" />
+                  <button type="button" class="st-pw-gp-search-clear st-pw-hidden" title="清空搜索">×</button>
+                </div>
+              </div>
 
-        <div class="st-pw-gp-toolbar-row">
-          <div class="st-pw-group-tabs st-pw-gp-tabs">
-            <button type="button" class="st-pw-filter-pill active" data-gp-tab="all">全部 (${personas.length})</button>
-            <button type="button" class="st-pw-filter-pill" data-gp-tab="checked">已选 (<span class="st-pw-gp-tab-checked-num">${checkedSet.size}</span>)</button>
-            <button type="button" class="st-pw-filter-pill" data-gp-tab="ungrouped">未分组 (${ungroupedTotal})</button>
-            ${favTotal > 0 ? `<button type="button" class="st-pw-filter-pill" data-gp-tab="fav">收藏 (${favTotal})</button>` : ''}
-          </div>
-          <div class="st-pw-gp-batch-btns">
-            <button type="button" class="menu_button st-pw-mini-btn st-pw-gp-select-visible">全选当前</button>
-            <button type="button" class="menu_button st-pw-mini-btn st-pw-gp-clear-visible">取消当前</button>
-          </div>
-        </div>
+              <div class="st-pw-gp-toolbar-row">
+                <div class="st-pw-group-tabs st-pw-gp-tabs">
+                  <button type="button" class="st-pw-filter-pill active" data-gp-tab="all">全部 (${personas.length})</button>
+                  <button type="button" class="st-pw-filter-pill" data-gp-tab="checked">已选 (<span class="st-pw-gp-tab-checked-num">${checkedSet.size}</span>)</button>
+                  <button type="button" class="st-pw-filter-pill" data-gp-tab="ungrouped">未分组 (${ungroupedTotal})</button>
+                  ${favTotal > 0 ? `<button type="button" class="st-pw-filter-pill" data-gp-tab="fav">收藏 (${favTotal})</button>` : ''}
+                </div>
+                <div class="st-pw-gp-batch-btns">
+                  <button type="button" class="menu_button st-pw-mini-btn st-pw-gp-select-visible">全选当前</button>
+                  <button type="button" class="menu_button st-pw-mini-btn st-pw-gp-clear-visible">取消当前</button>
+                </div>
+              </div>
 
-        <div class="st-pw-gp-subhint">
-          ${
-            isChar
-              ? '默认多选：点击整行即可勾选/取消绑定到此角色（支持 Shift 连选）'
-              : '默认多选：点击整行即可勾选，同一个 User 可同时放进多个分组（不会从原分组移出）'
-          }
-        </div>
+              <div class="st-pw-gp-subhint">
+                ${
+                  isChar
+                    ? '默认多选：点击整行即可勾选/取消绑定到此角色（支持 Shift 连选）'
+                    : '默认多选：点击整行即可勾选，同一个 User 可同时放进多个分组（不会从原分组移出）'
+                }
+              </div>
+            `
+        }
       </div>
 
-      <div class="st-pw-gp-list"></div>
+      ${isMetaOnly ? '' : `<div class="st-pw-gp-list"></div>`}
 
       <div class="st-pw-gp-footer">
-        <span class="st-pw-gp-selected-summary">当前已勾选 <strong class="st-pw-gp-count-num">${checkedSet.size}</strong> 个 User</span>
+        ${
+          isMetaOnly
+            ? `
+              <button type="button" class="st-pw-link-btn st-pw-gp-switch-members" title="展开成员列表，顺便批量勾选或移出组内 User">
+                <i class="fa-solid fa-user-plus"></i> 顺便增减组内 User (${checkedSet.size})
+              </button>
+            `
+            : `<span class="st-pw-gp-selected-summary">当前已勾选 <strong class="st-pw-gp-count-num">${checkedSet.size}</strong> 个 User</span>`
+        }
         <div class="st-pw-gp-footer-btns">
           <button type="button" class="menu_button st-pw-gp-cancel-btn">取消</button>
           <button type="button" class="menu_button st-pw-primary-btn st-pw-gp-confirm-btn"></button>
@@ -5961,15 +6086,49 @@ function openGroupMemberPickerModal({
   const listEl = modal.querySelector('.st-pw-gp-list');
   const parentSelect = modal.querySelector('#st_pw_gp_parent_select');
   const customParentInput = modal.querySelector('#st_pw_gp_custom_parent');
+  const quickNewParentBtn = modal.querySelector('.st-pw-gp-quick-new-parent');
+  const pathPreviewEl = modal.querySelector('.st-pw-gp-path-preview');
   const nameInput = modal.querySelector('#st_pw_gp_group_name');
   const nameErrEl = modal.querySelector('.st-pw-gp-name-err');
   const searchInput = modal.querySelector('#st_pw_gp_search');
   const searchClearBtn = modal.querySelector('.st-pw-gp-search-clear');
   const confirmBtn = modal.querySelector('.st-pw-gp-confirm-btn');
 
+  function updatePathPreview() {
+    if (!pathPreviewEl) return;
+    let chosenParent = '';
+    if (parentSelect) {
+      if (parentSelect.value === '__custom_parent__') {
+        chosenParent = String(customParentInput?.value || '').replaceAll('/', '·').trim();
+      } else {
+        chosenParent = String(parentSelect.value || '').trim();
+      }
+    }
+    const rawChild = String(nameInput?.value || '').trim();
+    if (parentSelect?.value === '__custom_parent__' && !chosenParent) {
+      pathPreviewEl.textContent = `待输入新大类名称 ▸ 📂 ${rawChild.replaceAll('/', '·') || '子分组'}`;
+      return;
+    }
+    if (chosenParent) {
+      pathPreviewEl.textContent = `保存后：📁 ${chosenParent} / 📂 ${rawChild.replaceAll('/', '·') || '子分组'}`;
+      return;
+    }
+    if (rawChild.includes('/')) {
+      const sp = splitGroupPath(rawChild);
+      if (sp.isSubgroup) {
+        pathPreviewEl.textContent = `保存后：📁 ${sp.parent} / 📂 ${sp.child}`;
+        return;
+      }
+    }
+    pathPreviewEl.textContent = `保存后：📁 ${rawChild || '未命名'}（一级分组）`;
+  }
+
   parentSelect?.addEventListener('change', () => {
     const isCustom = parentSelect.value === '__custom_parent__';
     customParentInput?.classList.toggle('st-pw-hidden', !isCustom);
+    customParentInput?.classList.remove('st-pw-input-invalid');
+    nameErrEl?.classList.add('st-pw-hidden');
+    updatePathPreview();
     if (isCustom) {
       customParentInput?.focus();
     } else if (nameInput) {
@@ -5979,6 +6138,83 @@ function openGroupMemberPickerModal({
       nameInput.focus();
     }
   });
+
+  quickNewParentBtn?.addEventListener('click', () => {
+    if (!parentSelect) return;
+    parentSelect.value = '__custom_parent__';
+    customParentInput?.classList.remove('st-pw-hidden');
+    customParentInput?.classList.remove('st-pw-input-invalid');
+    updatePathPreview();
+    customParentInput?.focus();
+  });
+
+  customParentInput?.addEventListener('input', () => {
+    customParentInput.classList.remove('st-pw-input-invalid');
+    nameErrEl?.classList.add('st-pw-hidden');
+    updatePathPreview();
+  });
+
+  customParentInput?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (nameInput && !nameInput.value.trim()) {
+        nameInput.focus();
+      } else {
+        confirmBtn?.click();
+      }
+    }
+  });
+
+  modal.querySelector('.st-pw-gp-switch-members')?.addEventListener('click', () => {
+    openGroupMemberPickerModal({
+      mode: 'edit_group',
+      targetName: cleanTarget,
+      draftParent: parentSelect ? parentSelect.value : '',
+      draftCustomParent: customParentInput ? customParentInput.value : '',
+      draftGroupName: nameInput ? nameInput.value : initialGroupName,
+      onSaved,
+    });
+  });
+
+  function resolveValidatedGroupFullName() {
+    if (parentSelect?.value === '__custom_parent__') {
+      const typedParent = String(customParentInput?.value || '').replaceAll('/', '·').trim();
+      if (!typedParent) {
+        if (nameErrEl) {
+          nameErrEl.textContent = '请先输入新上级大类名称（若不需要大类，可将下拉框切回「无」）';
+          nameErrEl.classList.remove('st-pw-hidden');
+        }
+        customParentInput?.classList.add('st-pw-input-invalid');
+        customParentInput?.focus();
+        globalThis.toastr?.warning?.('请先输入新上级大类名称');
+        return null;
+      }
+    }
+    const rawChildOrFull = String(nameInput?.value || '').trim();
+    if (!rawChildOrFull) {
+      if (nameErrEl) {
+        nameErrEl.textContent = '请先填写分组名称';
+        nameErrEl.classList.remove('st-pw-hidden');
+      }
+      nameInput?.classList.add('st-pw-input-invalid');
+      nameInput?.focus();
+      globalThis.toastr?.warning?.('请先输入分组名称');
+      return null;
+    }
+    let chosenParent = '';
+    if (parentSelect) {
+      if (parentSelect.value === '__custom_parent__') {
+        chosenParent = String(customParentInput?.value || '').replaceAll('/', '·').trim();
+      } else {
+        chosenParent = String(parentSelect.value || '').trim();
+      }
+    }
+    const combinedRaw = chosenParent
+      ? `${chosenParent}/${rawChildOrFull.replaceAll('/', '·').trim()}`
+      : rawChildOrFull;
+    const normalized = normalizeSingleGroupPath(combinedRaw);
+    return normalized || null;
+  }
 
   function getFilteredPersonas() {
     const q = searchQuery.trim().toLowerCase();
@@ -6004,6 +6240,10 @@ function openGroupMemberPickerModal({
           count > 0
             ? `<i class="fa-solid fa-check"></i> 创建并加入 (${count})`
             : `<i class="fa-solid fa-folder-plus"></i> 创建空分组`;
+      } else if (isMetaOnly) {
+        confirmBtn.innerHTML = `<i class="fa-solid fa-check"></i> 保存修改`;
+      } else if (isEditGroup) {
+        confirmBtn.innerHTML = `<i class="fa-solid fa-check"></i> 保存修改 (${count})`;
       } else {
         confirmBtn.innerHTML = `<i class="fa-solid fa-check"></i> 保存成员 (${count})`;
       }
@@ -6011,9 +6251,10 @@ function openGroupMemberPickerModal({
   }
 
   function renderListItems() {
+    syncCountsAndFooter();
+    if (!listEl) return;
     const visible = getFilteredPersonas();
     lastVisibleIds = visible.map((p) => p.avatarId);
-    syncCountsAndFooter();
 
     if (visible.length === 0) {
       listEl.innerHTML = `<div class="st-pw-empty-state">${
@@ -6032,14 +6273,14 @@ function openGroupMemberPickerModal({
         const fallbackAvatarUrl = resolvePersonaDirectAvatarUrl(p.avatarId);
         const groups = getProfileGroups(p.meta);
         const otherGroups =
-          mode === 'edit_group' && cleanTarget ? groups.filter((g) => g !== cleanTarget) : groups;
+          isEditGroup && cleanTarget ? groups.filter((g) => g !== cleanTarget) : groups;
         const shownGroups = otherGroups.slice(0, 2);
         const restGroupCount = otherGroups.length - shownGroups.length;
         const groupBadgesHtml =
           shownGroups
             .map(
               (g) =>
-                `<span class="st-pw-tiny-tag">${mode === 'edit_group' ? `也在:${sanitizeHtml(g)}` : sanitizeHtml(g)}</span>`
+                `<span class="st-pw-tiny-tag">${isEditGroup ? `也在:${sanitizeHtml(g)}` : sanitizeHtml(g)}</span>`
             )
             .join('') +
           (restGroupCount > 0
@@ -6085,7 +6326,7 @@ function openGroupMemberPickerModal({
   }
 
   function toggleOneInPlace(avatarId, nextState, shiftKey = false) {
-    if (!avatarId) return;
+    if (!avatarId || !listEl) return;
     const shouldCheck = typeof nextState === 'boolean' ? nextState : !checkedSet.has(avatarId);
 
     if (shiftKey && lastClickedId && lastClickedId !== avatarId) {
@@ -6136,12 +6377,13 @@ function openGroupMemberPickerModal({
   nameInput?.addEventListener('input', () => {
     nameErrEl?.classList.add('st-pw-hidden');
     nameInput.classList.remove('st-pw-input-invalid');
+    updatePathPreview();
   });
 
   nameInput?.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
       e.preventDefault();
-      if (checkedSet.size === 0 && searchInput) {
+      if (isCreate && checkedSet.size === 0 && searchInput) {
         searchInput.focus();
       } else {
         confirmBtn?.click();
@@ -6157,14 +6399,14 @@ function openGroupMemberPickerModal({
     isComposing = false;
     searchQuery = e.target.value || '';
     searchClearBtn?.classList.toggle('st-pw-hidden', !searchQuery);
-    listEl.scrollTop = 0;
+    if (listEl) listEl.scrollTop = 0;
     renderListItems();
   });
   searchInput?.addEventListener('input', (e) => {
     searchQuery = e.target.value || '';
     searchClearBtn?.classList.toggle('st-pw-hidden', !searchQuery);
     if (isComposing) return;
-    listEl.scrollTop = 0;
+    if (listEl) listEl.scrollTop = 0;
     renderListItems();
   });
 
@@ -6175,7 +6417,7 @@ function openGroupMemberPickerModal({
       searchInput.focus();
     }
     searchClearBtn.classList.add('st-pw-hidden');
-    listEl.scrollTop = 0;
+    if (listEl) listEl.scrollTop = 0;
     renderListItems();
   });
 
@@ -6184,12 +6426,13 @@ function openGroupMemberPickerModal({
       const nextTab = tabBtn.getAttribute('data-gp-tab') || 'all';
       if (activeTab === nextTab) return;
       activeTab = nextTab;
-      listEl.scrollTop = 0;
+      if (listEl) listEl.scrollTop = 0;
       renderListItems();
     });
   });
 
   modal.querySelector('.st-pw-gp-select-visible')?.addEventListener('click', () => {
+    if (!listEl) return;
     for (const id of lastVisibleIds) checkedSet.add(id);
     listEl.querySelectorAll('.st-pw-gp-item').forEach((row) => {
       row.classList.add('is-checked');
@@ -6200,6 +6443,7 @@ function openGroupMemberPickerModal({
   });
 
   modal.querySelector('.st-pw-gp-clear-visible')?.addEventListener('click', () => {
+    if (!listEl) return;
     for (const id of lastVisibleIds) checkedSet.delete(id);
     if (activeTab === 'checked') {
       renderListItems();
@@ -6213,7 +6457,7 @@ function openGroupMemberPickerModal({
     syncCountsAndFooter();
   });
 
-  listEl.addEventListener('click', (e) => {
+  listEl?.addEventListener('click', (e) => {
     const row = e.target.closest('.st-pw-gp-item');
     if (!row) return;
     const avatarId = row.getAttribute('data-avatar-id');
@@ -6228,27 +6472,7 @@ function openGroupMemberPickerModal({
 
   confirmBtn?.addEventListener('click', async () => {
     if (isCreate) {
-      const rawChildOrFull = String(nameInput?.value || '').trim();
-      if (!rawChildOrFull) {
-        nameErrEl?.classList.remove('st-pw-hidden');
-        nameInput?.classList.add('st-pw-input-invalid');
-        nameInput?.focus();
-        globalThis.toastr?.warning?.('请先输入分组名称');
-        return;
-      }
-      let chosenParent = '';
-      if (parentSelect) {
-        if (parentSelect.value === '__custom_parent__') {
-          chosenParent = String(customParentInput?.value || '').replaceAll('/', '·').trim();
-        } else {
-          chosenParent = String(parentSelect.value || '').trim();
-        }
-      }
-      const combinedRaw =
-        chosenParent && !rawChildOrFull.includes('/')
-          ? `${chosenParent}/${rawChildOrFull}`
-          : rawChildOrFull;
-      const rawName = normalizeSingleGroupPath(combinedRaw);
+      const rawName = resolveValidatedGroupFullName();
       if (!rawName) return;
 
       if (!settings.groups.includes(rawName)) {
@@ -6277,27 +6501,62 @@ function openGroupMemberPickerModal({
       return;
     }
 
-    if (mode === 'edit_group' && cleanTarget) {
-      if (!settings.groups.includes(cleanTarget)) {
-        settings.groups.push(cleanTarget);
+    if (isMetaOnly && cleanTarget) {
+      const nextFullName = resolveValidatedGroupFullName();
+      if (!nextFullName) return;
+      if (nextFullName === cleanTarget) {
+        closeModal();
+        return;
       }
-      for (const p of personas) {
-        const meta = ensureProfileMeta(p.avatarId);
-        if (checkedSet.has(p.avatarId)) {
-          addProfileToGroup(meta, cleanTarget);
-        } else {
-          removeProfileFromGroup(meta, cleanTarget);
-        }
-      }
+      applyGroupPathRenames(new Map([[cleanTarget, nextFullName]]));
+      const spNew = splitGroupPath(nextFullName);
       state.batchAssignTarget = null;
-      state.collapsedSections.delete(`group:${cleanTarget}`);
       syncCollapsedSectionsToSettings();
       invalidateRenderedHtmlCache();
       saveSettings();
       closeModal();
       refreshAllViews();
-      onSaved?.(cleanTarget, [...checkedSet]);
-      globalThis.toastr?.success?.(`已更新分组「${cleanTarget}」成员（共 ${checkedSet.size} 人）`);
+      onSaved?.(nextFullName, [...checkedSet]);
+      globalThis.toastr?.success?.(
+        !spOld.isSubgroup && spNew.isSubgroup
+          ? `已将「${cleanTarget}」归入大类「${spNew.parent}」`
+          : spOld.isSubgroup && !spNew.isSubgroup
+            ? `已将「${nextFullName}」移出大类，恢复为一级分组`
+            : `已更新分组为「${nextFullName}」`
+      );
+      return;
+    }
+
+    if (isEditGroup && cleanTarget) {
+      const nextFullName = resolveValidatedGroupFullName();
+      if (!nextFullName) return;
+      if (nextFullName !== cleanTarget) {
+        applyGroupPathRenames(new Map([[cleanTarget, nextFullName]]));
+      } else if (!settings.groups.includes(nextFullName)) {
+        settings.groups.push(nextFullName);
+      }
+      for (const p of personas) {
+        const meta = ensureProfileMeta(p.avatarId);
+        const wasInOld = initialChecked.has(p.avatarId);
+        if (checkedSet.has(p.avatarId)) {
+          addProfileToGroup(meta, nextFullName);
+        } else if (nextFullName === cleanTarget || wasInOld) {
+          removeProfileFromGroup(meta, nextFullName);
+        }
+      }
+      const spNew = splitGroupPath(nextFullName);
+      state.batchAssignTarget = null;
+      if (spNew.isSubgroup) {
+        state.collapsedSections.delete(`gparent:${spNew.parent}`);
+      }
+      state.collapsedSections.delete(`group:${nextFullName}`);
+      syncCollapsedSectionsToSettings();
+      invalidateRenderedHtmlCache();
+      saveSettings();
+      closeModal();
+      refreshAllViews();
+      onSaved?.(nextFullName, [...checkedSet]);
+      globalThis.toastr?.success?.(`已保存分组「${nextFullName}」（共 ${checkedSet.size} 人）`);
       return;
     }
 
@@ -6324,13 +6583,215 @@ function openGroupMemberPickerModal({
     }
   });
 
+  updatePathPreview();
   renderListItems();
   requestAnimationFrame(() => {
-    if (isCreate && nameInput) {
+    if (isCustomParentSelected && customParentInput) {
+      customParentInput.focus({ preventScroll: true });
+    } else if ((isCreate || isMetaOnly) && nameInput) {
       nameInput.focus({ preventScroll: true });
     } else if (searchInput) {
       searchInput.focus({ preventScroll: true });
     }
+  });
+}
+
+/**
+ * 打开「编辑一级大类文件夹」弹窗：支持修改大类名称，并可勾选已有独立分组一键并入此大类（或取消勾选将子组移回一级）
+ */
+function openParentCategoryEditModal(oldParent) {
+  const cleanOldParent = String(oldParent || '').trim();
+  if (!cleanOldParent) return;
+
+  const personas = getHostPersonas();
+  const { customGroups } = buildUnifiedPersonaGroups(personas);
+  const parentSubCount = new Map();
+  for (const g of customGroups) {
+    const sp = splitGroupPath(g.name);
+    if (sp.isSubgroup) {
+      parentSubCount.set(sp.parent, (parentSubCount.get(sp.parent) || 0) + 1);
+    }
+  }
+
+  const currentChildren = customGroups.filter((g) => {
+    const sp = splitGroupPath(g.name);
+    return sp.isSubgroup && sp.parent === cleanOldParent;
+  });
+  const standaloneCandidates = customGroups.filter((g) => {
+    const sp = splitGroupPath(g.name);
+    return !sp.isSubgroup && g.name !== cleanOldParent && !(parentSubCount.get(g.name) > 0);
+  });
+
+  const allFolderItems = [
+    ...currentChildren.map((g) => ({
+      fullName: g.name,
+      displayName: splitGroupPath(g.name).child,
+      memberCount: g.members.length,
+      wasChild: true,
+    })),
+    ...standaloneCandidates.map((g) => ({
+      fullName: g.name,
+      displayName: g.name,
+      memberCount: g.members.length,
+      wasChild: false,
+    })),
+  ];
+
+  const selectedFolderSet = new Set(currentChildren.map((g) => g.name));
+
+  let modal = document.querySelector('#st_pw_group_member_modal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'st_pw_group_member_modal';
+    modal.className = 'st-pw-modal-backdrop st-pw-group-picker-backdrop';
+    document.body.appendChild(modal);
+  }
+  bindModalBackdropEvents(modal);
+  modal.classList.remove('st-pw-hidden');
+
+  const headerTitle = `编辑大类文件夹「${cleanOldParent}」`;
+  modal.innerHTML = `
+    <div class="st-pw-group-picker-dialog" role="dialog" aria-modal="true" aria-label="${escapeAttr(headerTitle)}">
+      <div class="st-pw-modal-header">
+        <div class="st-pw-header-left">
+          <span class="st-pw-modal-title">${sanitizeHtml(headerTitle)}</span>
+        </div>
+        <div class="st-pw-modal-header-actions">
+          <button type="button" class="menu_button st-pw-mini-btn st-pw-gp-close-btn" title="关闭"><i class="fa-solid fa-xmark"></i> 关闭</button>
+        </div>
+      </div>
+
+      <div class="st-pw-gp-controls">
+        <div class="st-pw-gp-name-wrap">
+          <div class="st-pw-gp-field-head">
+            <span class="st-pw-gp-field-label">大类文件夹名称</span>
+          </div>
+          <input type="text" id="st_pw_parent_edit_name" class="text_pole st-pw-gp-name-input" value="${escapeAttr(cleanOldParent)}" placeholder="输入大类名称…" autocomplete="off" />
+          <div class="st-pw-gp-name-err st-pw-hidden">请先填写大类名称</div>
+        </div>
+        <div class="st-pw-gp-subhint">
+          勾选下方已有独立分组可一键并入此大类；取消勾选现有子分组可将其移回一级独立分组。
+        </div>
+      </div>
+
+      <div class="st-pw-gp-list">
+        ${
+          allFolderItems.length === 0
+            ? `<div class="st-pw-empty-state">暂无可调整的子分组或独立分组</div>`
+            : allFolderItems
+                .map((item) => {
+                  const checked = selectedFolderSet.has(item.fullName);
+                  return `
+                    <div class="st-pw-gp-item ${checked ? 'is-checked' : ''}" data-folder-name="${escapeAttr(item.fullName)}">
+                      <input type="checkbox" class="st-pw-gp-check" data-folder-name="${escapeAttr(item.fullName)}" ${checked ? 'checked' : ''} />
+                      <div class="st-pw-item-main">
+                        <div class="st-pw-item-title-line">
+                          <i class="fa-${item.wasChild ? 'solid fa-folder-tree' : 'regular fa-folder'}" style="opacity:0.8;"></i>
+                          <span class="st-pw-item-name">${sanitizeHtml(item.displayName)}</span>
+                          <span class="st-pw-tiny-tag">${item.memberCount} 人</span>
+                          <span class="st-pw-tiny-tag">${item.wasChild ? '当前子组' : '独立分组'}</span>
+                        </div>
+                      </div>
+                    </div>
+                  `;
+                })
+                .join('')
+        }
+      </div>
+
+      <div class="st-pw-gp-footer">
+        <span class="st-pw-gp-selected-summary">归入此大类：<strong class="st-pw-gp-count-num">${selectedFolderSet.size}</strong> 个子分组</span>
+        <div class="st-pw-gp-footer-btns">
+          <button type="button" class="menu_button st-pw-gp-cancel-btn">取消</button>
+          <button type="button" class="menu_button st-pw-primary-btn st-pw-gp-confirm-btn"><i class="fa-solid fa-check"></i> 保存修改</button>
+        </div>
+      </div>
+    </div>
+  `;
+
+  const closeModal = () => modal.classList.add('st-pw-hidden');
+  modal.querySelector('.st-pw-gp-close-btn')?.addEventListener('click', closeModal);
+  modal.querySelector('.st-pw-gp-cancel-btn')?.addEventListener('click', closeModal);
+
+  const parentInput = modal.querySelector('#st_pw_parent_edit_name');
+  const errEl = modal.querySelector('.st-pw-gp-name-err');
+  const listEl = modal.querySelector('.st-pw-gp-list');
+  const countEl = modal.querySelector('.st-pw-gp-count-num');
+
+  parentInput?.addEventListener('input', () => {
+    parentInput.classList.remove('st-pw-input-invalid');
+    errEl?.classList.add('st-pw-hidden');
+  });
+
+  listEl?.addEventListener('click', (e) => {
+    const row = e.target.closest('.st-pw-gp-item');
+    if (!row) return;
+    const fName = row.getAttribute('data-folder-name');
+    if (!fName) return;
+    const shouldCheck = e.target.classList.contains('st-pw-gp-check')
+      ? e.target.checked
+      : !selectedFolderSet.has(fName);
+    if (!e.target.classList.contains('st-pw-gp-check')) e.preventDefault();
+    if (shouldCheck) selectedFolderSet.add(fName);
+    else selectedFolderSet.delete(fName);
+    row.classList.toggle('is-checked', shouldCheck);
+    const cb = row.querySelector('.st-pw-gp-check');
+    if (cb) cb.checked = shouldCheck;
+    if (countEl) countEl.textContent = String(selectedFolderSet.size);
+  });
+
+  modal.querySelector('.st-pw-gp-confirm-btn')?.addEventListener('click', () => {
+    const newParent = String(parentInput?.value || '').replaceAll('/', '·').trim();
+    if (!newParent) {
+      errEl?.classList.remove('st-pw-hidden');
+      parentInput?.classList.add('st-pw-input-invalid');
+      parentInput?.focus();
+      globalThis.toastr?.warning?.('请填写大类名称');
+      return;
+    }
+
+    const renameMap = new Map();
+    if (newParent !== cleanOldParent) {
+      const settings = getSettings();
+      const hasDirect =
+        (settings.groups || []).includes(cleanOldParent) ||
+        Object.values(settings.profiles || {}).some((prof) =>
+          getProfileGroups(prof).includes(cleanOldParent)
+        );
+      if (hasDirect) {
+        renameMap.set(cleanOldParent, newParent);
+      }
+    }
+
+    for (const item of allFolderItems) {
+      const isChecked = selectedFolderSet.has(item.fullName);
+      if (item.wasChild) {
+        const nextPath = isChecked ? `${newParent}/${item.displayName}` : item.displayName;
+        if (nextPath !== item.fullName) {
+          renameMap.set(item.fullName, nextPath);
+        }
+      } else if (isChecked) {
+        renameMap.set(item.fullName, `${newParent}/${item.displayName}`);
+      }
+    }
+
+    if (renameMap.size > 0) {
+      applyGroupPathRenames(renameMap);
+    }
+    if (state.activeFilter === `gparent:${cleanOldParent}`) {
+      state.activeFilter = selectedFolderSet.size > 0 ? `gparent:${newParent}` : 'all';
+    }
+    state.collapsedSections.delete(`gparent:${newParent}`);
+    syncCollapsedSectionsToSettings();
+    invalidateRenderedHtmlCache();
+    saveSettings();
+    closeModal();
+    refreshAllViews();
+    globalThis.toastr?.success?.(`已保存大类「${newParent}」（共 ${selectedFolderSet.size} 个子分组）`);
+  });
+
+  requestAnimationFrame(() => {
+    parentInput?.focus({ preventScroll: true });
   });
 }
 
@@ -7152,38 +7613,13 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
     });
   });
 
-  // 重命名一级大类（同步更新该大类及旗下所有子分组路径）
+  // 编辑一级大类（改名 / 批量勾选已有独立分组一键并入或移出大类）
   modal.querySelectorAll('.st-pw-rename-parent-group-btn').forEach((btn) => {
-    btn.addEventListener('click', async (e) => {
+    btn.addEventListener('click', (e) => {
       e.stopPropagation();
       const oldParent = btn.getAttribute('data-parent-name');
       if (!oldParent) return;
-      const entered = await promptUserText(`重命名上级大类「${oldParent}」`, oldParent);
-      if (!entered || !entered.trim()) return;
-      const newParent = entered.replaceAll('/', '·').trim();
-      if (!newParent || newParent === oldParent) return;
-
-      const rewriteGroup = (g) => {
-        const sp = splitGroupPath(g);
-        if (sp.parent !== oldParent) return g;
-        return sp.isSubgroup ? `${newParent}/${sp.child}` : newParent;
-      };
-      settings.groups = [...new Set((settings.groups || []).map(rewriteGroup).filter(Boolean))];
-      for (const prof of Object.values(settings.profiles)) {
-        if (!prof) continue;
-        const curGroups = getProfileGroups(prof);
-        if (curGroups.some((g) => splitGroupPath(g).parent === oldParent)) {
-          setProfileGroups(prof, curGroups.map(rewriteGroup));
-        }
-      }
-      if (state.activeFilter === `gparent:${oldParent}`) {
-        state.activeFilter = `gparent:${newParent}`;
-      } else if (state.activeFilter.startsWith(`group:${oldParent}/`)) {
-        state.activeFilter = `group:${newParent}/${state.activeFilter.slice(`group:${oldParent}/`.length)}`;
-      }
-      invalidateRenderedHtmlCache();
-      saveSettings();
-      rerenderPanels();
+      openParentCategoryEditModal(oldParent);
     });
   });
 
@@ -7238,46 +7674,16 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
     });
   });
 
-  // 重命名自定义分组（支持改名或加上「大类/子组」迁入/迁出大类，完整同步所有 User 多分组列表）
+  // 编辑自定义分组（可视化设置/新建上级大类 + 修改组名，完整同步所有 User 多分组列表）
   modal.querySelectorAll('.st-pw-rename-group-btn').forEach((btn) => {
-    btn.addEventListener('click', async (e) => {
+    btn.addEventListener('click', (e) => {
       e.stopPropagation();
       const oldName = btn.getAttribute('data-group-name');
       if (!oldName) return;
-      const nextName = await promptUserText(`重命名分组「${oldName}」`, oldName, {
-        subtitle: '支持填写「大类/子组」直接归入或调整上级大类',
+      openGroupMemberPickerModal({
+        mode: 'edit_group_meta',
+        targetName: oldName,
       });
-      if (!nextName || !nextName.trim()) return;
-      const clean = normalizeSingleGroupPath(nextName);
-      if (!clean || clean === oldName) return;
-      const idx = settings.groups.indexOf(oldName);
-      if (idx !== -1) {
-        settings.groups[idx] = clean;
-        settings.groups = [...new Set(settings.groups)];
-      } else if (!settings.groups.includes(clean)) {
-        settings.groups.push(clean);
-      }
-      for (const prof of Object.values(settings.profiles)) {
-        if (!prof) continue;
-        const curGroups = getProfileGroups(prof);
-        if (curGroups.includes(oldName)) {
-          setProfileGroups(
-            prof,
-            curGroups.map((g) => (g === oldName ? clean : g))
-          );
-        }
-      }
-      if (state.activeFilter === `group:${oldName}`) {
-        state.activeFilter = `group:${clean}`;
-      }
-      const spClean = splitGroupPath(clean);
-      if (spClean.isSubgroup) {
-        state.collapsedSections.delete(`gparent:${spClean.parent}`);
-      }
-      syncCollapsedSectionsToSettings();
-      invalidateRenderedHtmlCache();
-      saveSettings();
-      rerenderPanels();
     });
   });
 
@@ -7550,15 +7956,11 @@ function bindWardrobeModalEvents(modal, selectedPersona, allPersonas) {
     if (!rawVal) return;
 
     if (rawVal === '__new__') {
-      const newGroup = await promptUserText('新建自定义分组', '', {
-        placeholder: '输入新分组名称…',
+      openGroupMemberPickerModal({
+        mode: 'create_group',
+        preselectedIds: [selectedPersona.avatarId],
       });
-      if (!newGroup || !newGroup.trim()) return;
-      const clean = newGroup.trim();
-      if (!settings.groups.includes(clean)) settings.groups.push(clean);
-      addProfileToGroup(meta, clean);
-      state.collapsedSections.delete(`group:${clean}`);
-      syncCollapsedSectionsToSettings();
+      return;
     } else if (rawVal === '__clear_all__') {
       setProfileGroups(meta, []);
     } else {
@@ -8221,10 +8623,10 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
                 ? `<button type="button" class="st-pw-icon-btn st-pw-move-group-btn" data-group-name="${escapeAttr(grp.name)}" data-move-dir="down" title="下移分组"><i class="fa-solid fa-arrow-down"></i></button>`
                 : ''
             }
-            <button type="button" class="st-pw-icon-btn st-pw-open-batch-group" data-group-name="${escapeAttr(grp.name)}" title="批量勾选移入此分组的 User">
+            <button type="button" class="st-pw-icon-btn st-pw-open-batch-group" data-group-name="${escapeAttr(grp.name)}" title="编辑分组（可设上级大类、改名、批量增减组员）">
               <i class="fa-solid fa-user-plus"></i>
             </button>
-            <button type="button" class="st-pw-icon-btn st-pw-rename-group-btn" data-group-name="${escapeAttr(grp.name)}" title="重命名分组（可填 大类/子组 调整层级）">
+            <button type="button" class="st-pw-icon-btn st-pw-rename-group-btn" data-group-name="${escapeAttr(grp.name)}" title="编辑分组名称与所属上级大类">
               <i class="fa-solid fa-pen"></i>
             </button>
             <button type="button" class="st-pw-icon-btn st-pw-delete-group-btn" data-group-name="${escapeAttr(grp.name)}" title="删除分组">
@@ -8341,7 +8743,7 @@ function buildGroupedTreeSectionsHtml(personas, selectedAvatarId, characterGroup
               <button type="button" class="st-pw-icon-btn st-pw-add-subgroup-btn" data-parent-name="${escapeAttr(node.parentName)}" title="在「${escapeAttr(node.parentName)}」下新建子分组">
                 <i class="fa-solid fa-folder-plus"></i>
               </button>
-              <button type="button" class="st-pw-icon-btn st-pw-rename-parent-group-btn" data-parent-name="${escapeAttr(node.parentName)}" title="重命名大类「${escapeAttr(node.parentName)}」">
+              <button type="button" class="st-pw-icon-btn st-pw-rename-parent-group-btn" data-parent-name="${escapeAttr(node.parentName)}" title="编辑大类「${escapeAttr(node.parentName)}」（改名 / 批量勾选已有分组并入或移出）">
                 <i class="fa-solid fa-pen"></i>
               </button>
               <button type="button" class="st-pw-icon-btn st-pw-delete-parent-group-btn" data-parent-name="${escapeAttr(node.parentName)}" title="删除大类「${escapeAttr(node.parentName)}」及其子分组">

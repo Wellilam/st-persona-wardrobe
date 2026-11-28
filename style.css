@@ -1962,6 +1962,23 @@ dialog.popup.st-pw-newchat-expanded-dialog {
   gap: 6px;
 }
 
+.st-pw-gp-field-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.st-pw-gp-path-preview {
+  font-size: 0.74rem;
+  opacity: 0.72;
+}
+
+.st-pw-gp-meta-only-dialog {
+  width: min(460px, 100%);
+}
+
 .st-pw-gp-parent-row {
   display: flex;
   align-items: center;
